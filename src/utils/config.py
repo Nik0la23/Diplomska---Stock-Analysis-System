@@ -26,9 +26,12 @@ else:
 # REQUIRED API KEYS
 # ============================================================================
 
-FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY')
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+# Data sources
+POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')      # Primary price data (Node 1)
+FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY')      # News, peers, market news (Nodes 2, 3)
+
+# LLM for explanations
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')            # Explanations (Nodes 13, 14)
 
 
 # ============================================================================
@@ -58,14 +61,14 @@ def validate_config() -> None:
     """
     missing_keys = []
     
+    if not POLYGON_API_KEY:
+        missing_keys.append('POLYGON_API_KEY')
+    
     if not FINNHUB_API_KEY:
         missing_keys.append('FINNHUB_API_KEY')
     
-    if not NEWS_API_KEY:
-        missing_keys.append('NEWS_API_KEY')
-    
-    if not ANTHROPIC_API_KEY:
-        missing_keys.append('ANTHROPIC_API_KEY')
+    if not GROQ_API_KEY:
+        missing_keys.append('GROQ_API_KEY')
     
     if missing_keys:
         raise ValueError(
@@ -84,9 +87,9 @@ def get_config_summary() -> dict:
         Dict with configuration status (keys masked for security)
     """
     return {
+        'polygon_key_present': bool(POLYGON_API_KEY),
         'finnhub_key_present': bool(FINNHUB_API_KEY),
-        'news_api_key_present': bool(NEWS_API_KEY),
-        'anthropic_key_present': bool(ANTHROPIC_API_KEY),
+        'groq_key_present': bool(GROQ_API_KEY),
         'database_path': DATABASE_PATH,
         'cache_hours': CACHE_HOURS,
         'log_level': LOG_LEVEL
