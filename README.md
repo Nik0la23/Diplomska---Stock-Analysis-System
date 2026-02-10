@@ -79,13 +79,13 @@ Enterprise-level architecture and code quality:
 
 ### Technical Stack Highlights
 - **Architecture:** LangGraph 0.0.55 for multi-agent orchestration
-- **NLP:** FinBERT (financial domain-specific transformer)
+- **NLP:** Alpha Vantage Sentiment (built-in) + optional FinBERT (financial transformer)
 - **LLM:** Groq (Llama 3.3 70B) for explainability
 - **Technical Analysis:** pandas-ta with 6+ indicators
 - **Forecasting:** Monte Carlo simulation (1000 paths, GBM)
 - **UI:** Streamlit dashboard with 6 interactive tabs
 - **Database:** SQLite with 15 tables and 3 views
-- **APIs:** Polygon.io (price data), Finnhub (news/market data), Yahoo Finance, Alpha Vantage
+- **APIs (Optimized Free-Tier ✅):** yfinance, Alpha Vantage, Finnhub (peers + market news), Polygon.io (backup price)
 
 ---
 

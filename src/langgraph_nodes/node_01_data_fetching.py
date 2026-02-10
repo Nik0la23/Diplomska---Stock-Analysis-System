@@ -2,6 +2,11 @@
 Node 1: Price Data Fetching
 Fetches historical OHLCV (Open, High, Low, Close, Volume) price data.
 
+Data Sources (in priority order):
+1. Cache (24 hours)
+2. yfinance (Primary - NO API key, fast, reliable)
+3. Polygon.io (Backup - requires API key)
+
 Runs AFTER: Nothing (first node)
 Runs BEFORE: All other nodes
 Can run in PARALLEL with: Nothing
@@ -21,23 +26,92 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# HELPER FUNCTION: Fetch from Polygon (Primary)
+# HELPER FUNCTION: Fetch from yfinance (Primary)
 # ============================================================================
 
-def fetch_from_polygon(ticker: str, days: int = 90) -> Optional[pd.DataFrame]:
+def fetch_from_yfinance(ticker: str, days: int = 180) -> Optional[pd.DataFrame]:
     """
-    Fetch price data from Polygon.io API.
+    Fetch price data from yfinance (Primary source - NO API key needed).
     
     Args:
         ticker: Stock ticker symbol (e.g., 'AAPL')
-        days: Number of days of historical data
+        days: Number of days of historical data (default: 180 for 6 months)
         
     Returns:
         DataFrame with columns: date, open, high, low, close, volume
         None if fetch fails
         
     Example:
-        >>> df = fetch_from_polygon('AAPL', days=90)
+        >>> df = fetch_from_yfinance('AAPL', days=180)
+        >>> print(df.columns)
+        Index(['date', 'open', 'high', 'low', 'close', 'volume'])
+    """
+    try:
+        logger.info(f"Fetching {days} days of price data from yfinance for {ticker}")
+        
+        # Calculate period (yfinance uses period parameter)
+        # Map days to yfinance period
+        if days <= 7:
+            period = '1mo'
+        elif days <= 90:
+            period = '3mo'
+        elif days <= 180:
+            period = '6mo'
+        elif days <= 365:
+            period = '1y'
+        else:
+            period = '2y'
+        
+        # Fetch data using Ticker object for better reliability
+        ticker_obj = yf.Ticker(ticker)
+        df = ticker_obj.history(period=period)
+        
+        if df.empty:
+            logger.warning(f"yfinance: No data returned for {ticker}")
+            return None
+        
+        # Standardize column names to match our schema
+        df = df.reset_index()
+        df = df.rename(columns={
+            'Date': 'date',
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        })
+        
+        # Keep only required columns
+        df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
+        
+        # Ensure date is datetime
+        df['date'] = pd.to_datetime(df['date'])
+        
+        logger.info(f"yfinance: Fetched {len(df)} rows for {ticker}")
+        return df
+        
+    except Exception as e:
+        logger.error(f"yfinance fetch failed for {ticker}: {str(e)}")
+        return None
+
+
+# ============================================================================
+# HELPER FUNCTION: Fetch from Polygon (Backup)
+# ============================================================================
+
+    """
+    Fetch price data from Polygon.io API (Backup source).
+    
+    Args:
+        ticker: Stock ticker symbol (e.g., 'AAPL')
+        days: Number of days of historical data (default: 180 for 6 months)
+        
+    Returns:
+        DataFrame with columns: date, open, high, low, close, volume
+        None if fetch fails
+        
+    Example:
+        >>> df = fetch_from_polygon('AAPL', days=180)
         >>> print(df.columns)
         Index(['date', 'open', 'high', 'low', 'close', 'volume'])
     """
@@ -98,62 +172,6 @@ def fetch_from_polygon(ticker: str, days: int = 90) -> Optional[pd.DataFrame]:
         return None
 
 
-# ============================================================================
-# HELPER FUNCTION: Fetch from yfinance (Fallback)
-# ============================================================================
-
-def fetch_from_yfinance(ticker: str, days: int = 90) -> Optional[pd.DataFrame]:
-    """
-    Fetch price data from yfinance (fallback source).
-    
-    Args:
-        ticker: Stock ticker symbol (e.g., 'AAPL')
-        days: Number of days of historical data
-        
-    Returns:
-        DataFrame with columns: date, open, high, low, close, volume
-        None if fetch fails
-        
-    Example:
-        >>> df = fetch_from_yfinance('AAPL', days=90)
-        >>> print(len(df))
-        90
-    """
-    try:
-        logger.info(f"Fetching {days} days of price data from yfinance for {ticker}")
-        
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        
-        # Fetch data
-        stock = yf.Ticker(ticker)
-        df = stock.history(start=start_date, end=end_date)
-        
-        if df.empty:
-            logger.warning(f"No data returned from yfinance for {ticker}")
-            return None
-        
-        # Standardize column names
-        df = df.reset_index()
-        df.columns = [col.lower() for col in df.columns]
-        
-        # Ensure we have required columns
-        required_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_cols):
-            logger.error(f"yfinance data missing required columns for {ticker}")
-            return None
-        
-        # Select and order columns
-        df = df[required_cols]
-        df = df.sort_values('date').reset_index(drop=True)
-        
-        logger.info(f"yfinance: Fetched {len(df)} rows for {ticker}")
-        return df
-        
-    except Exception as e:
-        logger.error(f"yfinance fetch failed for {ticker}: {str(e)}")
-        return None
 
 
 # ============================================================================
@@ -206,8 +224,8 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Execution flow:
     1. Check SQLite cache for recent data (< 24h old)
     2. If cached, return cached data
-    3. If not cached, try Polygon.io API
-    4. If Polygon fails, fall back to yfinance
+    3. If not cached, try yfinance (Primary - NO API key, fast, reliable)
+    4. If yfinance fails, fall back to Polygon.io (requires API key)
     5. Validate data quality (min 50 days)
     6. Cache results for future use
     7. Update state with price data
@@ -238,16 +256,16 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
             return state
         
         # ====================================================================
-        # STEP 2: Fetch from Polygon (Primary Source)
+        # STEP 2: Fetch from yfinance (Primary Source - NO API key needed)
         # ====================================================================
-        df = fetch_from_polygon(ticker, days=180)
+        df = fetch_from_yfinance(ticker, days=180)
         
         # ====================================================================
-        # STEP 3: Fallback to yfinance if Polygon fails
+        # STEP 3: Fallback to Polygon if yfinance fails
         # ====================================================================
         if df is None or not validate_price_data(df, ticker):
-            logger.warning(f"Node 1: Polygon failed for {ticker}, falling back to yfinance")
-            df = fetch_from_yfinance(ticker, days=180)
+            logger.warning(f"Node 1: yfinance failed for {ticker}, falling back to Polygon.io")
+            df = fetch_from_polygon(ticker, days=180)
         
         # ====================================================================
         # STEP 4: Validate Final Result

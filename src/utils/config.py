@@ -27,11 +27,12 @@ else:
 # ============================================================================
 
 # Data sources
-POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')      # Primary price data (Node 1)
-FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY')      # News, peers, market news (Nodes 2, 3)
+POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')              # Backup price data (Node 1)
+FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY')              # Peers, market news (Nodes 2, 3)
+ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY')  # Primary news + sentiment (Node 2)
 
 # LLM for explanations
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')            # Explanations (Nodes 13, 14)
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')                    # Explanations (Nodes 13, 14)
 
 
 # ============================================================================
@@ -61,11 +62,15 @@ def validate_config() -> None:
     """
     missing_keys = []
     
-    if not POLYGON_API_KEY:
-        missing_keys.append('POLYGON_API_KEY')
+    # Note: Polygon is now optional (backup to yfinance)
+    # if not POLYGON_API_KEY:
+    #     missing_keys.append('POLYGON_API_KEY (optional backup)')
     
     if not FINNHUB_API_KEY:
         missing_keys.append('FINNHUB_API_KEY')
+    
+    if not ALPHA_VANTAGE_API_KEY:
+        missing_keys.append('ALPHA_VANTAGE_API_KEY')
     
     if not GROQ_API_KEY:
         missing_keys.append('GROQ_API_KEY')
@@ -73,7 +78,7 @@ def validate_config() -> None:
     if missing_keys:
         raise ValueError(
             f"Missing required API keys in .env file: {', '.join(missing_keys)}\n"
-            f"Please copy .env.example to .env and add your API keys."
+            f"Please create a .env file with your API keys."
         )
     
     logger.info("Configuration validated successfully")
@@ -89,6 +94,7 @@ def get_config_summary() -> dict:
     return {
         'polygon_key_present': bool(POLYGON_API_KEY),
         'finnhub_key_present': bool(FINNHUB_API_KEY),
+        'alpha_vantage_key_present': bool(ALPHA_VANTAGE_API_KEY),
         'groq_key_present': bool(GROQ_API_KEY),
         'database_path': DATABASE_PATH,
         'cache_hours': CACHE_HOURS,
