@@ -99,7 +99,7 @@ def main():
         print("✅ DATABASE SETUP COMPLETE")
         print("=" * 80)
         print("\nNext steps:")
-        print("1. Copy .env.example to .env and add your API keys")
+        print("1. Create a .env file and add your API keys")
         print("2. Install dependencies: pip install -r requirements.txt")
         print("3. Start building nodes following NODE_BUILD_GUIDE.md")
         print("4. Run tests: pytest tests/ -v")

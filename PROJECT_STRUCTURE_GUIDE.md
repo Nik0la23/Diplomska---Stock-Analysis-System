@@ -9,7 +9,7 @@
 ```
 Diplomska/                          👈 THE HOUSE (your entire project)
 │
-├── .env.example                    👈 🔑 SECRET KEYS TEMPLATE
+├── .env                            👈 🔑 SECRET KEYS (gitignored)
 ├── .gitignore                      👈 🚫 KEEP OUT LIST
 ├── requirements.txt                👈 📦 SHOPPING LIST (pip install -r requirements.txt)
 ├── README.md                       👈 📖 HOUSE MANUAL
@@ -200,7 +200,7 @@ When building Node 1, you need:
 **A:** Through **State** (the shared whiteboard). Node 1 writes, Node 2 reads.
 
 ### Q: "Where do I put API keys?"
-**A:** In `.env` file (copy from `.env.example`). Read via `config.py`.
+**A:** In `.env` file (gitignored). Read via `config.py`.
 
 ### Q: "I'm building Node 8, where does it go?"
 **A:** `src/langgraph_nodes/node_08_news_learning.py`
