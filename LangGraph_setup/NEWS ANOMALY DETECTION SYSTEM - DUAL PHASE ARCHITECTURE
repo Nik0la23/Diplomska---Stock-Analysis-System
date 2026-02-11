@@ -1,0 +1,364 @@
+# NEWS ANOMALY DETECTION SYSTEM - DUAL PHASE ARCHITECTURE
+
+## System Overview
+
+The News Anomaly Detection System operates in two distinct phases to identify fake news, market manipulation, and fraudulent patterns in financial markets. This dual-phase approach separates content analysis from pattern validation to achieve higher accuracy and reduce false positives.
+
+---
+
+## PHASE 1: NODE 9A - Content Analysis & Feature Extraction
+
+### Purpose
+Extract quantifiable signals from news articles and social media content WITHOUT making filtering decisions. This node acts as a feature engineering layer that produces numerical scores and metadata.
+
+### Core Functions
+
+#### 1. Textual Feature Extraction
+- **Sensationalism Scoring**: Detect clickbait language, excessive punctuation (!!! or ???), ALL CAPS usage, emotional language intensity
+- **Urgency Scoring**: Identify time-pressure phrases ("BREAKING", "URGENT", "ACT NOW", "LIMITED TIME")
+- **Unverified Claims Detection**: Flag hedging language ("allegedly", "rumored", "sources say", "unconfirmed reports")
+- **Complexity Analysis**: Measure technical jargon density, readability metrics, sentence structure complexity
+
+#### 2. Source Credibility Assessment
+- **Domain Authority**: Evaluate source reliability (Bloomberg/Reuters = high, unknown blogs = low)
+- **Publication History**: Check if source has established track record
+- **Author Attribution**: Verify if content has named authors vs. anonymous posts
+
+#### 3. Entity & Keyword Recognition
+- **Financial Terms**: Extract mentions of "fraud", "investigation", "SEC", "lawsuit", "bankruptcy", "merger"
+- **Named Entities**: Identify companies, executives, regulators, financial institutions
+- **Temporal Markers**: Classify as past event, current situation, or future prediction
+
+#### 4. Contextual Tagging
+- **Topic Classification**: Categorize content (earnings report, fraud allegation, merger announcement, regulatory action)
+- **Sentiment Extraction**: Determine overall tone (positive, negative, neutral) and intensity
+- **Geographic Markers**: Identify relevant jurisdictions and markets
+
+### Output Structure
+NODE 9A produces a structured data object for each piece of content:
+```
+Content Scores (0-1 scale):
+├─ Sensationalism Score: 0.85
+├─ Urgency Score: 0.90
+├─ Unverified Claims Score: 0.75
+├─ Source Credibility Score: 0.15
+├─ Complexity Score: 0.40
+└─ Composite Anomaly Score: 0.78
+
+Metadata Tags:
+├─ Keywords: ["BREAKING", "EXPOSED", "ACT NOW"]
+├─ Entities: ["XYZ Corp", "CEO John Doe"]
+├─ Topic: "fraud_allegation"
+├─ Sentiment: "negative" (intensity: 0.88)
+└─ Temporal: "current_event"
+```
+
+### Critical Principle
+**NODE 9A DOES NOT FILTER**. It only scores and tags. A legitimate Bloomberg article about an SEC investigation will trigger keywords like "fraud" and "investigation", but will have:
+- Low sensationalism score (factual reporting style)
+- High source credibility score (Bloomberg domain)
+- Low unverified claims score (official sources cited)
+
+These scores are passed to NODE 9B for final decision-making.
+
+---
+
+## PHASE 2: NODE 9B - Cross-Validation & Fraud Pattern Detection
+
+### Purpose
+Validate NODE 9A findings against historical market data and detect sophisticated fraud patterns that only emerge when combining news analysis with price/volume behavior over time.
+
+### Core Functions
+
+#### 1. News Validation Through Market Cross-Reference
+NODE 9B receives NODE 9A scores and validates them against outputs from historical analysis nodes:
+
+**Validation Process:**
+- **Price Correlation Check** (uses NODE 1 - Historical Price Analysis): Does the news align with actual price movement?
+- **Volume Validation** (uses NODE 2 - Volume Analysis): Is there unusual trading volume supporting the news?
+- **Volatility Assessment** (uses NODE 3 - Volatility Analysis): Does volatility match the news severity?
+- **Sentiment Cross-Check** (uses NODE 5 - Historical Sentiment): Is this sentiment shift abnormal for this stock?
+- **Sector Correlation** (uses NODE 7 - Correlation Analysis): Are related stocks moving similarly?
+- **Macro Context** (uses NODE 6 - Macro Indicators): Do broader market conditions support this movement?
+
+**Decision Logic Examples:**
+
+✅ **Legitimate News Confirmed:**
+```
+Bloomberg reports: "SEC launches fraud investigation into XYZ Corp"
+├─ NODE 9A: Keywords detected but low sensationalism, high source credibility
+├─ NODE 1: Price dropped -12% (expected reaction)
+├─ NODE 2: Volume spike 400% (significant interest)
+├─ NODE 7: Sector peers unaffected (company-specific issue)
+└─ DECISION: LEGITIMATE NEWS - No action needed
+```
+
+❌ **Fake News Detected:**
+```
+Unknown blog posts: "BREAKING: XYZ Corp MIRACLE CURE - Stock to 10X!"
+├─ NODE 9A: High sensationalism, low source credibility, high urgency
+├─ NODE 1: No significant price movement
+├─ NODE 2: Normal trading volume
+├─ Reputable sources: No corroboration
+└─ DECISION: LIKELY FAKE NEWS - Flag for investigation
+```
+
+#### 2. Pump & Dump Fraud Detection
+
+**Pattern Recognition:**
+```
+Stage 1 - Pump Phase:
+├─ Suspicious news appears (NODE 9A: high urgency, low credibility)
+├─ Multiple coordinated social media posts (NODE 5: abnormal sentiment surge)
+├─ Sharp price increase (NODE 1: returns exceed historical norms)
+├─ Volume spike (NODE 2: 500%+ above average)
+└─ Pattern detected: Potential pump phase
+
+Stage 2 - Monitoring:
+├─ Track price behavior over 24-72 hours
+├─ Monitor for news retraction or disappearance
+└─ Watch for coordinated selling
+
+Stage 3 - Dump Confirmation:
+├─ Sharp price drop (often -30% to -60%)
+├─ Volume returns to normal
+├─ Original news sources delete content or go silent
+└─ CONFIRMED: Pump & Dump Scheme - Alert regulators
+```
+
+#### 3. Unexplained Price Anomaly Detection
+
+**Identifies market manipulation when:**
+```
+Market Behavior:
+├─ NODE 1: Price movement outside 3-sigma historical bands
+├─ NODE 3: Volatility spike without fundamental catalyst
+├─ NODE 4: Unusual intraday trading patterns (spoofing, layering)
+
+News Environment:
+├─ NODE 9A: No credible news to justify movement
+├─ Reputable sources: Silent on the stock
+├─ NODE 7: Sector peers show normal behavior
+
+Context Check:
+├─ NODE 6: No macro event explanation
+├─ Earnings calendar: No upcoming catalysts
+
+CONCLUSION: Unexplained price anomaly - Possible manipulation
+```
+
+#### 4. News-Price Divergence Analysis
+
+**Detects scenarios where news and price action contradict:**
+
+**Type A - Positive News, Negative Price:**
+```
+Major positive announcement (credible source)
++ Price decreases significantly
+= Possible explanations:
+  ├─ Already priced in
+  ├─ Hidden negative information (insider knowledge)
+  ├─ Market skepticism about sustainability
+  └─ Investigate further
+```
+
+**Type B - Negative News, Positive Price:**
+```
+Major negative announcement (credible source)
++ Price increases
+= Possible explanations:
+  ├─ Market expected worse news
+  ├─ Contrarian buying opportunity recognized
+  ├─ Short covering activity
+  └─ Monitor for reversal
+```
+
+**Type C - Fake News, Real Price Impact (Manipulation):**
+```
+Low-credibility sensational news
++ Significant price movement
++ No corroboration from reputable sources
+= HIGH PROBABILITY MANIPULATION:
+  └─ Coordinated scheme to move market
+```
+
+### Output Structure
+NODE 9B produces actionable intelligence:
+```
+Validation Results:
+├─ News Classification: [LEGITIMATE | FAKE | UNCERTAIN]
+├─ Confidence Score: 0.92
+└─ Supporting Evidence: [list of corroborating signals]
+
+Fraud Pattern Alerts:
+├─ Pump & Dump: DETECTED (Stage: dump_confirmed)
+├─ Price Manipulation: SUSPECTED (confidence: 0.78)
+└─ News-Price Divergence: DETECTED (type: positive_news_negative_price)
+
+Anomaly Assessment:
+├─ Severity Score: 0.85 (HIGH)
+├─ Risk Level: CRITICAL
+└─ Recommended Action: FLAG_FOR_REGULATORY_REVIEW
+
+Context Summary:
+├─ Historical Precedent: 3 similar patterns detected in past 12 months
+├─ Sector Impact: Isolated (no contagion detected)
+└─ Market Conditions: Normal volatility environment
+```
+
+---
+
+## Integration Between Phases
+
+### Data Flow
+```
+Real-time News/Social Media
+         ↓
+    [NODE 9A]
+    Content Analysis & Scoring
+         ↓
+    Feature Scores + Tags
+         ↓
+    [NODE 9B] ← Historical Data (NODES 1-8)
+    Validation & Pattern Detection
+         ↓
+    Classification + Fraud Alerts
+         ↓
+    Dashboard / Alert System
+```
+
+### Why This Two-Phase Approach?
+
+**Separation of Concerns:**
+- NODE 9A focuses solely on content analysis without market context
+- NODE 9B brings in temporal and cross-asset context for validation
+
+**Reduces False Positives:**
+- Keywords alone would flag legitimate Bloomberg fraud investigations as fake news
+- Market validation confirms whether news is genuine or manipulative
+
+**Enables Sophisticated Fraud Detection:**
+- Pump & dump schemes only visible when combining news timing with price/volume patterns over days
+- Price manipulation requires cross-referencing multiple data sources
+
+**Scalability:**
+- NODE 9A can process thousands of articles in parallel
+- NODE 9B performs deeper, computationally expensive analysis only on flagged content
+
+---
+
+## Example: Complete Workflow
+
+### Scenario: Suspicious Tech Stock Announcement
+
+**T=0 (News Published)**
+```
+NODE 9A Analysis:
+Article: "BREAKING: TechCo announces REVOLUTIONARY AI chip - 1000X faster!"
+Source: unknown-tech-insider.blog
+
+Scores Generated:
+├─ Sensationalism: 0.92 (Very High - "REVOLUTIONARY", "1000X", excessive caps)
+├─ Urgency: 0.88 (High - "BREAKING")
+├─ Source Credibility: 0.12 (Very Low - unknown domain)
+├─ Unverified Claims: 0.85 (High - no technical specifications, no named sources)
+└─ Composite Anomaly: 0.89
+
+Tags: [ai_breakthrough, unverified, high_urgency]
+→ Passed to NODE 9B for validation
+```
+
+**T=0 to T+30min (Initial Market Reaction)**
+```
+NODE 9B Validation:
+Market Data Check:
+├─ NODE 1: Price +18% in 20 minutes ⚠️ (abnormal move)
+├─ NODE 2: Volume 650% above daily average ⚠️ (extreme interest)
+├─ NODE 5: Social media mentions +2000% ⚠️ (coordinated?)
+├─ NODE 7: Other semiconductor stocks flat (isolated event)
+
+Credibility Cross-Check:
+├─ Reuters/Bloomberg: No mention of announcement ⚠️
+├─ TechCo official website: No press release ⚠️
+├─ SEC filings: No material event disclosure ⚠️
+
+Pattern Recognition:
+→ Characteristics match PUMP PHASE
+→ Flagged for monitoring
+→ Severity: HIGH
+```
+
+**T+2 hours (Peak)**
+```
+NODE 9B Continued Monitoring:
+├─ Price peaked at +22%
+├─ Volume beginning to decline
+├─ Still no corroboration from credible sources
+├─ Original blog post shared 50,000+ times on social media
+└─ Status: Monitoring for dump phase
+```
+
+**T+48 hours (Dump Detected)**
+```
+NODE 9B Pattern Confirmation:
+Market Behavior:
+├─ Price crashed to -28% from peak (net -6% from pre-news)
+├─ Volume normalized
+├─ Social media buzz disappeared
+├─ Original blog post deleted
+
+Fraud Pattern Confirmed:
+└─ PUMP & DUMP SCHEME DETECTED
+
+Actions Taken:
+├─ Alert generated for compliance team
+├─ Pattern logged in fraud database
+├─ Similar content flagged for priority review
+└─ Recommended: Report to SEC
+```
+
+---
+
+## Technical Considerations for Implementation
+
+### NODE 9A Requirements
+- Natural Language Processing (NLP) models for feature extraction
+- Domain reputation database (Bloomberg = 0.95, unknown blogs = 0.10)
+- Real-time content ingestion pipeline
+- Keyword/entity recognition system
+
+### NODE 9B Requirements
+- Access to real-time and historical market data (price, volume, volatility)
+- Pattern matching algorithms for fraud detection
+- Cross-reference capability with multiple data sources
+- Time-series analysis for detecting multi-day patterns
+- Alert management system for escalation
+
+### Performance Considerations
+- NODE 9A processes content in milliseconds (lightweight feature extraction)
+- NODE 9B performs deeper analysis in seconds (cross-references multiple datasets)
+- Pattern detection happens over hours/days (monitors evolution of potential fraud)
+
+---
+
+## Success Metrics
+
+**NODE 9A Performance:**
+- Accuracy of sensationalism scoring vs. human labeling
+- Source credibility database coverage
+- Processing latency (target: <100ms per article)
+
+**NODE 9B Performance:**
+- False positive rate for fake news detection (target: <5%)
+- Pump & dump detection accuracy (target: >85%)
+- Time to detection for fraud patterns (target: detect before dump phase)
+- News-price divergence identification precision
+
+**System-Wide:**
+- End-to-end latency from news publication to alert
+- Reduction in market manipulation incidents
+- Regulatory compliance and reporting accuracy
+
+---
+
+This dual-phase architecture ensures professional-grade fraud detection by combining sophisticated content analysis with market behavior validation, minimizing false positives while maximizing detection of genuine manipulation schemes.
