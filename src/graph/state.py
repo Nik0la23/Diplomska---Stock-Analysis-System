@@ -88,8 +88,10 @@ class StockAnalysisState(TypedDict):
     # ========================================================================
     # NODE 9A: Early Anomaly Detection (Content-based)
     # ========================================================================
-    early_anomalies_detected: List[Dict[str, Any]]    # Fake/suspicious news
-    cleaned_news: List[Dict[str, Any]]                # News after filtering
+    cleaned_stock_news: List[Dict[str, Any]]          # Stock news with embedded scores
+    cleaned_market_news: List[Dict[str, Any]]         # Market news with embedded scores
+    cleaned_related_company_news: List[Dict[str, Any]] # Related news with embedded scores
+    content_analysis_summary: Optional[Dict[str, Any]] # Overall content analysis results
     
     
     # ========================================================================
@@ -188,8 +190,10 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         verified_sentiment=None,
         verified_confidence=None,
         source_reliability_scores={},
-        early_anomalies_detected=[],
-        cleaned_news=[],
+        cleaned_stock_news=[],
+        cleaned_market_news=[],
+        cleaned_related_company_news=[],
+        content_analysis_summary=None,
         behavioral_anomalies=[],
         manipulation_risk=None,
         backtest_results=None,
