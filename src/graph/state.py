@@ -143,7 +143,7 @@ class StockAnalysisState(TypedDict):
     # SYSTEM TRACKING
     # ========================================================================
     errors: Annotated[List[str], operator.add]        # Accumulated errors
-    node_execution_times: Dict[str, float]            # Per-node timing
+    node_execution_times: Annotated[Dict[str, float], operator.or_]  # Per-node timing (mergeable)
     total_execution_time: Optional[float]             # End-to-end time
     timestamp: Optional[datetime]                     # When analysis started
 
