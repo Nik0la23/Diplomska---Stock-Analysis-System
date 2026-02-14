@@ -3,16 +3,14 @@ LangGraph Workflow Builder
 
 Defines the complete stock analysis workflow with all nodes and edges.
 
-Current Flow (Nodes 1-4, 7):
+Current Flow (Nodes 1-7, 9A):
 1. Node 1: Price Data Fetching
 2. Node 3: Related Companies Detection
 3. Node 2: Multi-Source News Fetching
 4. Node 9A: Content Analysis & Feature Extraction
-5. PARALLEL: Node 4 (Technical) & Node 7 (Monte Carlo)
+5. PARALLEL: Nodes 4, 5, 6, 7 (Technical, Sentiment, Market Context, Monte Carlo)
 
 Future additions:
-- Node 5: Sentiment Analysis
-- Node 6: Market Context
 - Node 8: News Verification & Learning
 - Nodes 9B-15: Remaining pipeline
 """
@@ -27,6 +25,8 @@ from src.langgraph_nodes.node_03_related_companies import detect_related_compani
 from src.langgraph_nodes.node_02_news_fetching import fetch_all_news_node
 from src.langgraph_nodes.node_09a_content_analysis import content_analysis_node
 from src.langgraph_nodes.node_04_technical_analysis import technical_analysis_node
+from src.langgraph_nodes.node_05_sentiment_analysis import sentiment_analysis_node
+from src.langgraph_nodes.node_06_market_context import market_context_node
 from src.langgraph_nodes.node_07_monte_carlo import monte_carlo_forecasting_node
 
 logger = logging.getLogger(__name__)
@@ -88,15 +88,15 @@ def create_stock_analysis_workflow() -> StateGraph:
       ↓
     Node 9A: Content Analysis
       ↓
-    ┌─────────────┴──────────────┐
-    ↓                            ↓
-    Node 4: Technical         Node 7: Monte Carlo
-    Analysis                  Forecasting
-    └─────────────┬──────────────┘
+    ┌─────────┬─────────┬─────────┐
+    ↓         ↓         ↓         ↓
+    Node 4    Node 5    Node 6    Node 7
+    Tech      Sent      Market    Monte Carlo
+    └─────────┴─────────┴─────────┘
       ↓
     Conditional Edge
       ↓
-    END (for now)
+    END (Node 8 next)
     ```
     
     Returns:
@@ -123,8 +123,10 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_node("fetch_news", fetch_all_news_node)
     workflow.add_node("content_analysis", content_analysis_node)
     
-    # Phase 2: Parallel Analysis
+    # Phase 2: Parallel Analysis (4 nodes execute simultaneously)
     workflow.add_node("technical_analysis", technical_analysis_node)
+    workflow.add_node("sentiment_analysis", sentiment_analysis_node)
+    workflow.add_node("market_context", market_context_node)
     workflow.add_node("monte_carlo", monte_carlo_forecasting_node)
     
     # ========================================================================
@@ -140,22 +142,42 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_edge("fetch_news", "content_analysis")
     
     # ========================================================================
-    # PARALLEL EXECUTION
+    # PARALLEL EXECUTION (Nodes 4, 5, 6, 7)
     # ========================================================================
     
-    # From Node 9A, split to both Node 4 and Node 7
+    # From Node 9A, split to ALL 4 analysis nodes
     # These execute in PARALLEL (LangGraph handles this automatically)
     workflow.add_edge("content_analysis", "technical_analysis")
+    workflow.add_edge("content_analysis", "sentiment_analysis")
+    workflow.add_edge("content_analysis", "market_context")
     workflow.add_edge("content_analysis", "monte_carlo")
     
     # ========================================================================
     # CONVERGENCE & CONDITIONAL ROUTING
     # ========================================================================
     
-    # Both parallel nodes converge here
+    # All 4 parallel nodes converge here
     # Conditional edge determines next step
     workflow.add_conditional_edges(
         "technical_analysis",
+        should_continue_after_parallel,
+        {
+            "continue": END,  # Future: Route to Node 8
+            "end": END
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "sentiment_analysis",
+        should_continue_after_parallel,
+        {
+            "continue": END,  # Future: Route to Node 8
+            "end": END
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "market_context",
         should_continue_after_parallel,
         {
             "continue": END,  # Future: Route to Node 8
@@ -172,7 +194,7 @@ def create_stock_analysis_workflow() -> StateGraph:
         }
     )
     
-    logger.info("Workflow built successfully with 6 nodes")
+    logger.info("Workflow built successfully with 8 nodes (4 parallel)")
     
     # Compile and return
     return workflow.compile()
@@ -257,6 +279,22 @@ def print_analysis_summary(state: StockAnalysisState):
                 print(f"   RSI: {indicators['rsi']:.2f}")
             if 'macd' in indicators:
                 print(f"   MACD: {indicators['macd']['macd']:.2f}")
+    
+    # Sentiment Analysis
+    if state.get('sentiment_signal'):
+        print(f"\n💭 Sentiment Analysis:")
+        print(f"   Signal: {state['sentiment_signal']}")
+        print(f"   Confidence: {state['sentiment_confidence']*100:.1f}%")
+        print(f"   Combined Sentiment: {state['aggregated_sentiment']:.3f}")
+    
+    # Market Context
+    if state.get('market_context'):
+        mc_data = state['market_context']
+        print(f"\n🌍 Market Context:")
+        print(f"   Sector: {mc_data.get('sector', 'N/A')} ({mc_data.get('sector_trend', 'N/A')})")
+        print(f"   Market: {mc_data.get('market_trend', 'N/A')}")
+        print(f"   Signal: {mc_data.get('context_signal', 'N/A')}")
+        print(f"   Correlation: {mc_data.get('market_correlation', 0):.2f}")
     
     # Monte Carlo Forecast
     if state.get('monte_carlo_results'):
