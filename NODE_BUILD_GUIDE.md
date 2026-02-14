@@ -785,7 +785,7 @@ Step 2: Calculate source reliability
     Count total articles
     Count accurate predictions (sentiment matched price movement)
     Calculate accuracy rate = accurate / total
-  
+
 Step 3: Calculate confidence multipliers
   High accuracy (>80%) → multiplier = 1.2x (boost confidence)
   Medium accuracy (60-80%) → multiplier = 1.0x (no change)

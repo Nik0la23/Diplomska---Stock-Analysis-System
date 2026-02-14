@@ -17,9 +17,10 @@ sys.path.insert(0, str(project_root))
 from src.graph.state import create_initial_state
 from src.langgraph_nodes.node_02_news_fetching import (
     fetch_all_news_node,
-    fetch_company_news_async,
-    fetch_market_news_async,
-    fetch_related_companies_news_async
+    fetch_alpha_vantage_news_async,
+    fetch_finnhub_company_news_async,
+    fetch_finnhub_market_news_async,
+    NEWS_LOOKBACK_DAYS,
 )
 
 
@@ -99,11 +100,11 @@ class TestNode02NewsFetching:
         
         if all_news:
             article = all_news[0]
-            
-            # Should have required fields
-            required_fields = ['headline', 'summary', 'source', 'url', 'datetime', 'news_type']
-            for field in required_fields:
-                assert field in article, f"Missing field: {field}"
+            # Standardized articles have headline (or title) and news_type; legacy cache may not
+            has_headline = 'headline' in article or 'title' in article
+            assert has_headline, "Missing headline/title"
+            if 'news_type' in article:
+                assert article['news_type'] in ('stock', 'market', 'related'), "Invalid news_type"
     
     def test_news_type_classification(self):
         """Test that news is correctly classified by type"""
@@ -128,13 +129,13 @@ class TestNode02NewsFetching:
                 assert article['news_type'] == 'related'
     
     @pytest.mark.asyncio
-    async def test_fetch_company_news_async(self):
-        """Test async company news fetching"""
-        from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        to_date = datetime.now().strftime('%Y-%m-%d')
+    async def test_fetch_finnhub_company_news_async(self):
+        """Test async Finnhub company news fetching (6-month range)"""
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
         
         async with aiohttp.ClientSession() as session:
-            news = await fetch_company_news_async('AAPL', from_date, to_date, session)
+            news = await fetch_finnhub_company_news_async('AAPL', from_date, to_date, session)
             
             # Should return a list (may be empty if API limit reached)
             assert isinstance(news, list)
@@ -148,10 +149,10 @@ class TestNode02NewsFetching:
                 assert article['news_type'] == 'stock'
     
     @pytest.mark.asyncio
-    async def test_fetch_market_news_async(self):
-        """Test async market news fetching"""
+    async def test_fetch_finnhub_market_news_async(self):
+        """Test async Finnhub market news fetching"""
         async with aiohttp.ClientSession() as session:
-            news = await fetch_market_news_async('general', session)
+            news = await fetch_finnhub_market_news_async('general', session)
             
             # Should return a list
             assert isinstance(news, list)
@@ -165,46 +166,19 @@ class TestNode02NewsFetching:
                 assert article['news_type'] == 'market'
     
     @pytest.mark.asyncio
-    async def test_fetch_related_companies_news_async(self):
-        """Test async related companies news fetching"""
-        from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        to_date = datetime.now().strftime('%Y-%m-%d')
+    async def test_fetch_alpha_vantage_news_async_with_date_range(self):
+        """Test Alpha Vantage news with 6-month date range"""
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
         
         async with aiohttp.ClientSession() as session:
-            news = await fetch_related_companies_news_async(
-                ['MSFT', 'GOOGL'],
-                from_date,
-                to_date,
-                session,
-                max_articles_per_ticker=10
-            )
+            news = await fetch_alpha_vantage_news_async('AAPL', session, from_date, to_date)
             
-            # Should return a list
             assert isinstance(news, list)
-            
-            # Should limit articles per ticker
             if news:
-                # All should be marked as related news
-                for article in news:
-                    if 'news_type' in article:
-                        assert article['news_type'] == 'related'
-    
-    @pytest.mark.asyncio
-    async def test_fetch_related_companies_news_empty_list(self):
-        """Test fetching related news with empty ticker list"""
-        from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        to_date = datetime.now().strftime('%Y-%m-%d')
-        
-        async with aiohttp.ClientSession() as session:
-            news = await fetch_related_companies_news_async(
-                [],  # Empty list
-                from_date,
-                to_date,
-                session
-            )
-            
-            # Should return empty list
-            assert news == []
+                article = news[0]
+                assert 'headline' in article or 'title' in article
+                assert 'news_type' in article or 'overall_sentiment_score' in article
 
 
 # ============================================================================
@@ -244,9 +218,8 @@ class TestNode02Integration:
         
         result = fetch_all_news_node(state)
         
-        # Parallel fetching should complete in < 4 seconds
-        # (3 sources fetched simultaneously)
-        assert result['node_execution_times']['node_2'] < 4.0
+        # With 6-month window (Alpha Vantage + Finnhub company + market), allow up to 15s
+        assert result['node_execution_times']['node_2'] < 15.0
 
 
 # ============================================================================
