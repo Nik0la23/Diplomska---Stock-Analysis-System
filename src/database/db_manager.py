@@ -182,6 +182,82 @@ def get_cached_price_data(
         return None
 
 
+def get_latest_price_date(
+    ticker: str,
+    db_path: str = DEFAULT_DB_PATH
+) -> Optional[datetime]:
+    """
+    Get the most recent date of stored price data for a ticker.
+    
+    Used for incremental fetch: only fetch from (latest_date - overlap) to today.
+    
+    Args:
+        ticker: Stock ticker symbol
+        db_path: Path to database
+    
+    Returns:
+        datetime of latest stored date, or None if no data for ticker
+    
+    Example:
+        >>> latest = get_latest_price_date('NVDA')
+        >>> if latest: fetch_from_yfinance('NVDA', from_date=latest - timedelta(days=3))
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MAX(date) AS latest_date
+                FROM price_data
+                WHERE ticker = ?
+            """, (ticker,))
+            row = cursor.fetchone()
+            if not row or not row['latest_date']:
+                return None
+            return datetime.strptime(str(row['latest_date'])[:10], '%Y-%m-%d')
+    except Exception as e:
+        logger.error(f"Failed to get latest price date for {ticker}: {str(e)}")
+        return None
+
+
+def get_price_data_for_ticker(
+    ticker: str,
+    days: int = 180,
+    db_path: str = DEFAULT_DB_PATH
+) -> Optional[pd.DataFrame]:
+    """
+    Get all stored price data for a ticker in the last N days (by date, not created_at).
+    
+    Used after incremental fetch to load the full series for the pipeline.
+    
+    Args:
+        ticker: Stock ticker symbol
+        days: Number of calendar days of history (default: 180)
+        db_path: Path to database
+    
+    Returns:
+        DataFrame with date, open, high, low, close, volume or None if empty
+    """
+    try:
+        with get_connection(db_path) as conn:
+            query = """
+                SELECT date, open, high, low, close, volume
+                FROM price_data
+                WHERE ticker = ?
+                AND date >= date('now', ?)
+                ORDER BY date ASC
+            """
+            params = (ticker, f'-{days} days')
+            df = pd.read_sql_query(query, conn, params=params)
+            if df.empty:
+                return None
+            df['date'] = pd.to_datetime(df['date'])
+            logger.info(f"Retrieved {len(df)} price records for {ticker} (last {days} days)")
+            return df
+    except Exception as e:
+        logger.error(f"Failed to get price data for {ticker}: {str(e)}")
+        return None
+
+
 # ============================================================================
 # NEWS OPERATIONS
 # ============================================================================
@@ -337,6 +413,106 @@ def get_cached_news(
             
     except Exception as e:
         logger.error(f"Failed to retrieve cached news: {str(e)}")
+        return []
+
+
+def get_latest_news_date(
+    ticker: str,
+    db_path: str = DEFAULT_DB_PATH
+) -> Optional[datetime]:
+    """
+    Get the most recent published_at date of stored news for a ticker (any type).
+    
+    Used for incremental fetch: only fetch from (latest_date - overlap) to today.
+    
+    Args:
+        ticker: Stock ticker symbol
+        db_path: Path to database
+    
+    Returns:
+        datetime of latest article published_at, or None if no news for ticker
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT MAX(published_at) AS latest_date
+                FROM news_articles
+                WHERE ticker = ?
+                AND published_at IS NOT NULL
+                AND published_at != ''
+            """, (ticker,))
+            row = cursor.fetchone()
+            if not row or not row['latest_date']:
+                return None
+            raw = str(row['latest_date'])
+            return datetime.strptime(raw[:10], '%Y-%m-%d')
+    except Exception as e:
+        logger.error(f"Failed to get latest news date for {ticker}: {str(e)}")
+        return None
+
+
+def get_news_for_ticker(
+    ticker: str,
+    news_type: str,
+    days: int = 180,
+    db_path: str = DEFAULT_DB_PATH
+) -> List[Dict]:
+    """
+    Get all stored news for a ticker in the last N days (by published_at).
+    
+    Returns articles in pipeline format (headline, summary, datetime, etc.)
+    so downstream nodes work the same as with API-fetched news.
+    
+    Args:
+        ticker: Stock ticker symbol
+        news_type: 'stock', 'market', or 'related'
+        days: Number of calendar days of history (default: 180)
+        db_path: Path to database
+    
+    Returns:
+        List of article dicts with headline, summary, url, source, datetime, etc.
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT title, description, url, source, published_at
+                FROM news_articles
+                WHERE ticker = ?
+                AND news_type = ?
+                AND published_at >= date('now', ?)
+                ORDER BY published_at DESC
+            """, (ticker, news_type, f'-{days} days'))
+            articles = []
+            for row in cursor.fetchall():
+                pub = row['published_at']
+                try:
+                    if not pub:
+                        ts = int(datetime.now().timestamp())
+                    else:
+                        s = str(pub).replace('Z', '').strip()
+                        if 'T' in s:
+                            ts = int(datetime.strptime(s[:19], '%Y-%m-%dT%H:%M:%S').timestamp())
+                        else:
+                            ts = int(datetime.strptime(s[:10], '%Y-%m-%d').timestamp())
+                except (ValueError, TypeError):
+                    ts = int(datetime.now().timestamp())
+                src_name = row['source'] if isinstance(row['source'], str) else getattr(row['source'], 'get', lambda k, d=None: d)('name', 'Unknown')
+                articles.append({
+                    'headline': row['title'] or '',
+                    'title': row['title'] or '',
+                    'summary': row['description'] or '',
+                    'description': row['description'] or '',
+                    'url': row['url'] or '',
+                    'source': {'name': src_name},
+                    'publishedAt': pub,
+                    'datetime': ts
+                })
+            logger.info(f"Retrieved {len(articles)} {news_type} articles for {ticker} (last {days} days)")
+            return articles
+    except Exception as e:
+        logger.error(f"Failed to get news for {ticker} ({news_type}): {str(e)}")
         return []
 
 

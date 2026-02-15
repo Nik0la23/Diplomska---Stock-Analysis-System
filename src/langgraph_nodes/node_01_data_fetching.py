@@ -20,9 +20,17 @@ from polygon import RESTClient
 import yfinance as yf
 
 from src.utils.config import POLYGON_API_KEY, DATABASE_PATH, CACHE_HOURS
-from src.database.db_manager import get_cached_price_data, cache_price_data
+from src.database.db_manager import (
+    get_cached_price_data,
+    cache_price_data,
+    get_latest_price_date,
+    get_price_data_for_ticker,
+)
 
 logger = logging.getLogger(__name__)
+
+# Overlap when doing incremental fetch (re-fetch last N days for corrections)
+PRICE_OVERLAP_DAYS = 3
 
 
 # ============================================================================
@@ -99,6 +107,7 @@ def fetch_from_yfinance(ticker: str, days: int = 180) -> Optional[pd.DataFrame]:
 # HELPER FUNCTION: Fetch from Polygon (Backup)
 # ============================================================================
 
+def fetch_from_polygon(ticker: str, days: int = 180) -> Optional[pd.DataFrame]:
     """
     Fetch price data from Polygon.io API (Backup source).
     
@@ -243,10 +252,9 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Node 1: Starting price data fetch for {ticker}")
         
         # ====================================================================
-        # STEP 1: Check Cache (80% cache hit rate)
+        # STEP 1: Same-day cache (hybrid) — avoid API if we have fresh data
         # ====================================================================
         cached_df = get_cached_price_data(ticker, max_age_hours=CACHE_HOURS)
-        
         if cached_df is not None and validate_price_data(cached_df, ticker):
             logger.info(f"Node 1: Using cached data for {ticker} ({len(cached_df)} rows)")
             state['raw_price_data'] = cached_df
@@ -256,20 +264,44 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
             return state
         
         # ====================================================================
-        # STEP 2: Fetch from yfinance (Primary Source - NO API key needed)
+        # STEP 2: Multi-day gap — check DB for latest date, fetch only missing
         # ====================================================================
-        df = fetch_from_yfinance(ticker, days=180)
+        latest_date = get_latest_price_date(ticker)
+        today = datetime.now().date()
+        
+        if latest_date is not None:
+            latest_date = latest_date.date() if hasattr(latest_date, 'date') else latest_date
+            days_since = (today - latest_date).days
+            
+            if days_since <= 1:
+                # Data is current; load full series from DB (no API)
+                df = get_price_data_for_ticker(ticker, days=180)
+                if df is not None and validate_price_data(df, ticker):
+                    logger.info(f"Node 1: Data current for {ticker}, loaded {len(df)} rows from DB (no API)")
+                    state['raw_price_data'] = df
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    state['node_execution_times']['node_1'] = elapsed
+                    return state
+                # Fall through to full fetch if DB data invalid or missing
         
         # ====================================================================
-        # STEP 3: Fallback to Polygon if yfinance fails
+        # STEP 3: First-time or incremental fetch
         # ====================================================================
+        if latest_date is None:
+            # First time: full 6 months
+            days_to_fetch = 180
+            logger.info(f"Node 1: First run for {ticker}, fetching {days_to_fetch} days")
+        else:
+            # Incremental: missing days + overlap for corrections
+            days_since = (today - latest_date).days
+            days_to_fetch = min(days_since + PRICE_OVERLAP_DAYS, 180)
+            logger.info(f"Node 1: Incremental fetch for {ticker}: {days_to_fetch} days (incl. {PRICE_OVERLAP_DAYS}-day overlap)")
+        
+        df = fetch_from_yfinance(ticker, days=days_to_fetch)
         if df is None or not validate_price_data(df, ticker):
             logger.warning(f"Node 1: yfinance failed for {ticker}, falling back to Polygon.io")
-            df = fetch_from_polygon(ticker, days=180)
+            df = fetch_from_polygon(ticker, days=days_to_fetch)
         
-        # ====================================================================
-        # STEP 4: Validate Final Result
-        # ====================================================================
         if df is None or not validate_price_data(df, ticker):
             logger.error(f"Node 1: All price sources failed for {ticker}")
             state['errors'].append(f"Node 1: Failed to fetch price data for {ticker}")
@@ -278,24 +310,26 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
             state['node_execution_times']['node_1'] = elapsed
             return state
         
-        # ====================================================================
-        # STEP 5: Cache for Future Use
-        # ====================================================================
+        # INSERT OR REPLACE so overlap updates corrected closes
         try:
             cache_price_data(ticker, df)
             logger.info(f"Node 1: Cached {len(df)} rows for {ticker}")
         except Exception as e:
             logger.warning(f"Node 1: Failed to cache data for {ticker}: {str(e)}")
-            # Continue anyway - caching failure is not critical
         
-        # ====================================================================
-        # STEP 6: Update State
-        # ====================================================================
-        state['raw_price_data'] = df
+        # After incremental write, use full series from DB so state has 6 months
+        if latest_date is not None and days_to_fetch < 180:
+            full_df = get_price_data_for_ticker(ticker, days=180)
+            if full_df is not None and validate_price_data(full_df, ticker):
+                state['raw_price_data'] = full_df
+            else:
+                state['raw_price_data'] = df
+        else:
+            state['raw_price_data'] = df
+        
         elapsed = (datetime.now() - start_time).total_seconds()
         state['node_execution_times']['node_1'] = elapsed
-        
-        logger.info(f"Node 1: Successfully fetched {len(df)} rows for {ticker} in {elapsed:.2f}s")
+        logger.info(f"Node 1: Successfully fetched {len(state['raw_price_data'])} rows for {ticker} in {elapsed:.2f}s")
         return state
         
     except Exception as e:

@@ -663,6 +663,11 @@ def news_verification_node(state: Dict) -> Dict:
     ticker = state.get('ticker', 'UNKNOWN')
     
     try:
+        # Idempotency: Node 8 can be reached from multiple parallel branches; run once
+        if state.get('news_impact_verification') is not None:
+            logger.debug("Node 8: Already ran (idempotent skip)")
+            return state
+        
         logger.info(f"Node 8: Starting news verification & learning for {ticker}")
         
         # =====================================================================
@@ -670,18 +675,20 @@ def news_verification_node(state: Dict) -> Dict:
         # =====================================================================
         
         # Get current sentiment analysis (from Node 5)
+        # Node 5 writes flat keys; also support sentiment_analysis dict if present
         current_sentiment = state.get('sentiment_analysis')
         if not current_sentiment:
-            logger.warning("No sentiment analysis available, skipping verification")
-            state['news_impact_verification'] = None
-            state['node_execution_times'] = state.get('node_execution_times', {})
-            state['node_execution_times']['node_8'] = (datetime.now() - start_time).total_seconds()
-            return state
+            confidence = state.get('sentiment_confidence', 0.5)
+            current_sentiment = {
+                'confidence': confidence,
+                'signal': state.get('sentiment_signal'),
+                'aggregated_sentiment': state.get('aggregated_sentiment'),
+            }
         
-        # Get cleaned news (from Node 9A)
+        # Get cleaned news (from Node 9A) - state uses cleaned_related_company_news
         cleaned_stock_news = state.get('cleaned_stock_news', [])
         cleaned_market_news = state.get('cleaned_market_news', [])
-        cleaned_related_news = state.get('cleaned_related_news', [])
+        cleaned_related_news = state.get('cleaned_related_news') or state.get('cleaned_related_company_news', [])
         
         today_articles = {
             'stock': cleaned_stock_news,

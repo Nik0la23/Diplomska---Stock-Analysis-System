@@ -1,5 +1,18 @@
 # Background Script - Quick Start Guide
 
+## Where Does the Data Come From?
+
+**The background script does not call any APIs.** It only reads from your **database**.
+
+| Data | Filled by | Read by script |
+|------|-----------|----------------|
+| **Price data** (close, date) | **Node 1** (yfinance / Polygon) | `get_price_on_date`, `get_price_after_days` |
+| **News articles** (title, url, published_at, **sentiment_label**, sentiment_score) | **Node 2** (Alpha Vantage, Finnhub) when it **caches** articles | `get_news_outcomes_pending` |
+
+So: **Nodes 1 and 2 write to the DB; the script only reads.** Run the workflow (or at least Nodes 1 and 2) first so the DB has data. Then run the script to evaluate that stored data.
+
+---
+
 ## What Was Just Built ✅
 
 ### 1. Database Functions (4 new functions in `db_manager.py`)
@@ -22,6 +35,24 @@
 ---
 
 ## How To Use It
+
+### One-Command Test: Workflow 1–8 + Background Script
+
+To run the **full pipeline (Nodes 1–8) and then the background script** in one go:
+
+```bash
+source venv/bin/activate
+python -m scripts.test_workflow_1_to_8_with_background NVDA
+```
+
+Options:
+- `python -m scripts.test_workflow_1_to_8_with_background NVDA --workflow-only` — run only the workflow (no background script)
+- `python -m scripts.test_workflow_1_to_8_with_background NVDA --skip-workflow` — run only the background script (no workflow)
+- `python -m scripts.test_workflow_1_to_8_with_background NVDA --limit 500 --quiet` — custom limit, less output
+
+After the first run, `news_outcomes` will be populated. On a **second** workflow run, Node 8 will have historical data and can apply learning (source reliability, etc.).
+
+---
 
 ### Step 1: Fetch Historical Data (if not done yet)
 
@@ -91,9 +122,27 @@ python -m scripts.validate_node_08
 ## Understanding the Output
 
 ### Accuracy Metrics:
-- **~60-65%** - Raw sentiment accuracy (expected without learning)
+- **~60-65%** - Raw sentiment accuracy (expected when most articles have sentiment)
 - **~70-75%** - Expected accuracy after Node 8 adjustments
 - **Skipped articles** - Missing price data (holidays, weekends, data gaps)
+
+### Why Is My Accuracy Low (e.g. 39%)?
+
+Accuracy = % of evaluated articles where **predicted direction** (from sentiment) matched **actual direction** (from 7‑day price move). Low accuracy is usually **not** an API “10 days” limit (Node 1 uses ~6 months of price data, Node 2 uses 6‑month news).
+
+Common causes:
+
+1. **Many articles with no sentiment (NULL)**  
+   Only **Alpha Vantage** articles get sentiment when Node 2 caches. **Finnhub** articles and any cached **before** we added sentiment to `cache_news()` have `sentiment_label = NULL`. The script treats NULL as **FLAT**. If the price actually went UP or DOWN, the prediction is wrong → accuracy drops.  
+   **Check:** The script now logs `With sentiment label: X/Y`. If X is much smaller than Y, most predictions are FLAT and accuracy will be low.
+
+2. **Reality of sentiment vs price**  
+   News sentiment often predicts 7‑day direction only ~50–60%. So 39% is worse than that and points to (1) or to a noisy sample.
+
+3. **Threshold (0.5%)**  
+   We count UP/DOWN only if the 7‑day move is &gt; 0.5%. Small moves count as FLAT; if many moves are small, actual_direction is often FLAT and matching depends on how many predicted FLAT.
+
+**What to do:** Run Node 2 again so more articles are cached **with** Alpha Vantage sentiment, then re-run the background script. Also run the script with verbose output and check `With sentiment label: X/Y`.
 
 ### What Gets Saved:
 For each article, the script saves:
