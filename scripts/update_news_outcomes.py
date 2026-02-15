@@ -314,12 +314,16 @@ def run_evaluation(ticker: Optional[str] = None, limit: int = 500, verbose: bool
     evaluated = 0
     skipped = 0
     accurate = 0
+    with_sentiment = 0   # Articles that had sentiment_label set (not NULL)
     
     for i, article in enumerate(pending, 1):
         try:
             # Progress reporting
             if verbose and i % 50 == 0:
                 logger.info(f"Progress: {i}/{len(pending)} articles processed...")
+            
+            if article.get('sentiment_label'):
+                with_sentiment += 1
             
             # Evaluate this article
             outcome = evaluate_single_article(article)
@@ -352,6 +356,7 @@ def run_evaluation(ticker: Optional[str] = None, limit: int = 500, verbose: bool
     logger.info(f"  Total found: {len(pending)}")
     logger.info(f"  Evaluated: {evaluated}")
     logger.info(f"  Skipped: {skipped} (missing price data)")
+    logger.info(f"  With sentiment label: {with_sentiment}/{len(pending)} (rest predict as FLAT)")
     logger.info(f"  Accurate predictions: {accurate}/{evaluated} ({accuracy_pct:.1f}%)")
     
     if verbose:
@@ -363,6 +368,7 @@ def run_evaluation(ticker: Optional[str] = None, limit: int = 500, verbose: bool
         print(f"Total found: {len(pending)}")
         print(f"Evaluated: {evaluated}")
         print(f"Skipped: {skipped} (missing price data)")
+        print(f"With sentiment label: {with_sentiment}/{len(pending)} (rest → predicted FLAT)")
         print(f"Accurate predictions: {accurate}/{evaluated} ({accuracy_pct:.1f}%)")
         print(f"Execution time: {execution_time:.2f}s")
         print(f"{'='*60}\n")
@@ -372,6 +378,7 @@ def run_evaluation(ticker: Optional[str] = None, limit: int = 500, verbose: bool
         'skipped': skipped,
         'accurate': accurate,
         'total': len(pending),
+        'with_sentiment': with_sentiment,
         'accuracy_pct': accuracy_pct,
         'execution_time': execution_time
     }

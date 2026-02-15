@@ -18,7 +18,12 @@ from typing import List, Dict, Any, Optional
 import logging
 
 from src.utils.config import ALPHA_VANTAGE_API_KEY, FINNHUB_API_KEY
-from src.database.db_manager import cache_news, get_cached_news
+from src.database.db_manager import (
+    cache_news,
+    get_cached_news,
+    get_latest_news_date,
+    get_news_for_ticker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,9 @@ NEWS_CACHE_HOURS = 6
 
 # News lookback: 6 months (align with Node 1 price data window)
 NEWS_LOOKBACK_DAYS = 180
+
+# Overlap when doing incremental fetch (re-fetch last N days for late-arriving articles)
+NEWS_OVERLAP_DAYS = 3
 
 
 # ============================================================================
@@ -311,45 +319,65 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         logger.info(f"Node 2: Starting news fetching for {ticker}")
         
-        # ====================================================================
-        # STEP 1: Define Date Range — 6 months back to today (align with Node 1)
-        # ====================================================================
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
-        
-        from_str = from_date.strftime('%Y-%m-%d')
-        to_str = to_date.strftime('%Y-%m-%d')
-        
-        logger.info(f"Node 2: Fetching news from {from_str} to {to_str} ({NEWS_LOOKBACK_DAYS}-day / 6-month window)")
         
         # ====================================================================
-        # STEP 2: Check Cache (only use if has articles)
+        # STEP 1: Same-day cache (hybrid) — avoid API if we have fresh data
         # ====================================================================
         cached_stock_news = get_cached_news(ticker, 'stock', max_age_hours=NEWS_CACHE_HOURS)
         cached_market_news = get_cached_news(ticker, 'market', max_age_hours=NEWS_CACHE_HOURS)
-        
-        # Check if cache has actual articles (not just empty list)
         has_cached_stock = cached_stock_news is not None and len(cached_stock_news) > 0
         has_cached_market = cached_market_news is not None and len(cached_market_news) > 0
         
         if has_cached_stock and has_cached_market:
             logger.info(f"Node 2: Using cached news for {ticker}")
-            logger.info(f"  - Stock news: {len(cached_stock_news)} articles")
-            logger.info(f"  - Market news: {len(cached_market_news)} articles")
-            
             state['stock_news'] = cached_stock_news
             state['market_news'] = cached_market_news
-            state['related_company_news'] = []  # No separate related news with Alpha Vantage
-            
+            state['related_company_news'] = []
             elapsed = (datetime.now() - start_time).total_seconds()
             state['node_execution_times']['node_2'] = elapsed
             logger.info(f"Node 2: Completed (cache hit) in {elapsed:.2f}s")
             return state
         
         # ====================================================================
-        # STEP 3: Fetch News from Multiple Sources (Async Parallel, 6-month range)
+        # STEP 2: Multi-day gap — check DB for latest news date, load if current
         # ====================================================================
-        logger.info(f"Node 2: Cache miss - fetching fresh news from APIs (6-month window)")
+        latest_news_date = get_latest_news_date(ticker)
+        today = to_date.date() if hasattr(to_date, 'date') else to_date
+        
+        if latest_news_date is not None:
+            latest_d = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
+            days_since = (today - latest_d).days
+            if days_since <= 1:
+                stock_from_db = get_news_for_ticker(ticker, 'stock', days=NEWS_LOOKBACK_DAYS)
+                market_from_db = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
+                if stock_from_db or market_from_db:
+                    logger.info(f"Node 2: News current for {ticker}, loaded from DB (no API) — stock: {len(stock_from_db)}, market: {len(market_from_db)}")
+                    state['stock_news'] = stock_from_db
+                    state['market_news'] = market_from_db
+                    state['related_company_news'] = []
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    state['node_execution_times']['node_2'] = elapsed
+                    return state
+        
+        # ====================================================================
+        # STEP 3: Define date range — full 6 months or incremental + overlap
+        # ====================================================================
+        if latest_news_date is None:
+            from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
+            logger.info(f"Node 2: First run for {ticker}, fetching 6-month window")
+        else:
+            latest_d = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
+            from_date = (datetime.combine(latest_d, datetime.min.time()) - timedelta(days=NEWS_OVERLAP_DAYS))
+            logger.info(f"Node 2: Incremental fetch for {ticker} from {from_date.date()} (incl. {NEWS_OVERLAP_DAYS}-day overlap)")
+        
+        from_str = from_date.strftime('%Y-%m-%d')
+        to_str = to_date.strftime('%Y-%m-%d')
+        logger.info(f"Node 2: Fetching news from {from_str} to {to_str}")
+        
+        # ====================================================================
+        # STEP 4: Fetch News from Multiple Sources (Async Parallel)
+        # ====================================================================
         
         async def fetch_all():
             """Async wrapper to fetch all news in parallel with date range"""
@@ -386,7 +414,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Node 2: Stock news merged: {len(av_news)} Alpha Vantage + {len(finnhub_company_news)} Finnhub company → {len(stock_news)} total")
         
         # ====================================================================
-        # STEP 4: Filter by Date Range (if needed)
+        # Filter by Date Range
         # ====================================================================
         from_timestamp = int(from_date.timestamp())
         to_timestamp = int(to_date.timestamp())
@@ -402,22 +430,26 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ]
         
         # ====================================================================
-        # STEP 5: Cache Results
+        # Cache Results (INSERT OR IGNORE — new articles only)
         # ====================================================================
         try:
             if stock_news:
                 cache_news(ticker, 'stock', stock_news)
                 logger.info(f"Node 2: Cached {len(stock_news)} stock news articles")
-            
             if market_news:
                 cache_news(ticker, 'market', market_news)
                 logger.info(f"Node 2: Cached {len(market_news)} market news articles")
         except Exception as e:
             logger.warning(f"Node 2: Failed to cache news: {str(e)}")
-            # Continue anyway - caching failure is not critical
+        
+        # After incremental fetch, load full 6 months from DB for state
+        if latest_news_date is not None and (to_date - from_date).days < (NEWS_LOOKBACK_DAYS - 10):
+            stock_news = get_news_for_ticker(ticker, 'stock', days=NEWS_LOOKBACK_DAYS)
+            market_news = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
+            logger.info(f"Node 2: Loaded full 6-month series from DB — stock: {len(stock_news)}, market: {len(market_news)}")
         
         # ====================================================================
-        # STEP 6: Update State
+        # Update State
         # ====================================================================
         state['stock_news'] = stock_news
         state['market_news'] = market_news

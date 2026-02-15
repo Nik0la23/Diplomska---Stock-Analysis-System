@@ -3,15 +3,15 @@ LangGraph Workflow Builder
 
 Defines the complete stock analysis workflow with all nodes and edges.
 
-Current Flow (Nodes 1-7, 9A):
+Current Flow (Nodes 1-8, 9A):
 1. Node 1: Price Data Fetching
 2. Node 3: Related Companies Detection
 3. Node 2: Multi-Source News Fetching
 4. Node 9A: Content Analysis & Feature Extraction
 5. PARALLEL: Nodes 4, 5, 6, 7 (Technical, Sentiment, Market Context, Monte Carlo)
+6. Node 8: News Verification & Learning (thesis innovation)
 
 Future additions:
-- Node 8: News Verification & Learning
 - Nodes 9B-15: Remaining pipeline
 """
 
@@ -28,6 +28,7 @@ from src.langgraph_nodes.node_04_technical_analysis import technical_analysis_no
 from src.langgraph_nodes.node_05_sentiment_analysis import sentiment_analysis_node
 from src.langgraph_nodes.node_06_market_context import market_context_node
 from src.langgraph_nodes.node_07_monte_carlo import monte_carlo_forecasting_node
+from src.langgraph_nodes.node_08_news_verification import news_verification_node
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,9 @@ def should_continue_after_parallel(state: StockAnalysisState) -> Literal["contin
             logger.warning("Critical errors detected, ending workflow")
             return "end"
     
-    # TODO: When Node 8 is implemented, return "continue" to route there
-    # For now, end the workflow after parallel nodes
-    logger.info("Parallel nodes complete, ending workflow (Node 8 not yet implemented)")
-    return "end"
+    # Route to Node 8 (News Verification & Learning)
+    logger.info("Parallel nodes complete, routing to Node 8 (news verification)")
+    return "continue"
 
 
 # ============================================================================
@@ -94,9 +94,9 @@ def create_stock_analysis_workflow() -> StateGraph:
     Tech      Sent      Market    Monte Carlo
     └─────────┴─────────┴─────────┘
       ↓
-    Conditional Edge
+    Node 8: News Verification & Learning
       ↓
-    END (Node 8 next)
+    END
     ```
     
     Returns:
@@ -129,6 +129,9 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_node("market_context", market_context_node)
     workflow.add_node("monte_carlo", monte_carlo_forecasting_node)
     
+    # Phase 3: Learning (after parallel convergence)
+    workflow.add_node("news_verification", news_verification_node)
+    
     # ========================================================================
     # DEFINE EDGES (Sequential Flow)
     # ========================================================================
@@ -156,13 +159,13 @@ def create_stock_analysis_workflow() -> StateGraph:
     # CONVERGENCE & CONDITIONAL ROUTING
     # ========================================================================
     
-    # All 4 parallel nodes converge here
-    # Conditional edge determines next step
+    # All 4 parallel nodes converge to Node 8 (news verification)
+    # Conditional edge: continue -> Node 8, end -> END
     workflow.add_conditional_edges(
         "technical_analysis",
         should_continue_after_parallel,
         {
-            "continue": END,  # Future: Route to Node 8
+            "continue": "news_verification",
             "end": END
         }
     )
@@ -171,7 +174,7 @@ def create_stock_analysis_workflow() -> StateGraph:
         "sentiment_analysis",
         should_continue_after_parallel,
         {
-            "continue": END,  # Future: Route to Node 8
+            "continue": "news_verification",
             "end": END
         }
     )
@@ -180,7 +183,7 @@ def create_stock_analysis_workflow() -> StateGraph:
         "market_context",
         should_continue_after_parallel,
         {
-            "continue": END,  # Future: Route to Node 8
+            "continue": "news_verification",
             "end": END
         }
     )
@@ -189,12 +192,15 @@ def create_stock_analysis_workflow() -> StateGraph:
         "monte_carlo",
         should_continue_after_parallel,
         {
-            "continue": END,  # Future: Route to Node 8
+            "continue": "news_verification",
             "end": END
         }
     )
     
-    logger.info("Workflow built successfully with 8 nodes (4 parallel)")
+    # Node 8 runs after parallel layer, then end
+    workflow.add_edge("news_verification", END)
+    
+    logger.info("Workflow built successfully with 9 nodes (4 parallel + Node 8)")
     
     # Compile and return
     return workflow.compile()
@@ -305,6 +311,17 @@ def print_analysis_summary(state: StockAnalysisState):
         print(f"   Expected Return: {mc['expected_return']:.2f}%")
         print(f"   Probability Up: {mc['probability_up']*100:.1f}%")
         print(f"   95% CI: [${mc['confidence_95']['lower']:.2f}, ${mc['confidence_95']['upper']:.2f}]")
+    
+    # Node 8: News Verification & Learning
+    if state.get('news_impact_verification'):
+        niv = state['news_impact_verification']
+        print(f"\n📊 Node 8: News Verification & Learning:")
+        print(f"   Learning adjustment: {niv.get('learning_adjustment', 1.0):.3f}")
+        print(f"   News accuracy score: {niv.get('news_accuracy_score', 0):.1f}%")
+        print(f"   Historical correlation: {niv.get('historical_correlation', 0):.3f}")
+        print(f"   Sample size: {niv.get('sample_size', 0)} events")
+        if niv.get('insufficient_data'):
+            print(f"   (Insufficient historical data — neutral defaults)")
     
     # Errors
     if state.get('errors'):
