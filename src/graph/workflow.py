@@ -20,6 +20,7 @@ from typing import Literal
 import logging
 
 from src.graph.state import StockAnalysisState, create_initial_state
+from src.database.db_manager import get_news_outcomes_pending
 from src.langgraph_nodes.node_01_data_fetching import fetch_price_data_node
 from src.langgraph_nodes.node_03_related_companies import detect_related_companies_node
 from src.langgraph_nodes.node_02_news_fetching import fetch_all_news_node
@@ -41,31 +42,51 @@ def should_continue_after_parallel(state: StockAnalysisState) -> Literal["contin
     """
     Conditional edge: Determine if workflow should continue after parallel nodes.
     
-    Currently just returns 'end' since we only have Nodes 4 & 7.
-    Future: Will route to Node 8 (News Verification) when implemented.
-    
     Args:
         state: Current workflow state
         
     Returns:
-        'continue' to proceed to next nodes, 'end' to finish
+        'continue' to proceed to background outcomes then Node 8, 'end' to finish
     """
-    # Check if critical errors occurred
     if state.get('errors') and len(state['errors']) > 0:
-        # Check for critical errors that should halt
         critical_keywords = ['no price data', 'failed to fetch']
         has_critical = any(
             any(keyword in error.lower() for keyword in critical_keywords)
             for error in state['errors']
         )
-        
         if has_critical:
             logger.warning("Critical errors detected, ending workflow")
             return "end"
-    
-    # Route to Node 8 (News Verification & Learning)
-    logger.info("Parallel nodes complete, routing to Node 8 (news verification)")
+    logger.info("Parallel nodes complete, routing to background outcomes then Node 8")
     return "continue"
+
+
+def run_background_outcomes_node(state: StockAnalysisState) -> StockAnalysisState:
+    """
+    Run the news-outcomes evaluator before Node 8 when needed.
+    
+    Nodes 1–2 have already written price_data and news_articles to the DB.
+    This node queries: articles in news_articles that are 7+ days old and have
+    no row in news_outcomes. If any exist, runs the background script to fill
+    news_outcomes so Node 8 can learn from them. Pass-through: returns state unchanged.
+    """
+    ticker = state.get("ticker")
+    if not ticker:
+        return state
+    pending = get_news_outcomes_pending(ticker=ticker, limit=500)
+    if not pending:
+        logger.debug(f"No pending news outcomes for {ticker}, skipping background script")
+        return state
+    try:
+        from scripts.update_news_outcomes import run_evaluation
+        bg = run_evaluation(ticker=ticker, limit=500, verbose=False)
+        logger.info(
+            f"Background outcomes for {ticker}: evaluated={bg['evaluated']}, "
+            f"skipped={bg['skipped']}, accuracy={bg['accuracy_pct']:.1f}%"
+        )
+    except Exception as e:
+        logger.warning(f"Background outcomes script failed (non-fatal): {e}")
+    return state
 
 
 # ============================================================================
@@ -129,7 +150,8 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_node("market_context", market_context_node)
     workflow.add_node("monte_carlo", monte_carlo_forecasting_node)
     
-    # Phase 3: Learning (after parallel convergence)
+    # Phase 3: Background outcomes (before Node 8) then Learning
+    workflow.add_node("run_background_outcomes", run_background_outcomes_node)
     workflow.add_node("news_verification", news_verification_node)
     
     # ========================================================================
@@ -156,51 +178,36 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_edge("content_analysis", "monte_carlo")
     
     # ========================================================================
-    # CONVERGENCE & CONDITIONAL ROUTING
+    # CONVERGENCE: parallel → background outcomes → Node 8
     # ========================================================================
     
-    # All 4 parallel nodes converge to Node 8 (news verification)
-    # Conditional edge: continue -> Node 8, end -> END
+    # All 4 parallel nodes converge to background-outcomes node, then Node 8
     workflow.add_conditional_edges(
         "technical_analysis",
         should_continue_after_parallel,
-        {
-            "continue": "news_verification",
-            "end": END
-        }
+        {"continue": "run_background_outcomes", "end": END}
     )
-    
     workflow.add_conditional_edges(
         "sentiment_analysis",
         should_continue_after_parallel,
-        {
-            "continue": "news_verification",
-            "end": END
-        }
+        {"continue": "run_background_outcomes", "end": END}
     )
-    
     workflow.add_conditional_edges(
         "market_context",
         should_continue_after_parallel,
-        {
-            "continue": "news_verification",
-            "end": END
-        }
+        {"continue": "run_background_outcomes", "end": END}
     )
-    
     workflow.add_conditional_edges(
         "monte_carlo",
         should_continue_after_parallel,
-        {
-            "continue": "news_verification",
-            "end": END
-        }
+        {"continue": "run_background_outcomes", "end": END}
     )
     
-    # Node 8 runs after parallel layer, then end
+    # Background outcomes runs first (fills news_outcomes when needed), then Node 8
+    workflow.add_edge("run_background_outcomes", "news_verification")
     workflow.add_edge("news_verification", END)
     
-    logger.info("Workflow built successfully with 9 nodes (4 parallel + Node 8)")
+    logger.info("Workflow built successfully (parallel → background outcomes → Node 8)")
     
     # Compile and return
     return workflow.compile()
@@ -217,7 +224,7 @@ def run_stock_analysis(ticker: str) -> StockAnalysisState:
     This is a high-level interface that:
     1. Creates initial state
     2. Builds workflow
-    3. Executes workflow
+    3. Executes workflow (includes background outcomes before Node 8 when needed)
     4. Returns final state
     
     Args:
@@ -239,7 +246,7 @@ def run_stock_analysis(ticker: str) -> StockAnalysisState:
     # Build workflow
     workflow = create_stock_analysis_workflow()
     
-    # Execute workflow
+    # Execute workflow (background outcomes run inside graph before Node 8)
     final_state = workflow.invoke(initial_state)
     
     logger.info(f"Stock analysis complete for {ticker}")
