@@ -34,7 +34,14 @@ from src.utils.sentiment_config import (
     FINBERT_DEVICE,
     USE_TICKER_SENTIMENT,
     normalize_sentiment_score,
-    classify_sentiment
+    classify_sentiment,
+    CREDIBILITY_SOURCE_WEIGHT,
+    CREDIBILITY_ANOMALY_WEIGHT,
+    CREDIBILITY_RELEVANCE_WEIGHT,
+    CREDIBILITY_WEIGHT_FLOOR,
+    CREDIBILITY_WEIGHT_CEILING,
+    CREDIBILITY_CONFIDENCE_MIN,
+    CREDIBILITY_CONFIDENCE_MAX
 )
 
 logger = logging.getLogger(__name__)
@@ -324,7 +331,57 @@ def analyze_articles_batch(
 
 
 # ============================================================================
-# HELPER FUNCTION 5: Aggregate Sentiment by Type
+# HELPER FUNCTION 5: Calculate Credibility Weight
+# ============================================================================
+
+def calculate_credibility_weight(article: Dict) -> float:
+    """
+    Calculate how much this article should influence the sentiment score.
+    
+    Uses Node 9A's scores:
+    - source_credibility_score (most important, 50% of weight)
+    - composite_anomaly_score (inverted - high anomaly = low weight, 30%)
+    - relevance_score from Alpha Vantage (20%)
+    
+    Algorithm:
+    1. Extract scores with safe defaults if missing
+    2. Invert anomaly score (high anomaly = low quality)
+    3. Weighted combination (50/30/20)
+    4. Floor at 0.1, ceiling at 1.0
+    
+    Args:
+        article: Article dictionary with optional Node 9A scores
+        
+    Returns:
+        Weight from 0.1 (almost ignore) to 1.0 (full trust)
+        
+    Examples:
+        Bloomberg article, low anomaly, high relevance → 0.93
+        Random blog, high anomaly, low relevance → 0.22
+        Unknown source, medium anomaly, medium relevance → 0.48
+    """
+    # Get scores (with safe defaults if missing)
+    credibility = article.get('source_credibility_score', 0.5)    # default: unknown
+    anomaly = article.get('composite_anomaly_score', 0.3)         # default: moderate
+    relevance = article.get('relevance_score', 0.5)               # default: moderate
+    
+    # Invert anomaly (high anomaly = low weight)
+    anomaly_quality = 1.0 - anomaly
+    
+    # Weighted combination
+    weight = (
+        credibility * CREDIBILITY_SOURCE_WEIGHT +       # Source reputation matters most
+        anomaly_quality * CREDIBILITY_ANOMALY_WEIGHT +   # Content quality
+        relevance * CREDIBILITY_RELEVANCE_WEIGHT         # Relevance to ticker
+    )
+    
+    # Floor at 0.1 (never completely ignore — Node 9B needs to see patterns)
+    # Cap at 1.0
+    return max(CREDIBILITY_WEIGHT_FLOOR, min(CREDIBILITY_WEIGHT_CEILING, weight))
+
+
+# ============================================================================
+# HELPER FUNCTION 6: Aggregate Sentiment by Type
 # ============================================================================
 
 def aggregate_sentiment_by_type(articles: List[Dict], news_type: str) -> Dict[str, Any]:
@@ -382,10 +439,20 @@ def aggregate_sentiment_by_type(articles: List[Dict], news_type: str) -> Dict[st
     # Calculate simple average
     average_sentiment = np.mean(sentiments) if sentiments else 0.0
     
-    # Calculate weighted average (recent articles matter more)
+    # Calculate weighted average with BOTH time decay AND credibility weighting
     # Assuming articles are sorted by time (newest first)
-    weights = [0.95 ** i for i in range(len(sentiments))]  # Exponential decay
-    weighted_sentiment = np.average(sentiments, weights=weights) if sentiments else 0.0
+    combined_weights = []
+    for i, article in enumerate(articles):
+        time_weight = 0.95 ** i  # Exponential time decay
+        credibility_weight = calculate_credibility_weight(article)
+        combined_weight = time_weight * credibility_weight
+        combined_weights.append(combined_weight)
+    
+    # Calculate weighted sentiment using combined weights
+    if combined_weights and sum(combined_weights) > 0:
+        weighted_sentiment = np.average(sentiments, weights=combined_weights)
+    else:
+        weighted_sentiment = 0.0
     
     # Count sentiment labels
     labels = [a.get('sentiment_label', 'neutral') for a in articles]
@@ -404,12 +471,24 @@ def aggregate_sentiment_by_type(articles: List[Dict], news_type: str) -> Dict[st
     # Calculate confidence based on:
     # 1. Number of articles (more = higher confidence)
     # 2. Consistency of sentiment (all positive/negative = higher)
+    # 3. Average source credibility (NEW: high-credibility sources = higher confidence)
     article_count = len(articles)
     consistency = max(positive_count, negative_count, neutral_count) / article_count if article_count > 0 else 0
     
-    # Confidence formula
+    # Base confidence formula
     count_factor = min(article_count / 10.0, 1.0)  # Max at 10 articles
-    confidence = (consistency * 0.7 + count_factor * 0.3)  # Weighted combination
+    base_confidence = (consistency * 0.7 + count_factor * 0.3)  # Weighted combination
+    
+    # Average credibility of sources used (NEW)
+    avg_credibility = sum(
+        article.get('source_credibility_score', 0.5) for article in articles
+    ) / len(articles) if articles else 0.5
+    
+    # Adjust confidence: high-credibility sources = higher confidence
+    # Scale: avg_credibility of 0.9 boosts confidence by ~10%
+    #        avg_credibility of 0.3 reduces confidence by ~20%
+    credibility_factor = CREDIBILITY_CONFIDENCE_MIN + (avg_credibility * (CREDIBILITY_CONFIDENCE_MAX - CREDIBILITY_CONFIDENCE_MIN))
+    confidence = min(1.0, base_confidence * credibility_factor)
     
     logger.info(f"{news_type.capitalize()} sentiment: {weighted_sentiment:.3f} "
                 f"({positive_count}+ {negative_count}- {neutral_count}~) → {signal}")
@@ -638,7 +717,7 @@ def sentiment_analysis_node(state: Dict[str, Any]) -> Dict[str, Any]:
         sentiment_confidence = combined_result['confidence']
         
         # ====================================================================
-        # STEP 5: Collect Per-Article Scores
+        # STEP 5: Collect Per-Article Scores (with credibility data)
         # ====================================================================
         raw_sentiment_scores = []
         
@@ -646,31 +725,92 @@ def sentiment_analysis_node(state: Dict[str, Any]) -> Dict[str, Any]:
             raw_sentiment_scores.append({
                 'type': 'stock',
                 'title': article.get('title', ''),
+                'source': article.get('source', ''),
                 'sentiment_score': article.get('sentiment_score', 0.0),
                 'sentiment_label': article.get('sentiment_label', 'neutral'),
-                'sentiment_source': article.get('sentiment_source', 'none')
+                'sentiment_source': article.get('sentiment_source', 'none'),
+                # NEW: Credibility-related fields for Node 8 and Node 13
+                'credibility_weight': calculate_credibility_weight(article),
+                'source_credibility_score': article.get('source_credibility_score', 0.5),
+                'composite_anomaly_score': article.get('composite_anomaly_score', 0.3),
+                'relevance_score': article.get('relevance_score', 0.5)
             })
         
         for article in market_analyzed:
             raw_sentiment_scores.append({
                 'type': 'market',
                 'title': article.get('title', ''),
+                'source': article.get('source', ''),
                 'sentiment_score': article.get('sentiment_score', 0.0),
                 'sentiment_label': article.get('sentiment_label', 'neutral'),
-                'sentiment_source': article.get('sentiment_source', 'none')
+                'sentiment_source': article.get('sentiment_source', 'none'),
+                # NEW: Credibility-related fields for Node 8 and Node 13
+                'credibility_weight': calculate_credibility_weight(article),
+                'source_credibility_score': article.get('source_credibility_score', 0.5),
+                'composite_anomaly_score': article.get('composite_anomaly_score', 0.3),
+                'relevance_score': article.get('relevance_score', 0.5)
             })
         
         for article in related_analyzed:
             raw_sentiment_scores.append({
                 'type': 'related',
                 'title': article.get('title', ''),
+                'source': article.get('source', ''),
                 'sentiment_score': article.get('sentiment_score', 0.0),
                 'sentiment_label': article.get('sentiment_label', 'neutral'),
-                'sentiment_source': article.get('sentiment_source', 'none')
+                'sentiment_source': article.get('sentiment_source', 'none'),
+                # NEW: Credibility-related fields for Node 8 and Node 13
+                'credibility_weight': calculate_credibility_weight(article),
+                'source_credibility_score': article.get('source_credibility_score', 0.5),
+                'composite_anomaly_score': article.get('composite_anomaly_score', 0.3),
+                'relevance_score': article.get('relevance_score', 0.5)
             })
         
         # ====================================================================
-        # STEP 6: Log Results
+        # STEP 6: Calculate Credibility Summary
+        # ====================================================================
+        all_articles = stock_analyzed + market_analyzed + related_analyzed
+        
+        if all_articles:
+            # Calculate average source credibility
+            avg_source_credibility = sum(
+                a.get('source_credibility_score', 0.5) for a in all_articles
+            ) / len(all_articles)
+            
+            # Calculate average composite anomaly
+            avg_composite_anomaly = sum(
+                a.get('composite_anomaly_score', 0.3) for a in all_articles
+            ) / len(all_articles)
+            
+            # Count articles by credibility tier
+            high_credibility_articles = sum(
+                1 for a in all_articles if a.get('source_credibility_score', 0.5) >= 0.8
+            )
+            medium_credibility_articles = sum(
+                1 for a in all_articles 
+                if 0.5 <= a.get('source_credibility_score', 0.5) < 0.8
+            )
+            low_credibility_articles = sum(
+                1 for a in all_articles if a.get('source_credibility_score', 0.5) < 0.5
+            )
+        else:
+            avg_source_credibility = 0.5
+            avg_composite_anomaly = 0.3
+            high_credibility_articles = 0
+            medium_credibility_articles = 0
+            low_credibility_articles = 0
+        
+        credibility_summary = {
+            'avg_source_credibility': float(avg_source_credibility),
+            'high_credibility_articles': high_credibility_articles,      # credibility >= 0.8
+            'medium_credibility_articles': medium_credibility_articles,  # 0.5 to 0.8
+            'low_credibility_articles': low_credibility_articles,        # below 0.5
+            'avg_composite_anomaly': float(avg_composite_anomaly),
+            'credibility_weighted': True                                 # flag that weighting was applied
+        }
+        
+        # ====================================================================
+        # STEP 7: Log Results
         # ====================================================================
         logger.info(f"Sentiment Analysis Results:")
         logger.info(f"  Combined Sentiment: {combined_sentiment:.3f}")
@@ -682,9 +822,11 @@ def sentiment_analysis_node(state: Dict[str, Any]) -> Dict[str, Any]:
                    f"({market_sentiment['article_count']} articles)")
         logger.info(f"  Related: {related_sentiment['weighted_sentiment']:.3f} "
                    f"({related_sentiment['article_count']} articles)")
+        logger.info(f"  Credibility: {avg_source_credibility:.2f} avg "
+                   f"({high_credibility_articles}H/{medium_credibility_articles}M/{low_credibility_articles}L)")
         
         # ====================================================================
-        # STEP 7: Return Partial State Update (for parallel execution)
+        # STEP 8: Return Partial State Update (for parallel execution)
         # ====================================================================
         elapsed = (datetime.now() - start_time).total_seconds()
         
@@ -696,6 +838,7 @@ def sentiment_analysis_node(state: Dict[str, Any]) -> Dict[str, Any]:
             'aggregated_sentiment': combined_sentiment,
             'sentiment_signal': sentiment_signal,
             'sentiment_confidence': sentiment_confidence,
+            'sentiment_credibility_summary': credibility_summary,  # NEW
             'node_execution_times': {'node_5': elapsed}
         }
         
@@ -712,5 +855,6 @@ def sentiment_analysis_node(state: Dict[str, Any]) -> Dict[str, Any]:
             'aggregated_sentiment': None,
             'sentiment_signal': None,
             'sentiment_confidence': None,
+            'sentiment_credibility_summary': None,
             'node_execution_times': {'node_5': elapsed}
         }

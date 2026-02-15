@@ -583,6 +583,7 @@ def test_integration_parallel_execution_compatibility():
         'aggregated_sentiment', 
         'sentiment_signal', 
         'sentiment_confidence',
+        'sentiment_credibility_summary',  # NEW field
         'node_execution_times'
     }
     
@@ -593,6 +594,194 @@ def test_integration_parallel_execution_compatibility():
     
     # Should have execution time for node_5
     assert 'node_5' in result['node_execution_times']
+
+
+# ============================================================================
+# CREDIBILITY WEIGHTING TESTS (Node 5 Upgrade)
+# ============================================================================
+
+def test_credibility_weight_high_quality():
+    """Bloomberg article should get weight near 1.0"""
+    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
+    
+    article = {
+        'source_credibility_score': 0.95,
+        'composite_anomaly_score': 0.04,
+        'relevance_score': 0.85
+    }
+    weight = calculate_credibility_weight(article)
+    assert weight > 0.85, f"High quality article should have weight > 0.85, got {weight}"
+    assert weight <= 1.0
+
+
+def test_credibility_weight_low_quality():
+    """Random blog should get weight near 0.2-0.3"""
+    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
+    
+    article = {
+        'source_credibility_score': 0.30,
+        'composite_anomaly_score': 0.75,
+        'relevance_score': 0.40
+    }
+    weight = calculate_credibility_weight(article)
+    assert weight < 0.40, f"Low quality article should have weight < 0.40, got {weight}"
+    assert weight >= 0.1  # Floor
+
+
+def test_credibility_weight_missing_scores():
+    """Articles without 9A scores should get moderate defaults"""
+    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
+    
+    article = {}  # No scores at all
+    weight = calculate_credibility_weight(article)
+    assert 0.4 < weight < 0.7, f"Article with missing scores should have moderate weight, got {weight}"
+
+
+def test_credibility_weight_floor():
+    """Even worst articles should have minimum 0.1 weight"""
+    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
+    
+    article = {
+        'source_credibility_score': 0.0,
+        'composite_anomaly_score': 1.0,
+        'relevance_score': 0.0
+    }
+    weight = calculate_credibility_weight(article)
+    assert weight >= 0.1, f"Weight should be floored at 0.1, got {weight}"
+    assert weight <= 0.15  # Should be very close to floor
+
+
+def test_weighted_aggregation_reduces_blog_influence():
+    """Random blog sentiment should not dominate over Bloomberg"""
+    articles = [
+        {
+            'sentiment_score': 0.9, 
+            'source_credibility_score': 0.30,
+            'composite_anomaly_score': 0.75, 
+            'relevance_score': 0.4,
+            'time_published': '20260214T120000',
+            'sentiment_label': 'positive'
+        },
+        {
+            'sentiment_score': -0.3, 
+            'source_credibility_score': 0.95,
+            'composite_anomaly_score': 0.04, 
+            'relevance_score': 0.85,
+            'time_published': '20260214T110000',
+            'sentiment_label': 'negative'
+        },
+    ]
+    result = aggregate_sentiment_by_type(articles, 'stock')
+    
+    # Bloomberg's -0.3 should pull the average below 0.3
+    # Without weighting it would be (0.9 + -0.3)/2 = 0.30
+    # With credibility weighting, Bloomberg should have more influence
+    assert result['weighted_sentiment'] < 0.15, \
+        f"Expected weighted sentiment < 0.15, got {result['weighted_sentiment']}"
+
+
+def test_credibility_summary_in_output():
+    """State output should include credibility summary"""
+    state = {
+        'ticker': 'TEST',
+        'cleaned_stock_news': [
+            {
+                'title': 'High credibility news',
+                'ticker_sentiment_score': 0.8,
+                'source_credibility_score': 0.90,
+                'composite_anomaly_score': 0.05,
+                'relevance_score': 0.85
+            },
+            {
+                'title': 'Low credibility news',
+                'ticker_sentiment_score': 0.5,
+                'source_credibility_score': 0.40,
+                'composite_anomaly_score': 0.60,
+                'relevance_score': 0.50
+            }
+        ],
+        'cleaned_market_news': [],
+        'cleaned_related_company_news': [],
+        'errors': [],
+        'node_execution_times': {}
+    }
+    
+    result = sentiment_analysis_node(state)
+    
+    assert 'sentiment_credibility_summary' in result
+    summary = result['sentiment_credibility_summary']
+    assert 'avg_source_credibility' in summary
+    assert 'high_credibility_articles' in summary
+    assert 'medium_credibility_articles' in summary
+    assert 'low_credibility_articles' in summary
+    assert 'avg_composite_anomaly' in summary
+    assert summary['credibility_weighted'] == True
+    
+    # Check counts
+    assert summary['high_credibility_articles'] == 1  # 0.90 >= 0.8
+    assert summary['low_credibility_articles'] == 1   # 0.40 < 0.5
+
+
+def test_per_article_scores_include_credibility():
+    """raw_sentiment_scores should include credibility_weight per article"""
+    state = {
+        'ticker': 'TEST',
+        'cleaned_stock_news': [
+            {
+                'title': 'Test article',
+                'source': 'Bloomberg',
+                'ticker_sentiment_score': 0.7,
+                'source_credibility_score': 0.95,
+                'composite_anomaly_score': 0.04,
+                'relevance_score': 0.85
+            }
+        ],
+        'cleaned_market_news': [],
+        'cleaned_related_company_news': [],
+        'errors': [],
+        'node_execution_times': {}
+    }
+    
+    result = sentiment_analysis_node(state)
+    
+    assert len(result['raw_sentiment_scores']) > 0
+    for score in result['raw_sentiment_scores']:
+        assert 'credibility_weight' in score
+        assert 'source_credibility_score' in score
+        assert 'composite_anomaly_score' in score
+        assert 'relevance_score' in score
+        assert 'source' in score
+
+
+def test_backward_compatibility_without_9a_scores():
+    """Node 5 should still work if 9A scores are missing (graceful defaults)"""
+    articles = [
+        {
+            'title': 'Test', 
+            'summary': 'Test article', 
+            'ticker_sentiment_score': 0.5
+            # No 9A scores at all
+        }
+    ]
+    state = {
+        'ticker': 'TEST',
+        'cleaned_stock_news': articles, 
+        'cleaned_market_news': [],
+        'cleaned_related_company_news': [], 
+        'errors': [], 
+        'node_execution_times': {}
+    }
+    
+    result = sentiment_analysis_node(state)
+    
+    # Should work with default weights
+    assert result['aggregated_sentiment'] is not None
+    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
+    assert 'sentiment_credibility_summary' in result
+    
+    # Check that default credibility was used
+    summary = result['sentiment_credibility_summary']
+    assert 0.4 < summary['avg_source_credibility'] < 0.6  # Should be near 0.5 default
 
 
 # ============================================================================

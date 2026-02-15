@@ -88,6 +88,26 @@ LABEL_TO_SCORE = {
 
 
 # ============================================================================
+# CREDIBILITY WEIGHTING (Node 5 Upgrade)
+# ============================================================================
+
+# Credibility weight formula components (must sum to 1.0)
+CREDIBILITY_SOURCE_WEIGHT = 0.50      # Source reputation (most important)
+CREDIBILITY_ANOMALY_WEIGHT = 0.30     # Content quality (inverted anomaly)
+CREDIBILITY_RELEVANCE_WEIGHT = 0.20   # Relevance to ticker
+
+assert abs(CREDIBILITY_SOURCE_WEIGHT + CREDIBILITY_ANOMALY_WEIGHT + CREDIBILITY_RELEVANCE_WEIGHT - 1.0) < 0.001
+
+# Credibility weight bounds
+CREDIBILITY_WEIGHT_FLOOR = 0.1        # Minimum weight (never completely ignore)
+CREDIBILITY_WEIGHT_CEILING = 1.0      # Maximum weight
+
+# Confidence adjustment based on source credibility
+CREDIBILITY_CONFIDENCE_MIN = 0.8      # Min multiplier for low credibility
+CREDIBILITY_CONFIDENCE_MAX = 1.2      # Max multiplier for high credibility
+
+
+# ============================================================================
 # VALIDATION FUNCTIONS
 # ============================================================================
 
