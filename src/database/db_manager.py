@@ -6,7 +6,7 @@ Handles all database CRUD operations with proper error handling and caching.
 import sqlite3
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import logging
 import json
@@ -195,15 +195,26 @@ def cache_news(
     """
     Cache news articles to database.
     
+    Saves Alpha Vantage sentiment data if available (overall_sentiment_label, overall_sentiment_score).
+    This enables the background script to evaluate news outcomes without re-analyzing sentiment.
+    
     Args:
         ticker: Stock ticker symbol
         news_type: 'stock', 'market', or 'related'
         articles: List of article dictionaries with keys:
                   ['title', 'description', 'url', 'source', 'publishedAt']
+                  Optional Alpha Vantage fields:
+                  ['overall_sentiment_label', 'overall_sentiment_score']
         db_path: Path to database
     
     Example:
-        >>> articles = [{'title': 'News', 'url': 'http://...', ...}]
+        >>> # Alpha Vantage article with sentiment
+        >>> articles = [{
+        ...     'title': 'News',
+        ...     'url': 'http://...',
+        ...     'overall_sentiment_label': 'Bullish',
+        ...     'overall_sentiment_score': 0.75
+        ... }]
         >>> cache_news('AAPL', 'stock', articles)
     """
     if not articles:
@@ -213,26 +224,70 @@ def cache_news(
     try:
         with get_connection(db_path) as conn:
             for article in articles:
-                # Extract source name
-                source_name = article.get('source', {})
+                # Extract source name (handle both dict and string)
+                source_name = article.get('source', 'Unknown')
                 if isinstance(source_name, dict):
                     source_name = source_name.get('name', 'Unknown')
                 
+                # Handle field name variations from different APIs
+                # Node 2 (Alpha Vantage/Finnhub) uses: headline, summary, datetime
+                # Some other sources might use: title, description, publishedAt
+                title = article.get('headline') or article.get('title', '')
+                description = article.get('summary') or article.get('description', '')
+                
+                # Convert datetime (Unix timestamp) to ISO string for database
+                published_at = article.get('publishedAt', '')
+                if not published_at and 'datetime' in article:
+                    dt_val = article['datetime']
+                    if isinstance(dt_val, (int, float)):
+                        # Unix timestamp to ISO string
+                        published_at = datetime.fromtimestamp(dt_val).isoformat()
+                    else:
+                        published_at = str(dt_val)
+                
+                # Extract Alpha Vantage sentiment if available
+                # Alpha Vantage provides: 'Bearish', 'Somewhat-Bearish', 'Neutral', 
+                # 'Somewhat-Bullish', 'Bullish'
+                sentiment_label = article.get('overall_sentiment_label')
+                sentiment_score = article.get('overall_sentiment_score')
+                
+                # Normalize Alpha Vantage labels to our standard format
+                # 'Bearish', 'Somewhat-Bearish' → 'negative'
+                # 'Neutral' → 'neutral'
+                # 'Bullish', 'Somewhat-Bullish' → 'positive'
+                if sentiment_label:
+                    sentiment_label_lower = sentiment_label.lower()
+                    if 'bearish' in sentiment_label_lower:
+                        normalized_label = 'negative'
+                    elif 'bullish' in sentiment_label_lower:
+                        normalized_label = 'positive'
+                    else:
+                        normalized_label = 'neutral'
+                else:
+                    normalized_label = None
+                
                 conn.execute("""
                     INSERT OR IGNORE INTO news_articles
-                    (ticker, news_type, title, description, url, source, published_at, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (ticker, news_type, title, description, url, source, published_at, 
+                     sentiment_label, sentiment_score, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (
                     ticker,
                     news_type,
-                    article.get('title', ''),
-                    article.get('description', ''),
+                    title,
+                    description,
                     article.get('url', ''),
                     source_name,
-                    article.get('publishedAt', '')
+                    published_at,
+                    normalized_label,  # Alpha Vantage sentiment normalized
+                    sentiment_score if sentiment_score is not None else None
                 ))
             conn.commit()
-            logger.info(f"Cached {len(articles)} {news_type} news articles for {ticker}")
+            
+            # Log how many had sentiment data
+            with_sentiment = sum(1 for a in articles if a.get('overall_sentiment_label'))
+            logger.info(f"Cached {len(articles)} {news_type} news articles for {ticker} "
+                       f"({with_sentiment} with Alpha Vantage sentiment)")
     except Exception as e:
         logger.error(f"Failed to cache news for {ticker}: {str(e)}")
 
@@ -637,6 +692,258 @@ def store_final_signal(
             logger.info(f"Stored final signal for {ticker}: {signal_data['recommendation']}")
     except Exception as e:
         logger.error(f"Failed to store final signal: {str(e)}")
+
+
+# ============================================================================
+# NEWS OUTCOMES OPERATIONS (For Background Script)
+# ============================================================================
+
+def get_news_outcomes_pending(
+    ticker: Optional[str] = None,
+    limit: int = 500,
+    db_path: str = DEFAULT_DB_PATH
+) -> List[Dict]:
+    """
+    Get news articles that are 7+ days old and don't have outcomes yet.
+    
+    Used by background script to find articles needing evaluation.
+    
+    Args:
+        ticker: Optional ticker symbol (if None, gets for ALL tickers)
+        limit: Max articles to return (default: 500)
+        db_path: Path to database
+        
+    Returns:
+        List of article dictionaries with:
+        - id, ticker, published_at, sentiment_label, sentiment_score
+        
+    Example:
+        >>> pending = get_news_outcomes_pending(ticker='NVDA', limit=100)
+        >>> print(f"Found {len(pending)} articles needing evaluation")
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            
+            if ticker:
+                # Single ticker
+                cursor.execute("""
+                    SELECT n.id, n.ticker, n.published_at, 
+                           n.sentiment_label, n.sentiment_score
+                    FROM news_articles n
+                    LEFT JOIN news_outcomes no ON n.id = no.news_id
+                    WHERE n.ticker = ?
+                    AND no.id IS NULL
+                    AND n.published_at <= date('now', '-7 days')
+                    AND n.published_at IS NOT NULL
+                    AND n.published_at != ''
+                    ORDER BY n.published_at ASC
+                    LIMIT ?
+                """, (ticker, limit))
+            else:
+                # All tickers
+                cursor.execute("""
+                    SELECT n.id, n.ticker, n.published_at,
+                           n.sentiment_label, n.sentiment_score
+                    FROM news_articles n
+                    LEFT JOIN news_outcomes no ON n.id = no.news_id
+                    WHERE no.id IS NULL
+                    AND n.published_at <= date('now', '-7 days')
+                    AND n.published_at IS NOT NULL
+                    AND n.published_at != ''
+                    ORDER BY n.published_at ASC
+                    LIMIT ?
+                """, (limit,))
+            
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row['id'],
+                    'ticker': row['ticker'],
+                    'published_at': row['published_at'],
+                    'sentiment_label': row['sentiment_label'],
+                    'sentiment_score': row['sentiment_score']
+                })
+            
+            logger.info(f"Found {len(results)} pending news outcomes"
+                       f"{f' for {ticker}' if ticker else ''}")
+            return results
+            
+    except Exception as e:
+        logger.error(f"Failed to get pending news outcomes: {str(e)}")
+        return []
+
+
+def get_price_on_date(
+    ticker: str,
+    date_str: str,
+    db_path: str = DEFAULT_DB_PATH
+) -> Optional[float]:
+    """
+    Get closing price on a specific date.
+    
+    If no exact match (weekend/holiday), returns nearest PREVIOUS trading day.
+    
+    Args:
+        ticker: Stock ticker symbol
+        date_str: Date in format 'YYYY-MM-DD'
+        db_path: Path to database
+        
+    Returns:
+        Closing price (float) or None if no data available
+        
+    Example:
+        >>> price = get_price_on_date('NVDA', '2025-09-15')
+        >>> print(f"NVDA closed at ${price:.2f} on 2025-09-15")
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Get price on or before the date (handles weekends/holidays)
+            cursor.execute("""
+                SELECT close FROM price_data
+                WHERE ticker = ? AND date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+            """, (ticker, date_str))
+            
+            row = cursor.fetchone()
+            
+            if row:
+                return float(row['close'])
+            
+            logger.debug(f"No price data for {ticker} on or before {date_str}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Failed to get price for {ticker} on {date_str}: {str(e)}")
+        return None
+
+
+def get_price_after_days(
+    ticker: str,
+    date_str: str,
+    days: int,
+    db_path: str = DEFAULT_DB_PATH
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Get closing price N calendar days after a given date.
+    
+    Finds the nearest trading day on or after (date + days).
+    Handles weekends and holidays automatically.
+    
+    Args:
+        ticker: Stock ticker symbol
+        date_str: Starting date in format 'YYYY-MM-DD'
+        days: Number of calendar days to add
+        db_path: Path to database
+        
+    Returns:
+        Tuple of (closing_price, actual_date) or (None, None) if no data
+        
+    Example:
+        >>> price, date = get_price_after_days('NVDA', '2025-09-15', 7)
+        >>> print(f"7 days later: ${price:.2f} on {date}")
+    """
+    try:
+        # Calculate target date
+        base_date = datetime.strptime(date_str[:10], '%Y-%m-%d').date()
+        target_date = base_date + timedelta(days=days)
+        
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Get price on or after target date (next trading day)
+            cursor.execute("""
+                SELECT close, date FROM price_data
+                WHERE ticker = ? AND date >= ?
+                ORDER BY date ASC
+                LIMIT 1
+            """, (ticker, str(target_date)))
+            
+            row = cursor.fetchone()
+            
+            if row:
+                return (float(row['close']), row['date'])
+            
+            logger.debug(f"No price data for {ticker} after {target_date}")
+            return (None, None)
+            
+    except Exception as e:
+        logger.error(f"Failed to get price for {ticker} after {days} days from {date_str}: {str(e)}")
+        return (None, None)
+
+
+def save_news_outcome(
+    outcome_data: Dict[str, Any],
+    db_path: str = DEFAULT_DB_PATH
+) -> None:
+    """
+    Save a single news outcome evaluation.
+    
+    Used by background script to record prediction accuracy.
+    
+    Args:
+        outcome_data: Dictionary with keys:
+            - news_id: ID of the news article
+            - ticker: Stock ticker symbol
+            - price_at_news: Price when article was published
+            - price_1day_later: Price 1 day later (optional)
+            - price_3day_later: Price 3 days later (optional)
+            - price_7day_later: Price 7 days later (required)
+            - price_change_1day: % change 1 day (optional)
+            - price_change_3day: % change 3 days (optional)
+            - price_change_7day: % change 7 days (required)
+            - predicted_direction: 'UP', 'DOWN', or 'FLAT'
+            - actual_direction: 'UP', 'DOWN', or 'FLAT'
+            - prediction_was_accurate_7day: Boolean
+        db_path: Path to database
+        
+    Example:
+        >>> outcome = {
+        ...     'news_id': 123,
+        ...     'ticker': 'NVDA',
+        ...     'price_at_news': 135.00,
+        ...     'price_7day_later': 139.50,
+        ...     'price_change_7day': 3.33,
+        ...     'predicted_direction': 'UP',
+        ...     'actual_direction': 'UP',
+        ...     'prediction_was_accurate_7day': True
+        ... }
+        >>> save_news_outcome(outcome)
+    """
+    try:
+        with get_connection(db_path) as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO news_outcomes
+                (news_id, ticker, price_at_news, price_1day_later,
+                 price_3day_later, price_7day_later, price_change_1day,
+                 price_change_3day, price_change_7day, predicted_direction,
+                 actual_direction, prediction_was_accurate_7day, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                outcome_data['news_id'],
+                outcome_data['ticker'],
+                outcome_data['price_at_news'],
+                outcome_data.get('price_1day_later'),
+                outcome_data.get('price_3day_later'),
+                outcome_data['price_7day_later'],
+                outcome_data.get('price_change_1day'),
+                outcome_data.get('price_change_3day'),
+                outcome_data['price_change_7day'],
+                outcome_data['predicted_direction'],
+                outcome_data['actual_direction'],
+                outcome_data['prediction_was_accurate_7day']
+            ))
+            conn.commit()
+            
+            logger.debug(f"Saved outcome for news_id {outcome_data['news_id']}: "
+                        f"{outcome_data['predicted_direction']} vs {outcome_data['actual_direction']} "
+                        f"({'✓' if outcome_data['prediction_was_accurate_7day'] else '✗'})")
+            
+    except Exception as e:
+        logger.error(f"Failed to save news outcome for article {outcome_data.get('news_id')}: {str(e)}")
 
 
 # ============================================================================
