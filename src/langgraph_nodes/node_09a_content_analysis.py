@@ -437,13 +437,24 @@ def process_article(
         Article with embedded content scores
     """
     # Combine title and summary for analysis
+    # Guard: API responses occasionally return nested dicts for text fields
     title = article.get('headline', article.get('title', ''))
     summary = article.get('summary', article.get('description', ''))
+    if not isinstance(title, str):
+        title = str(title) if title else ''
+    if not isinstance(summary, str):
+        summary = str(summary) if summary else ''
     text = f"{title} {summary}"
     
-    # Extract source information
-    source_url = article.get('url', '')
-    source_name = article.get('source', '')
+    # Extract source information — guard against nested dict fields from some APIs
+    source_url = article.get('url', '') or ''
+    source_name = article.get('source', '') or ''
+    if isinstance(source_url, dict):
+        source_url = source_url.get('url', source_url.get('href', '')) or ''
+    if isinstance(source_name, dict):
+        source_name = source_name.get('name', source_name.get('id', '')) or ''
+    source_url = str(source_url)
+    source_name = str(source_name)
     
     # Calculate all scores
     sensationalism = calculate_sensationalism_score(text)

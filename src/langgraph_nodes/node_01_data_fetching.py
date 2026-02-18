@@ -40,45 +40,36 @@ PRICE_OVERLAP_DAYS = 3
 def fetch_from_yfinance(ticker: str, days: int = 180) -> Optional[pd.DataFrame]:
     """
     Fetch price data from yfinance (Primary source - NO API key needed).
-    
+
+    Uses explicit start/end dates (more reliable than the period shorthand,
+    which can silently return fewer rows due to yfinance calendar handling).
+
     Args:
         ticker: Stock ticker symbol (e.g., 'AAPL')
-        days: Number of days of historical data (default: 180 for 6 months)
-        
+        days: Number of calendar days of history to request (default: 180)
+
     Returns:
         DataFrame with columns: date, open, high, low, close, volume
         None if fetch fails
-        
-    Example:
-        >>> df = fetch_from_yfinance('AAPL', days=180)
-        >>> print(df.columns)
-        Index(['date', 'open', 'high', 'low', 'close', 'volume'])
     """
     try:
         logger.info(f"Fetching {days} days of price data from yfinance for {ticker}")
-        
-        # Calculate period (yfinance uses period parameter)
-        # Map days to yfinance period
-        if days <= 7:
-            period = '1mo'
-        elif days <= 90:
-            period = '3mo'
-        elif days <= 180:
-            period = '6mo'
-        elif days <= 365:
-            period = '1y'
-        else:
-            period = '2y'
-        
-        # Fetch data using Ticker object for better reliability
+
+        end_date = datetime.now()
+        # Add a 10-day buffer so weekends / holidays don't shorten the window
+        start_date = end_date - timedelta(days=days + 10)
+
         ticker_obj = yf.Ticker(ticker)
-        df = ticker_obj.history(period=period)
-        
+        df = ticker_obj.history(
+            start=start_date.strftime('%Y-%m-%d'),
+            end=end_date.strftime('%Y-%m-%d'),
+            auto_adjust=True,
+        )
+
         if df.empty:
             logger.warning(f"yfinance: No data returned for {ticker}")
             return None
-        
-        # Standardize column names to match our schema
+
         df = df.reset_index()
         df = df.rename(columns={
             'Date': 'date',
@@ -88,16 +79,13 @@ def fetch_from_yfinance(ticker: str, days: int = 180) -> Optional[pd.DataFrame]:
             'Close': 'close',
             'Volume': 'volume'
         })
-        
-        # Keep only required columns
+
         df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
-        
-        # Ensure date is datetime
-        df['date'] = pd.to_datetime(df['date'])
-        
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
+
         logger.info(f"yfinance: Fetched {len(df)} rows for {ticker}")
         return df
-        
+
     except Exception as e:
         logger.error(f"yfinance fetch failed for {ticker}: {str(e)}")
         return None
@@ -292,10 +280,15 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
             days_to_fetch = 180
             logger.info(f"Node 1: First run for {ticker}, fetching {days_to_fetch} days")
         else:
-            # Incremental: missing days + overlap for corrections
             days_since = (today - latest_date).days
-            days_to_fetch = min(days_since + PRICE_OVERLAP_DAYS, 180)
-            logger.info(f"Node 1: Incremental fetch for {ticker}: {days_to_fetch} days (incl. {PRICE_OVERLAP_DAYS}-day overlap)")
+            if days_since >= 2:
+                # There is a real gap — fetch only the missing window
+                days_to_fetch = min(days_since + PRICE_OVERLAP_DAYS, 180)
+                logger.info(f"Node 1: Incremental fetch for {ticker}: {days_to_fetch} days (incl. {PRICE_OVERLAP_DAYS}-day overlap)")
+            else:
+                # DB was current but had too few rows — force full 6-month refetch
+                days_to_fetch = 180
+                logger.warning(f"Node 1: DB data insufficient for {ticker} (< 50 rows), forcing full 6-month refetch")
         
         df = fetch_from_yfinance(ticker, days=days_to_fetch)
         if df is None or not validate_price_data(df, ticker):

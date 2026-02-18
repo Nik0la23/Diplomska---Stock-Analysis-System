@@ -29,8 +29,9 @@ import logging
 
 # Database operations
 from src.database.db_manager import (
+    compute_and_seed_news_outcomes,
     get_news_with_outcomes,
-    store_source_reliability
+    store_source_reliability,
 )
 
 # Logger
@@ -701,7 +702,17 @@ def news_verification_node(state: Dict) -> Dict:
         # =====================================================================
         
         logger.info("Fetching historical news events with price outcomes...")
-        
+
+        # Bootstrap: compute news-price outcomes from raw tables if not yet done.
+        # This runs on the very first pipeline call for any ticker and is a no-op
+        # once enough outcomes exist (idempotent via INSERT OR IGNORE).
+        try:
+            seeded = compute_and_seed_news_outcomes(ticker)
+            if seeded:
+                logger.info(f"Node 8: Seeded {seeded} new outcome records for {ticker}")
+        except Exception as seed_err:
+            logger.warning(f"Node 8: Outcome seeding failed (non-fatal): {seed_err}")
+
         try:
             historical_df = get_news_with_outcomes(ticker, days=180)
             
