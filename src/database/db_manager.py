@@ -1013,7 +1013,7 @@ def store_final_signal(
 
 def get_news_outcomes_pending(
     ticker: Optional[str] = None,
-    limit: int = 500,
+    limit: Optional[int] = 500,
     db_path: str = DEFAULT_DB_PATH
 ) -> List[Dict]:
     """
@@ -1023,7 +1023,7 @@ def get_news_outcomes_pending(
     
     Args:
         ticker: Optional ticker symbol (if None, gets for ALL tickers)
-        limit: Max articles to return (default: 500)
+        limit: Max articles to return (default: 500). None = no limit (all pending).
         db_path: Path to database
         
     Returns:
@@ -1032,8 +1032,10 @@ def get_news_outcomes_pending(
         
     Example:
         >>> pending = get_news_outcomes_pending(ticker='NVDA', limit=100)
-        >>> print(f"Found {len(pending)} articles needing evaluation")
+        >>> all_pending = get_news_outcomes_pending(ticker='NVDA', limit=None)
     """
+    # No limit: use a large cap so we get all pending (SQLite LIMIT must be non-negative)
+    effective_limit = (2**31) - 1 if limit is None else limit
     try:
         with get_connection(db_path) as conn:
             cursor = conn.cursor()
@@ -1052,7 +1054,7 @@ def get_news_outcomes_pending(
                     AND n.published_at != ''
                     ORDER BY n.published_at ASC
                     LIMIT ?
-                """, (ticker, limit))
+                """, (ticker, effective_limit))
             else:
                 # All tickers
                 cursor.execute("""
@@ -1066,7 +1068,7 @@ def get_news_outcomes_pending(
                     AND n.published_at != ''
                     ORDER BY n.published_at ASC
                     LIMIT ?
-                """, (limit,))
+                """, (effective_limit,))
             
             results = []
             for row in cursor.fetchall():

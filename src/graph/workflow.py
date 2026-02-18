@@ -76,13 +76,13 @@ def run_background_outcomes_node(state: StockAnalysisState) -> StockAnalysisStat
     ticker = state.get("ticker")
     if not ticker:
         return state
-    pending = get_news_outcomes_pending(ticker=ticker, limit=500)
+    pending = get_news_outcomes_pending(ticker=ticker, limit=None)
     if not pending:
         logger.debug(f"No pending news outcomes for {ticker}, skipping background script")
         return state
     try:
         from scripts.update_news_outcomes import run_evaluation
-        bg = run_evaluation(ticker=ticker, limit=500, verbose=False)
+        bg = run_evaluation(ticker=ticker, limit=None, verbose=False)
         logger.info(
             f"Background outcomes for {ticker}: evaluated={bg['evaluated']}, "
             f"skipped={bg['skipped']}, accuracy={bg['accuracy_pct']:.1f}%"

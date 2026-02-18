@@ -18,8 +18,8 @@ from src.graph.state import create_initial_state
 from src.langgraph_nodes.node_02_news_fetching import (
     fetch_all_news_node,
     fetch_alpha_vantage_news_async,
-    fetch_finnhub_company_news_async,
-    fetch_finnhub_market_news_async,
+    fetch_alpha_vantage_market_news_async,
+    fetch_alpha_vantage_related_company_news_async,
     NEWS_LOOKBACK_DAYS,
 )
 
@@ -129,13 +129,13 @@ class TestNode02NewsFetching:
                 assert article['news_type'] == 'related'
     
     @pytest.mark.asyncio
-    async def test_fetch_finnhub_company_news_async(self):
-        """Test async Finnhub company news fetching (6-month range)"""
+    async def test_fetch_alpha_vantage_market_news_async(self):
+        """Test async Alpha Vantage market/global news fetching (6-month range)"""
         to_date = datetime.now()
         from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
         
         async with aiohttp.ClientSession() as session:
-            news = await fetch_finnhub_company_news_async('AAPL', from_date, to_date, session)
+            news = await fetch_alpha_vantage_market_news_async(session, from_date, to_date)
             
             # Should return a list (may be empty if API limit reached)
             assert isinstance(news, list)
@@ -146,13 +146,19 @@ class TestNode02NewsFetching:
                 assert 'headline' in article
                 assert 'source' in article
                 assert 'news_type' in article
-                assert article['news_type'] == 'stock'
+                assert article['news_type'] == 'market'
     
     @pytest.mark.asyncio
-    async def test_fetch_finnhub_market_news_async(self):
-        """Test async Finnhub market news fetching"""
+    async def test_fetch_alpha_vantage_related_company_news_async(self):
+        """Test async Alpha Vantage related-company news fetching (6-month range)"""
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
+        peers = ['MSFT', 'GOOGL']
+        
         async with aiohttp.ClientSession() as session:
-            news = await fetch_finnhub_market_news_async('general', session)
+            news = await fetch_alpha_vantage_related_company_news_async(
+                peers, session, from_date, to_date
+            )
             
             # Should return a list
             assert isinstance(news, list)
@@ -163,7 +169,7 @@ class TestNode02NewsFetching:
                 assert 'headline' in article
                 assert 'source' in article
                 assert 'news_type' in article
-                assert article['news_type'] == 'market'
+                assert article['news_type'] == 'related'
     
     @pytest.mark.asyncio
     async def test_fetch_alpha_vantage_news_async_with_date_range(self):
@@ -218,7 +224,7 @@ class TestNode02Integration:
         
         result = fetch_all_news_node(state)
         
-        # With 6-month window (Alpha Vantage + Finnhub company + market), allow up to 15s
+        # With 6-month window (Alpha Vantage stock + related + market), allow up to 15s
         assert result['node_execution_times']['node_2'] < 15.0
 
 

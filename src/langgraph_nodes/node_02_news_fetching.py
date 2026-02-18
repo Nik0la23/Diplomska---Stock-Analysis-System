@@ -1,10 +1,12 @@
-"""
+""" 
 Node 2: Multi-Source News Fetching
-Fetches news from multiple sources in parallel using async operations.
+Fetches news from Alpha Vantage in parallel using async operations.
 
 Data Sources (6-month historical window):
-1. Alpha Vantage (Primary - stock news + built-in sentiment, date range: 6 months)
-2. Finnhub (Company news with date range: 6 months; market news as supplement)
+1. Alpha Vantage (Primary - stock, related-company, and market/global news + built-in sentiment)
+   - Stock news: target ticker
+   - Related-company news: peers from Node 3 (Finnhub)
+   - Market/global news: financial_markets topic
 
 Runs AFTER: Node 1 (price data), Node 3 (related companies)
 Runs BEFORE: Node 5 (sentiment), Node 6 (market context)
@@ -17,7 +19,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import logging
 
-from src.utils.config import ALPHA_VANTAGE_API_KEY, FINNHUB_API_KEY
+from src.utils.config import ALPHA_VANTAGE_API_KEY
 from src.database.db_manager import (
     cache_news,
     compute_and_store_ticker_stats,
@@ -39,256 +41,306 @@ NEWS_OVERLAP_DAYS = 3
 
 
 # ============================================================================
-# HELPER FUNCTION: Fetch from Alpha Vantage (Primary)
+# HELPER FUNCTIONS: Alpha Vantage (Primary for ALL News)
 # ============================================================================
+
+# Size of each time window for Alpha Vantage chunked fetching.
+# 6 months / 30 days = 6 calls per stream (stock, market, related each make 6 calls).
+_AV_WINDOW_DAYS = 30
+
+
+def _parse_av_timestamp(time_str: str) -> int:
+    """Parse Alpha Vantage time_published string to Unix timestamp."""
+    if time_str:
+        try:
+            return int(datetime.strptime(time_str, "%Y%m%dT%H%M%S").timestamp())
+        except Exception:
+            pass
+    return int(datetime.now().timestamp())
+
+
+async def _av_window_fetch(
+    session: aiohttp.ClientSession,
+    base_params: Dict[str, Any],
+    from_date: Optional[datetime],
+    to_date: Optional[datetime],
+    label: str,
+    window_days: int = _AV_WINDOW_DAYS,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch Alpha Vantage NEWS_SENTIMENT by slicing the date range into fixed
+    monthly windows and making one API call per window (sort=RELEVANCE).
+
+    Strategy
+    --------
+    - Divide [from_date, to_date] into N windows of `window_days` each.
+    - For a 6-month window with window_days=30 this is exactly 6 calls.
+    - Each call uses sort=RELEVANCE so the 1 000-article limit returns the
+      most important articles from that period rather than an arbitrary cut-off.
+    - Duplicates across windows are removed by URL.
+
+    Returns the raw feed items (not yet parsed into our article format).
+    """
+    if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == "your_alpha_vantage_key_here":
+        logger.warning(f"Alpha Vantage API key not configured ({label})")
+        return []
+
+    effective_to = to_date if to_date is not None else datetime.now()
+    effective_from = from_date if from_date is not None else (effective_to - timedelta(days=180))
+
+    # Build windows from newest to oldest so logs read naturally
+    windows: List[tuple] = []
+    win_to = effective_to
+    while win_to > effective_from:
+        win_from = max(win_to - timedelta(days=window_days), effective_from)
+        windows.append((win_from, win_to))
+        win_to = win_from
+
+    url = "https://www.alphavantage.co/query"
+    seen_urls: set = set()
+    all_items: List[Dict[str, Any]] = []
+
+    for idx, (win_from, win_to) in enumerate(windows, start=1):
+        params = {
+            **base_params,
+            "function": "NEWS_SENTIMENT",
+            "apikey": ALPHA_VANTAGE_API_KEY,
+            "limit": 1000,
+            "sort": "RELEVANCE",
+            "time_from": win_from.strftime("%Y%m%dT%H%M"),
+            "time_to": win_to.strftime("%Y%m%dT%H%M"),
+        }
+
+        logger.info(
+            f"AV ({label}) window {idx}/{len(windows)}: "
+            f"{win_from.strftime('%Y-%m-%d')} → {win_to.strftime('%Y-%m-%d')}"
+        )
+
+        try:
+            async with session.get(url, params=params) as response:
+                if response.status != 200:
+                    logger.error(f"AV API error ({label}) window {idx}: {response.status}")
+                    continue
+                data = await response.json()
+        except Exception as exc:
+            logger.error(f"AV request failed ({label}) window {idx}: {exc}")
+            continue
+
+        if "Note" in data or "Error Message" in data:
+            logger.warning(
+                f"AV ({label}) window {idx}: "
+                f"{data.get('Note') or data.get('Error Message')}"
+            )
+            continue
+
+        feed = data.get("feed", [])
+        if not feed:
+            logger.info(f"AV ({label}) window {idx}: empty feed")
+            continue
+
+        new_this_window = 0
+        for item in feed:
+            item_url = item.get("url", "")
+            if item_url and item_url in seen_urls:
+                continue
+            if item_url:
+                seen_urls.add(item_url)
+            item["_ts"] = _parse_av_timestamp(item.get("time_published", ""))
+            all_items.append(item)
+            new_this_window += 1
+
+        logger.info(
+            f"AV ({label}) window {idx}: "
+            f"{len(feed)} raw → {new_this_window} new, running total={len(all_items)}"
+        )
+
+    logger.info(
+        f"AV ({label}): fetch complete — {len(all_items)} articles "
+        f"across {len(windows)} windows"
+    )
+    return all_items
+
 
 async def fetch_alpha_vantage_news_async(
     ticker: str,
     session: aiohttp.ClientSession,
     from_date: Optional[datetime] = None,
-    to_date: Optional[datetime] = None
+    to_date: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch stock news + sentiment from Alpha Vantage API (async).
-    
-    Provides:
-    - Stock-specific news (6-month coverage when date range supplied)
-    - Built-in overall sentiment analysis
-    - Ticker-specific sentiment scores
-    
-    Args:
-        ticker: Stock ticker symbol
-        session: aiohttp session for requests
-        from_date: Start of date range (6 months back). Optional.
-        to_date: End of date range (today). Optional.
-        
-    Returns:
-        List of news articles with sentiment data
-        Empty list if fetch fails
+    Fetch ticker-specific stock news + sentiment from Alpha Vantage (paginated).
+
+    Walks backwards through the full 6-month window by repeating the 1 000-article
+    call with a sliding time_to until from_date is reached.
     """
-    try:
-        if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == 'your_alpha_vantage_key_here':
-            logger.warning("Alpha Vantage API key not configured")
-            return []
-        
-        url = "https://www.alphavantage.co/query"
-        params = {
-            'function': 'NEWS_SENTIMENT',
-            'tickers': ticker,
-            'apikey': ALPHA_VANTAGE_API_KEY,
-            'limit': 1000,  # Max for historical range (was 200)
-            'sort': 'LATEST'
-        }
-        # Add date range for 6-month historical pull (format: YYYYMMDDTHHMMSS)
-        if from_date is not None and to_date is not None:
-            params['time_from'] = from_date.strftime('%Y%m%dT0000')
-            params['time_to'] = to_date.strftime('%Y%m%dT2359')
-            logger.info(f"Alpha Vantage: Requesting news from {params['time_from']} to {params['time_to']}")
-        
-        async with session.get(url, params=params) as response:
-            if response.status != 200:
-                logger.error(f"Alpha Vantage API error: {response.status}")
-                return []
-            
-            data = await response.json()
-            
-            # Check for errors or rate limits
-            if 'Note' in data or 'Error Message' in data:
-                logger.warning(f"Alpha Vantage: {data.get('Note') or data.get('Error Message')}")
-                return []
-            
-            if 'feed' not in data:
-                logger.warning(f"Alpha Vantage: No feed in response for {ticker}")
-                return []
-            
-            feed = data['feed']
-            
-            # Standardize to our format
-            articles = []
-            for item in feed:
-                # Parse publish time
-                time_str = item.get('time_published', '')
-                if time_str:
-                    try:
-                        pub_time = datetime.strptime(time_str, '%Y%m%dT%H%M%S')
-                        timestamp = int(pub_time.timestamp())
-                    except:
-                        timestamp = int(datetime.now().timestamp())
-                else:
-                    timestamp = int(datetime.now().timestamp())
-                
-                # Extract ticker-specific sentiment
-                ticker_sentiment = None
-                ticker_relevance = 0.0
-                if 'ticker_sentiment' in item:
-                    for ts in item['ticker_sentiment']:
-                        if ts.get('ticker') == ticker:
-                            ticker_sentiment = ts.get('ticker_sentiment_score', 0.0)
-                            ticker_relevance = ts.get('relevance_score', 0.0)
-                            break
-                
-                article = {
-                    'headline': item.get('title', ''),
-                    'summary': item.get('summary', ''),
-                    'source': item.get('source', ''),
-                    'url': item.get('url', ''),
-                    'datetime': timestamp,
-                    'image': item.get('banner_image', ''),
-                    'news_type': 'stock',  # Tag as stock-specific news
-                    # Alpha Vantage specific fields
-                    'overall_sentiment_score': item.get('overall_sentiment_score', 0.0),
-                    'overall_sentiment_label': item.get('overall_sentiment_label', 'Neutral'),
-                    'ticker_sentiment_score': ticker_sentiment,
-                    'ticker_relevance_score': ticker_relevance
-                }
-                articles.append(article)
-            
-            logger.info(f"Alpha Vantage: Fetched {len(articles)} news articles for {ticker}")
-            return articles
-            
-    except Exception as e:
-        logger.error(f"Failed to fetch Alpha Vantage news for {ticker}: {str(e)}")
-        return []
+    raw_items = await _av_window_fetch(
+        session=session,
+        base_params={"tickers": ticker},
+        from_date=from_date,
+        to_date=to_date,
+        label=f"stock:{ticker}",
+    )
+
+    articles: List[Dict[str, Any]] = []
+    for item in raw_items:
+        ticker_sentiment = None
+        ticker_relevance = 0.0
+        for ts in item.get("ticker_sentiment", []):
+            if ts.get("ticker") == ticker:
+                ticker_sentiment = ts.get("ticker_sentiment_score", 0.0)
+                ticker_relevance = ts.get("relevance_score", 0.0)
+                break
+
+        articles.append({
+            "headline": item.get("title", ""),
+            "summary": item.get("summary", ""),
+            "source": item.get("source", ""),
+            "url": item.get("url", ""),
+            "datetime": item["_ts"],
+            "image": item.get("banner_image", ""),
+            "news_type": "stock",
+            "overall_sentiment_score": item.get("overall_sentiment_score", 0.0),
+            "overall_sentiment_label": item.get("overall_sentiment_label", "Neutral"),
+            "ticker_sentiment_score": ticker_sentiment,
+            "ticker_relevance_score": ticker_relevance,
+        })
+
+    logger.info(f"Alpha Vantage: {len(articles)} stock news articles for {ticker}")
+    return articles
 
 
-# ============================================================================
-# HELPER FUNCTION: Fetch Company News from Finnhub (with date range)
-# ============================================================================
-
-async def fetch_finnhub_company_news_async(
-    ticker: str,
-    from_date: datetime,
-    to_date: datetime,
-    session: aiohttp.ClientSession
+async def fetch_alpha_vantage_market_news_async(
+    session: aiohttp.ClientSession,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    topics: str = "financial_markets",
 ) -> List[Dict[str, Any]]:
     """
-    Fetch company-specific news from Finnhub API (async) for a 6-month window.
-    
-    Args:
-        ticker: Stock ticker symbol
-        from_date: Start of date range
-        to_date: End of date range
-        session: aiohttp session for requests
-        
-    Returns:
-        List of news articles (ticker-specific, with date range)
-        Empty list if fetch fails
+    Fetch broad market / global news from Alpha Vantage (paginated).
+
+    Uses the topics filter (e.g. 'financial_markets') to capture macro stories.
+    Paginates through the full 6-month window.
     """
-    try:
-        if not FINNHUB_API_KEY or FINNHUB_API_KEY == 'your_finnhub_key_here':
-            logger.warning("Finnhub API key not configured")
-            return []
-        
-        url = "https://finnhub.io/api/v1/company-news"
-        params = {
-            'symbol': ticker,
-            'from': from_date.strftime('%Y-%m-%d'),
-            'to': to_date.strftime('%Y-%m-%d'),
-            'token': FINNHUB_API_KEY
-        }
-        
-        async with session.get(url, params=params) as response:
-            if response.status != 200:
-                logger.error(f"Finnhub company news error: {response.status}")
-                return []
-            
-            data = await response.json()
-            
-            if not data:
-                logger.info(f"Finnhub: No company news for {ticker} in date range")
-                return []
-            
-            articles = []
-            for item in data:
-                # Finnhub company-news returns datetime as Unix timestamp (seconds)
-                ts = item.get('datetime', 0)
-                if isinstance(ts, (int, float)):
-                    datetime_val = ts
-                else:
-                    datetime_val = int(datetime.now().timestamp())
-                
-                article = {
-                    'headline': item.get('headline', ''),
-                    'summary': item.get('summary', ''),
-                    'source': item.get('source', ''),
-                    'url': item.get('url', ''),
-                    'datetime': datetime_val,
-                    'image': item.get('image', ''),
-                    'news_type': 'stock',  # Company-specific = stock
-                    'category': item.get('category', 'company')
-                }
-                articles.append(article)
-            
-            logger.info(f"Finnhub: Fetched {len(articles)} company news articles for {ticker} (6-month range)")
-            return articles
-            
-    except Exception as e:
-        logger.error(f"Failed to fetch Finnhub company news for {ticker}: {str(e)}")
-        return []
+    raw_items = await _av_window_fetch(
+        session=session,
+        base_params={"topics": topics},
+        from_date=from_date,
+        to_date=to_date,
+        label=f"market:{topics}",
+    )
+
+    articles: List[Dict[str, Any]] = []
+    for item in raw_items:
+        articles.append({
+            "headline": item.get("title", ""),
+            "summary": item.get("summary", ""),
+            "source": item.get("source", ""),
+            "url": item.get("url", ""),
+            "datetime": item["_ts"],
+            "image": item.get("banner_image", ""),
+            "news_type": "market",
+            "overall_sentiment_score": item.get("overall_sentiment_score", 0.0),
+            "overall_sentiment_label": item.get("overall_sentiment_label", "Neutral"),
+        })
+
+    logger.info(f"Alpha Vantage: {len(articles)} market/global news articles")
+    return articles
 
 
-# ============================================================================
-# HELPER FUNCTION: Fetch Market News from Finnhub (Supplement)
-# ============================================================================
-
-async def fetch_finnhub_market_news_async(
-    category: str,
-    session: aiohttp.ClientSession
+async def fetch_alpha_vantage_related_company_news_async(
+    peers: List[str],
+    session: aiohttp.ClientSession,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    per_peer_limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch general market news from Finnhub API (async).
-    Supplements with broader market context (recent articles; no date range in API).
-    
-    Args:
-        category: News category ('general', 'forex', 'crypto', 'merger')
-        session: aiohttp session for requests
-        
-    Returns:
-        List of market news articles
-        Empty list if fetch fails
+    Fetch top N most relevant articles for each peer concurrently.
+
+    One API call per peer (sort=RELEVANCE, limit=per_peer_limit) over the full
+    6-month window.  Passing all tickers comma-separated to AV returns 0 results;
+    individual calls per ticker work reliably.
+
+    For 5 peers this is exactly 5 concurrent API calls.
     """
-    try:
-        if not FINNHUB_API_KEY or FINNHUB_API_KEY == 'your_finnhub_key_here':
-            logger.warning("Finnhub API key not configured")
-            return []
-        
-        url = "https://finnhub.io/api/v1/news"
-        params = {
-            'category': category,
-            'token': FINNHUB_API_KEY
-        }
-        
-        async with session.get(url, params=params) as response:
-            if response.status != 200:
-                logger.error(f"Finnhub market news error: {response.status}")
-                return []
-            
-            data = await response.json()
-            
-            if not data:
-                return []
-            
-            # Standardize to our format
-            articles = []
-            for item in data:
-                article = {
-                    'headline': item.get('headline', ''),
-                    'summary': item.get('summary', ''),
-                    'source': item.get('source', ''),
-                    'url': item.get('url', ''),
-                    'datetime': item.get('datetime', 0),
-                    'image': item.get('image', ''),
-                    'news_type': 'market',  # Tag as market news
-                    'category': item.get('category', category)
-                }
-                articles.append(article)
-            
-            logger.info(f"Finnhub: Fetched {len(articles)} market news articles (category: {category})")
-            return articles
-            
-    except Exception as e:
-        logger.error(f"Failed to fetch Finnhub market news: {str(e)}")
+    if not peers:
         return []
+
+    if not ALPHA_VANTAGE_API_KEY or ALPHA_VANTAGE_API_KEY == "your_alpha_vantage_key_here":
+        logger.warning("Alpha Vantage API key not configured for related company news")
+        return []
+
+    url = "https://www.alphavantage.co/query"
+
+    async def _fetch_one(peer: str) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": peer.upper(),
+            "apikey": ALPHA_VANTAGE_API_KEY,
+            "limit": per_peer_limit,
+            "sort": "RELEVANCE",
+        }
+        if from_date is not None:
+            params["time_from"] = from_date.strftime("%Y%m%dT%H%M")
+        if to_date is not None:
+            params["time_to"] = to_date.strftime("%Y%m%dT%H%M")
+
+        logger.info(f"AV (related:{peer}): fetching top {per_peer_limit} articles")
+        try:
+            async with session.get(url, params=params) as response:
+                if response.status != 200:
+                    logger.error(f"AV API error (related:{peer}): {response.status}")
+                    return []
+                data = await response.json()
+        except Exception as exc:
+            logger.error(f"AV request failed (related:{peer}): {exc}")
+            return []
+
+        if "Note" in data or "Error Message" in data:
+            logger.warning(f"AV (related:{peer}): {data.get('Note') or data.get('Error Message')}")
+            return []
+
+        feed = data.get("feed", [])
+        peer_articles: List[Dict[str, Any]] = []
+        for item in feed:
+            ts = _parse_av_timestamp(item.get("time_published", ""))
+            peer_articles.append({
+                "headline": item.get("title", ""),
+                "summary": item.get("summary", ""),
+                "source": item.get("source", ""),
+                "url": item.get("url", ""),
+                "datetime": ts,
+                "image": item.get("banner_image", ""),
+                "news_type": "related",
+                "related_ticker": peer.upper(),
+                "overall_sentiment_score": item.get("overall_sentiment_score", 0.0),
+                "overall_sentiment_label": item.get("overall_sentiment_label", "Neutral"),
+            })
+
+        logger.info(f"AV (related:{peer}): got {len(peer_articles)} articles")
+        return peer_articles
+
+    # Run all peer fetches concurrently
+    results = await asyncio.gather(*[_fetch_one(p) for p in peers], return_exceptions=True)
+
+    seen_urls: set = set()
+    all_articles: List[Dict[str, Any]] = []
+    for result in results:
+        if not isinstance(result, list):
+            continue
+        for article in result:
+            article_url = article.get("url", "")
+            if article_url and article_url in seen_urls:
+                continue
+            if article_url:
+                seen_urls.add(article_url)
+            all_articles.append(article)
+
+    logger.info(
+        f"Alpha Vantage: {len(all_articles)} related-company news articles "
+        f"({per_peer_limit}/peer × {len(peers)} peers)"
+    )
+    return all_articles
 
 
 # ============================================================================
@@ -297,14 +349,14 @@ async def fetch_finnhub_market_news_async(
 
 def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Node 2: Multi-Source News Fetching
+    Node 2: Multi-Source News Fetching (Alpha Vantage primary)
     
     Execution flow:
     1. Check cache for recent news (< 6 hours)
     2. If cached, return cached news
-    3. Fetch stock news from Alpha Vantage (primary, with sentiment)
-    4. Fetch market news from Finnhub (supplement, broader context)
-    5. Combine and deduplicate articles
+    3. Fetch stock news from Alpha Vantage (ticker-specific, with sentiment)
+    4. Fetch market/global news from Alpha Vantage (topics-based)
+    5. Fetch related-company news from Alpha Vantage using peers from Node 3
     6. Cache results for future use
     7. Update state with all news articles
     
@@ -312,10 +364,11 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         state: LangGraph state containing 'ticker' and optionally 'raw_price_data'
         
     Returns:
-        Updated state with 'stock_news' and 'market_news' populated
+        Updated state with 'stock_news', 'market_news', and 'related_company_news' populated
     """
     start_time = datetime.now()
     ticker = state['ticker']
+    related_companies = state.get('related_companies', []) or []
     
     try:
         logger.info(f"Node 2: Starting news fetching for {ticker}")
@@ -367,7 +420,10 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 stock_from_db = get_news_for_ticker(ticker, 'stock', days=NEWS_LOOKBACK_DAYS)
                 market_from_db = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
                 if stock_from_db or market_from_db:
-                    logger.info(f"Node 2: News current for {ticker}, loaded from DB (no API) — stock: {len(stock_from_db)}, market: {len(market_from_db)}")
+                    logger.info(
+                        f"Node 2: News current for {ticker}, loaded from DB (no API) — "
+                        f"stock: {len(stock_from_db)}, market: {len(market_from_db)}"
+                    )
                     state['stock_news'] = stock_from_db
                     state['market_news'] = market_from_db
                     state['related_company_news'] = []
@@ -404,7 +460,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Node 2: Fetching news from {from_str} to {to_str}")
         
         # ====================================================================
-        # STEP 4: Fetch News from Multiple Sources (Async Parallel)
+        # STEP 4: Fetch News from Alpha Vantage (Async Parallel)
         # ====================================================================
         
         async def fetch_all():
@@ -413,10 +469,12 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 tasks = [
                     # Alpha Vantage: stock news + sentiment (with time_from, time_to)
                     fetch_alpha_vantage_news_async(ticker, session, from_date, to_date),
-                    # Finnhub: company news for ticker (with from, to)
-                    fetch_finnhub_company_news_async(ticker, from_date, to_date, session),
-                    # Finnhub: general market news (recent; filtered by date below)
-                    fetch_finnhub_market_news_async('general', session)
+                    # Alpha Vantage: market/global news via topics
+                    fetch_alpha_vantage_market_news_async(session, from_date, to_date),
+                    # Alpha Vantage: related-company news for peers from Node 3
+                    fetch_alpha_vantage_related_company_news_async(
+                        related_companies, session, from_date, to_date
+                    ),
                 ]
                 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -425,27 +483,22 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # Run async tasks
         results = asyncio.run(fetch_all())
         
-        # Extract results: merge Alpha Vantage + Finnhub company into stock_news
-        av_news = results[0] if isinstance(results[0], list) else []
-        finnhub_company_news = results[1] if isinstance(results[1], list) else []
-        market_news = results[2] if isinstance(results[2], list) else []
+        stock_news = results[0] if isinstance(results[0], list) else []
+        market_news = results[1] if isinstance(results[1], list) else []
+        related_company_news = results[2] if isinstance(results[2], list) else []
         
-        # Merge stock news: Alpha Vantage (has sentiment) + Finnhub company (6-month)
-        # Deduplicate by headline to avoid same story from both sources
-        seen_headlines = set()
-        stock_news = []
-        for article in av_news + finnhub_company_news:
-            key = (article.get('headline', '') or '').strip() or article.get('url', '')
-            if key and key not in seen_headlines:
-                seen_headlines.add(key)
-                stock_news.append(article)
-        logger.info(f"Node 2: Stock news merged: {len(av_news)} Alpha Vantage + {len(finnhub_company_news)} Finnhub company → {len(stock_news)} total")
-
         # Track how many articles were newly fetched from APIs (before date filtering)
-        newly_fetched_stock_count = len(av_news) + len(finnhub_company_news)
+        newly_fetched_stock_count = len(stock_news)
         newly_fetched_market_count = len(market_news)
-        newly_fetched_total = newly_fetched_stock_count + newly_fetched_market_count
-        logger.info(f"Node 2: Newly fetched from APIs: {newly_fetched_total} articles ({newly_fetched_stock_count} stock + {newly_fetched_market_count} market)")
+        newly_fetched_related_count = len(related_company_news)
+        newly_fetched_total = (
+            newly_fetched_stock_count + newly_fetched_market_count + newly_fetched_related_count
+        )
+        logger.info(
+            f"Node 2: Newly fetched from Alpha Vantage: {newly_fetched_total} articles "
+            f"({newly_fetched_stock_count} stock + {newly_fetched_market_count} market "
+            f"+ {newly_fetched_related_count} related)"
+        )
         
         # ====================================================================
         # Filter by Date Range
@@ -454,13 +507,21 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         to_timestamp = int(to_date.timestamp())
         
         stock_news = [
-            article for article in stock_news
-            if from_timestamp <= article.get('datetime', 0) <= to_timestamp
+            article
+            for article in stock_news
+            if from_timestamp <= article.get("datetime", 0) <= to_timestamp
         ]
         
         market_news = [
-            article for article in market_news
-            if from_timestamp <= article.get('datetime', 0) <= to_timestamp
+            article
+            for article in market_news
+            if from_timestamp <= article.get("datetime", 0) <= to_timestamp
+        ]
+        
+        related_company_news = [
+            article
+            for article in related_company_news
+            if from_timestamp <= article.get("datetime", 0) <= to_timestamp
         ]
         
         # ====================================================================
@@ -468,19 +529,31 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # ====================================================================
         try:
             if stock_news:
-                cache_news(ticker, 'stock', stock_news)
+                cache_news(ticker, "stock", stock_news)
                 logger.info(f"Node 2: Cached {len(stock_news)} stock news articles")
             if market_news:
-                cache_news(ticker, 'market', market_news)
+                cache_news(ticker, "market", market_news)
                 logger.info(f"Node 2: Cached {len(market_news)} market news articles")
+            if related_company_news:
+                cache_news(ticker, "related", related_company_news)
+                logger.info(
+                    f"Node 2: Cached {len(related_company_news)} related-company news articles"
+                )
         except Exception as e:
             logger.warning(f"Node 2: Failed to cache news: {str(e)}")
         
         # After incremental fetch, load full 6 months from DB for state
         if latest_news_date is not None and (to_date - from_date).days < (NEWS_LOOKBACK_DAYS - 10):
-            stock_news = get_news_for_ticker(ticker, 'stock', days=NEWS_LOOKBACK_DAYS)
-            market_news = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
-            logger.info(f"Node 2: Loaded full 6-month series from DB — stock: {len(stock_news)}, market: {len(market_news)}")
+            stock_news = get_news_for_ticker(ticker, "stock", days=NEWS_LOOKBACK_DAYS)
+            market_news = get_news_for_ticker(ticker, "market", days=NEWS_LOOKBACK_DAYS)
+            related_company_news = get_news_for_ticker(
+                ticker, "related", days=NEWS_LOOKBACK_DAYS
+            )
+            logger.info(
+                "Node 2: Loaded full 6-month series from DB — "
+                f"stock: {len(stock_news)}, market: {len(market_news)}, "
+                f"related: {len(related_company_news)}"
+            )
 
         # ====================================================================
         # Persist velocity baseline (ticker_stats) — live API fetch only.
@@ -496,32 +569,46 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # ====================================================================
         # Update State
         # ====================================================================
-        state['stock_news'] = stock_news
-        state['market_news'] = market_news
-        state['related_company_news'] = []  # Alpha Vantage doesn't separate related news
+        state["stock_news"] = stock_news
+        state["market_news"] = market_news
+        state["related_company_news"] = related_company_news
 
         # Add metadata about this fetch for Node 9B velocity detection
         fetch_window_days = max(1, (to_date - from_date).days + 1)
-        state['news_fetch_metadata'] = {
-            'from_date': from_date.isoformat(),
-            'to_date': to_date.isoformat(),
-            'fetch_window_days': fetch_window_days,
-            'newly_fetched_count': newly_fetched_total,   # Articles fetched from APIs this run
-            'total_in_state': len(stock_news) + len(market_news),  # Full 6-month batch
-            'newly_fetched_stock': newly_fetched_stock_count,
-            'newly_fetched_market': newly_fetched_market_count,
-            'was_incremental_fetch': latest_news_date is not None,
-            'daily_article_avg': daily_avg,  # True per-calendar-day baseline (from ticker_stats)
+        state["news_fetch_metadata"] = {
+            "from_date": from_date.isoformat(),
+            "to_date": to_date.isoformat(),
+            "fetch_window_days": fetch_window_days,
+            "newly_fetched_count": newly_fetched_total,
+            "total_in_state": len(stock_news) + len(market_news) + len(related_company_news),
+            "newly_fetched_stock": newly_fetched_stock_count,
+            "newly_fetched_market": newly_fetched_market_count,
+            "newly_fetched_related": newly_fetched_related_count,
+            "was_incremental_fetch": latest_news_date is not None,
+            "daily_article_avg": daily_avg,
         }
 
-        total_articles = len(stock_news) + len(market_news)
+        total_articles = len(stock_news) + len(market_news) + len(related_company_news)
         elapsed = (datetime.now() - start_time).total_seconds()
-        state['node_execution_times']['node_2'] = elapsed
-
-        logger.info(f"Node 2: Successfully fetched {total_articles} total articles in {elapsed:.2f}s (6-month window)")
-        logger.info(f"Node 2:   Stock news: {len(stock_news)} (Alpha Vantage + Finnhub company, 6-month range)")
-        logger.info(f"Node 2:   Market news: {len(market_news)} (Finnhub general, filtered by date)")
-        logger.info(f"Node 2:   Newly fetched: {newly_fetched_total} articles over {fetch_window_days} days")
+        state["node_execution_times"]["node_2"] = elapsed
+        
+        logger.info(
+            f"Node 2: Successfully fetched {total_articles} total articles in {elapsed:.2f}s "
+            f"(6-month window)"
+        )
+        logger.info(
+            f"Node 2:   Stock news: {len(stock_news)} (Alpha Vantage ticker-specific, 6-month range)"
+        )
+        logger.info(
+            f"Node 2:   Market/global news: {len(market_news)} (Alpha Vantage topics-based)"
+        )
+        logger.info(
+            f"Node 2:   Related-company news: {len(related_company_news)} "
+            f"(Alpha Vantage peers from Node 3)"
+        )
+        logger.info(
+            f"Node 2:   Newly fetched: {newly_fetched_total} articles over {fetch_window_days} days"
+        )
         
         return state
         
