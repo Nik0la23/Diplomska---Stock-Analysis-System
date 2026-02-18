@@ -1,0 +1,9 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "stock_analysis": "./src/graph/app.py:graph"
+  },
+  "env": ".env"
+}
+

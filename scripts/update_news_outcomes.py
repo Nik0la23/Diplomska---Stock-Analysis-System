@@ -11,9 +11,9 @@ news article was published, then records whether the sentiment prediction
 Runs separately from the main pipeline - can be run manually or via cron.
 
 Usage:
-    python -m scripts.update_news_outcomes                # All tickers
-    python -m scripts.update_news_outcomes --ticker NVDA  # Single ticker
-    python -m scripts.update_news_outcomes --limit 1000   # Custom limit
+    python -m scripts.update_news_outcomes                # All tickers, all pending articles
+    python -m scripts.update_news_outcomes --ticker NVDA   # Single ticker
+    python -m scripts.update_news_outcomes --limit 1000   # Cap at 1000 articles per run
     
 When to run:
     - FIRST TIME: After Nodes 1-2 have fetched 6 months of historical data
@@ -262,13 +262,13 @@ def evaluate_single_article(article: Dict) -> Optional[Dict]:
 # MAIN EVALUATION FUNCTION
 # ============================================================================
 
-def run_evaluation(ticker: Optional[str] = None, limit: int = 500, verbose: bool = True) -> Dict:
+def run_evaluation(ticker: Optional[str] = None, limit: Optional[int] = None, verbose: bool = True) -> Dict:
     """
     Main evaluation function - processes pending articles and saves outcomes.
     
     Args:
         ticker: Optional ticker symbol (if None, evaluates all tickers)
-        limit: Maximum articles to process per run (default: 500)
+        limit: Maximum articles to process (default: None = all pending)
         verbose: Print progress messages (default: True)
         
     Returns:
@@ -282,14 +282,14 @@ def run_evaluation(ticker: Optional[str] = None, limit: int = 500, verbose: bool
         }
         
     Example:
-        >>> results = run_evaluation(ticker='NVDA', limit=100)
+        >>> results = run_evaluation(ticker='NVDA', limit=None)  # all pending
         >>> print(f"Accuracy: {results['accuracy_pct']:.1f}%")
     """
     start_time = datetime.now()
     
     logger.info(f"Starting news outcomes evaluation"
                f"{f' for {ticker}' if ticker else ' for all tickers'}"
-               f" (limit: {limit})")
+               f" (limit: {'all' if limit is None else limit})")
     
     # =========================================================================
     # Step 1: Get pending articles needing evaluation
@@ -419,8 +419,9 @@ Examples:
     parser.add_argument(
         '--limit',
         type=int,
-        default=500,
-        help='Max articles to process per run (default: 500)'
+        default=None,
+        metavar='N',
+        help='Max articles to process (default: no limit, process all pending)'
     )
     
     parser.add_argument(

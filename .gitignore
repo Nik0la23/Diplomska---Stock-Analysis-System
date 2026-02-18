@@ -45,6 +45,7 @@ data/cache/*
 !data/cache/.gitkeep
 *.log
 logs/
+graph_schema.png
 
 # Jupyter
 .ipynb_checkpoints/
