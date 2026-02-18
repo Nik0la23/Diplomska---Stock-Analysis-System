@@ -569,6 +569,143 @@ def get_news_with_outcomes(
 
 
 # ============================================================================
+# NEWS OUTCOMES SEEDING  (Node 8 first-run bootstrap)
+# ============================================================================
+
+def compute_and_seed_news_outcomes(
+    ticker: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    """
+    Compute news-price outcome records from existing news_articles + price_data
+    and insert them into news_outcomes (INSERT OR IGNORE — never overwrites).
+
+    Called by Node 8 before get_news_with_outcomes() so that even on the very
+    first pipeline run the learning system has historical data to work with.
+
+    Returns the number of newly seeded outcome rows.
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+
+            # Skip if the table already has enough data for this ticker
+            cursor.execute(
+                "SELECT COUNT(*) AS cnt FROM news_outcomes WHERE ticker = ?",
+                (ticker,),
+            )
+            existing = cursor.fetchone()["cnt"]
+            if existing >= 10:
+                logger.debug(
+                    f"Seeding skipped for {ticker}: {existing} outcomes already exist"
+                )
+                return 0
+
+            # Load news articles with sentiment (only unfiltered, with a label)
+            cursor.execute(
+                """
+                SELECT id, news_type, sentiment_label, sentiment_score, published_at
+                FROM news_articles
+                WHERE ticker = ?
+                  AND is_filtered = 0
+                  AND sentiment_label IS NOT NULL
+                  AND published_at IS NOT NULL
+                ORDER BY published_at ASC
+                """,
+                (ticker,),
+            )
+            articles = cursor.fetchall()
+            if not articles:
+                logger.info(f"Seeding skipped for {ticker}: no suitable news articles")
+                return 0
+
+            # Load all price data into memory for fast lookup
+            cursor.execute(
+                "SELECT date, close FROM price_data WHERE ticker = ? ORDER BY date ASC",
+                (ticker,),
+            )
+            price_rows = cursor.fetchall()
+            if not price_rows:
+                logger.info(f"Seeding skipped for {ticker}: no price data")
+                return 0
+
+            prices: Dict[str, float] = {r["date"]: r["close"] for r in price_rows}
+            price_dates = sorted(prices.keys())
+
+            def _price_on_or_after(date_str: str, max_gap: int = 5) -> Optional[float]:
+                target = date_str[:10]
+                for d in price_dates:
+                    if d >= target:
+                        delta = (
+                            datetime.strptime(d, "%Y-%m-%d")
+                            - datetime.strptime(target, "%Y-%m-%d")
+                        ).days
+                        if delta <= max_gap:
+                            return prices[d]
+                return None
+
+            def _price_n_days_later(date_str: str, n: int) -> Optional[float]:
+                base = datetime.strptime(date_str[:10], "%Y-%m-%d")
+                lo = (base + timedelta(days=n)).strftime("%Y-%m-%d")
+                hi = (base + timedelta(days=n + 5)).strftime("%Y-%m-%d")
+                for d in price_dates:
+                    if lo <= d <= hi:
+                        return prices[d]
+                return None
+
+            seeded = 0
+            for art in articles:
+                pub = str(art["published_at"])[:10]
+                p0 = _price_on_or_after(pub)
+                p7 = _price_n_days_later(pub, 7)
+                if p0 is None or p7 is None or p0 == 0:
+                    continue
+
+                p1 = _price_n_days_later(pub, 1)
+                p3 = _price_n_days_later(pub, 3)
+
+                chg1 = (p1 - p0) / p0 * 100 if p1 else None
+                chg3 = (p3 - p0) / p0 * 100 if p3 else None
+                chg7 = (p7 - p0) / p0 * 100
+
+                label = (art["sentiment_label"] or "").lower()
+                pred = "UP" if label == "positive" else ("DOWN" if label == "negative" else "FLAT")
+                actual = "UP" if chg7 > 1.0 else ("DOWN" if chg7 < -1.0 else "FLAT")
+                acc7 = (pred == actual) if pred != "FLAT" else None
+
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO news_outcomes
+                        (news_id, ticker, price_at_news,
+                         price_1day_later, price_3day_later, price_7day_later,
+                         price_change_1day, price_change_3day, price_change_7day,
+                         predicted_direction, actual_direction,
+                         prediction_was_accurate_1day,
+                         prediction_was_accurate_3day,
+                         prediction_was_accurate_7day)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        art["id"], ticker, p0,
+                        p1, p3, p7,
+                        chg1, chg3, chg7,
+                        pred, actual,
+                        (pred == actual) if (chg1 is not None and pred != "FLAT") else None,
+                        (pred == actual) if (chg3 is not None and pred != "FLAT") else None,
+                        acc7,
+                    ),
+                )
+                seeded += 1
+
+        logger.info(f"Seeded {seeded} news outcomes for {ticker}")
+        return seeded
+
+    except Exception as e:
+        logger.error(f"compute_and_seed_news_outcomes failed for {ticker}: {str(e)}")
+        return 0
+
+
+# ============================================================================
 # SOURCE RELIABILITY OPERATIONS
 # ============================================================================
 
@@ -1217,3 +1354,397 @@ def verify_database(db_path: str = DEFAULT_DB_PATH) -> Dict[str, Any]:
             'status': 'ERROR',
             'error': str(e)
         }
+
+
+# ============================================================================
+# BEHAVIORAL ANOMALY SUPPORT (Node 9B)
+# ============================================================================
+
+def get_historical_daily_aggregates(  # noqa: C901
+    ticker: str,
+    days: int = 180,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """
+    Get daily aggregated metrics for historical behavioral pattern matching.
+
+    This joins price, news, and outcomes data to produce one record per day,
+    used by Node 9B's historical pattern matcher.
+
+    Args:
+        ticker: Stock ticker symbol
+        days: Number of calendar days of history (default: 180)
+        db_path: Path to database
+
+    Returns:
+        List of dictionaries, each representing a day:
+        [
+            {
+                'date': '2025-08-15',
+                'article_count': 8,
+                'avg_composite_anomaly': 0.12,
+                'avg_source_credibility': 0.68,
+                'volume': 45000000,
+                'volume_ratio': 1.1,
+                'price_change_1d': 0.8,
+                'price_change_7d': 2.1,
+                'sentiment_avg': 0.28,
+                'sentiment_label': 'positive'
+            },
+            ...
+        ]
+    """
+    try:
+        # Fetch window = requested days + 15 extra calendar days so we have
+        # enough future prices to compute price_change_7d for all dates.
+        lookback = days + 15
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+
+            # ── Price data ───────────────────────────────────────────────────
+            cursor.execute(
+                """
+                SELECT date, close, volume
+                FROM price_data
+                WHERE ticker = ? AND date >= date('now', ?)
+                ORDER BY date ASC
+                """,
+                (ticker, f"-{lookback} days"),
+            )
+            price_rows = cursor.fetchall()
+            if not price_rows:
+                logger.debug(f"No price data for {ticker} — returning empty aggregates")
+                return []
+
+            prices: Dict[str, float] = {r["date"]: r["close"] for r in price_rows}
+            volumes: Dict[str, int] = {r["date"]: r["volume"] for r in price_rows}
+            price_dates = sorted(prices.keys())
+
+            # 30-day rolling average volume (used for volume_ratio normalisation)
+            total_vol = sum(volumes.values())
+            avg_vol = total_vol / len(volumes) if volumes else 1.0
+
+            # ── News aggregates by publish date ──────────────────────────────
+            cursor.execute(
+                """
+                SELECT
+                    DATE(published_at)                                           AS pub_date,
+                    COUNT(*)                                                     AS article_count,
+                    AVG(CASE WHEN is_filtered=0 THEN COALESCE(sentiment_score,0)
+                             ELSE 0 END)                                         AS sentiment_avg,
+                    SUM(CASE WHEN is_filtered=1 THEN 1 ELSE 0 END)              AS filtered_count
+                FROM news_articles
+                WHERE ticker = ?
+                  AND published_at IS NOT NULL
+                  AND published_at >= date('now', ?)
+                GROUP BY DATE(published_at)
+                """,
+                (ticker, f"-{lookback} days"),
+            )
+            news_by_date: Dict[str, Dict] = {r["pub_date"]: dict(r) for r in cursor.fetchall()}
+
+            # ── Global source credibility (average across sources) ───────────
+            cursor.execute(
+                "SELECT AVG(accuracy_rate) AS avg_cred FROM source_reliability WHERE ticker = ?",
+                (ticker,),
+            )
+            cred_row = cursor.fetchone()
+            global_credibility = float(cred_row["avg_cred"]) if cred_row and cred_row["avg_cred"] else 0.5
+
+        # ── Build per-day records (pure Python — no view dependency) ─────────
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        results: List[Dict[str, Any]] = []
+
+        for i, date in enumerate(price_dates):
+            if date < cutoff:
+                continue
+
+            # Volume ratio
+            vol = volumes.get(date, 0)
+            volume_ratio = vol / avg_vol if avg_vol > 0 else 1.0
+
+            # Price change 1d (vs. previous trading day)
+            prev_idx = i - 1
+            while prev_idx >= 0 and price_dates[prev_idx] not in prices:
+                prev_idx -= 1
+            if prev_idx >= 0:
+                prev_close = prices[price_dates[prev_idx]]
+                price_change_1d = (prices[date] - prev_close) / prev_close * 100 if prev_close else 0.0
+            else:
+                price_change_1d = 0.0
+
+            # Price change 7d — find closest trading day in [+7, +12] calendar days
+            base_dt = datetime.strptime(date, "%Y-%m-%d")
+            lo7 = (base_dt + timedelta(days=7)).strftime("%Y-%m-%d")
+            hi7 = (base_dt + timedelta(days=12)).strftime("%Y-%m-%d")
+            fut_candidates = [d for d in price_dates[i + 1:] if lo7 <= d <= hi7]
+            if not fut_candidates:
+                # Too recent to have a 7-day outcome — skip this day
+                continue
+            fut_close = prices[fut_candidates[0]]
+            cur_close = prices[date]
+            price_change_7d = (fut_close - cur_close) / cur_close * 100 if cur_close else 0.0
+
+            # News aggregates for this date
+            news = news_by_date.get(date, {})
+            article_count = int(news.get("article_count", 0))
+            sentiment_avg = float(news.get("sentiment_avg", 0.0) or 0.0)
+            filtered_count = int(news.get("filtered_count", 0))
+            # Approximate composite anomaly: filtered ratio + sentiment magnitude
+            avg_composite_anomaly = (
+                (filtered_count / article_count * 0.5 + abs(sentiment_avg) * 0.5)
+                if article_count > 0 else 0.0
+            )
+            sentiment_label = (
+                "positive" if sentiment_avg > 0.05
+                else ("negative" if sentiment_avg < -0.05 else "neutral")
+            )
+
+            results.append({
+                "date": date,
+                "article_count": article_count,
+                "avg_composite_anomaly": round(avg_composite_anomaly, 4),
+                "avg_source_credibility": global_credibility,
+                "volume": vol,
+                "volume_ratio": round(volume_ratio, 4),
+                "price_change_1d": round(price_change_1d, 4),
+                "price_change_7d": round(price_change_7d, 4),
+                "sentiment_avg": round(sentiment_avg, 4),
+                "sentiment_label": sentiment_label,
+            })
+
+        logger.info(
+            f"Retrieved {len(results)} historical daily aggregates for {ticker} (last {days} days)"
+        )
+        return results
+
+    except Exception as e:
+        logger.error(
+            f"Failed to get historical daily aggregates for {ticker}: {str(e)}"
+        )
+        return []
+
+
+def get_volume_baseline(
+    ticker: str,
+    days: int = 30,
+    db_path: str = DEFAULT_DB_PATH
+) -> Optional[float]:
+    """
+    Calculate average daily volume over the past N days.
+
+    Used as baseline for volume anomaly detection in Node 9B.
+
+    Args:
+        ticker: Stock ticker symbol
+        days: Number of calendar days to include in baseline
+        db_path: Path to database
+
+    Returns:
+        Average volume as float, or None if no data
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT AVG(volume) AS avg_volume
+                FROM price_data
+                WHERE ticker = ?
+                  AND date >= date('now', ?)
+                """,
+                (ticker, f"-{days} days"),
+            )
+            row = cursor.fetchone()
+            if not row or row["avg_volume"] is None:
+                logger.debug(
+                    f"No volume baseline available for {ticker} over last {days} days"
+                )
+                return None
+            return float(row["avg_volume"])
+    except Exception as e:
+        logger.error(f"Failed to calculate volume baseline for {ticker}: {str(e)}")
+        return None
+
+
+# ============================================================================
+# TICKER STATS — velocity baseline cache
+# ============================================================================
+
+def compute_and_store_ticker_stats(
+    ticker: str,
+    days: int = 180,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Optional[float]:
+    """
+    Compute the true per-calendar-day article average for a ticker and persist
+    it in the ticker_stats table.
+
+    "True per-calendar-day" means:
+        total_articles_in_window  /  calendar_days_from_oldest_article_to_today
+
+    This is the correct unit for pump-and-dump velocity detection:
+        • Normal AAPL: 472 articles / 180 days = 2.62 articles/day
+        • Pump flood  : 50 articles fetched today vs 2.62/day baseline = 19x spike
+
+    Called by Node 2 after every live API fetch so the cache is always fresh.
+    Safe to call multiple times (UPSERT).
+
+    Returns the computed daily_article_avg, or None if no articles found.
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*)                AS total_articles,
+                    MIN(DATE(published_at)) AS oldest_date
+                FROM news_articles
+                WHERE ticker = ?
+                  AND published_at IS NOT NULL
+                  AND published_at >= date('now', ?)
+                """,
+                (ticker, f"-{days} days"),
+            )
+            row = cursor.fetchone()
+            total_articles = row["total_articles"] if row else 0
+            oldest_date = row["oldest_date"] if row else None
+
+            if total_articles == 0 or oldest_date is None:
+                logger.debug(f"No articles for {ticker} — skipping ticker_stats update")
+                return None
+
+            oldest_dt = datetime.strptime(oldest_date, "%Y-%m-%d")
+            date_range_days = max(1, (datetime.now() - oldest_dt).days)
+            daily_avg = float(total_articles) / float(date_range_days)
+
+            cursor.execute(
+                """
+                INSERT INTO ticker_stats
+                    (ticker, daily_article_avg, total_articles,
+                     date_range_days, oldest_article_date, computed_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    daily_article_avg   = excluded.daily_article_avg,
+                    total_articles      = excluded.total_articles,
+                    date_range_days     = excluded.date_range_days,
+                    oldest_article_date = excluded.oldest_article_date,
+                    computed_at         = excluded.computed_at
+                """,
+                (ticker, daily_avg, total_articles, date_range_days, oldest_date),
+            )
+
+        logger.info(
+            f"Ticker stats stored for {ticker}: "
+            f"{daily_avg:.2f} articles/day "
+            f"({total_articles} articles over {date_range_days} days)"
+        )
+        return daily_avg
+
+    except Exception as e:
+        logger.error(f"Failed to compute ticker stats for {ticker}: {str(e)}")
+        return None
+
+
+def get_ticker_stats(
+    ticker: str,
+    max_age_hours: float = 1.0,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return cached ticker_stats for a ticker if the row is fresh enough.
+
+    Args:
+        ticker:         Stock ticker symbol
+        max_age_hours:  Cache TTL in hours (default 1 h).  Pass 0 to force miss.
+
+    Returns:
+        Dict with keys: daily_article_avg, total_articles, date_range_days,
+                        oldest_article_date, computed_at
+        None if the row is missing or older than max_age_hours.
+    """
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT daily_article_avg, total_articles, date_range_days,
+                       oldest_article_date, computed_at
+                FROM ticker_stats
+                WHERE ticker = ?
+                  AND computed_at >= datetime('now', ?)
+                """,
+                (ticker, f"-{max_age_hours} hours"),
+            )
+            row = cursor.fetchone()
+            if row:
+                stats = dict(row)
+                logger.debug(
+                    f"Ticker stats cache HIT for {ticker}: "
+                    f"{stats['daily_article_avg']:.2f} articles/day "
+                    f"(computed {stats['computed_at']})"
+                )
+                return stats
+            logger.debug(f"Ticker stats cache MISS for {ticker}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to get ticker stats for {ticker}: {str(e)}")
+        return None
+
+
+def get_article_count_baseline(
+    ticker: str,
+    days: int = 180,
+    max_age_hours: float = 1.0,
+    db_path: str = DEFAULT_DB_PATH,
+) -> Optional[float]:
+    """
+    Return the average number of articles published per calendar day for a ticker.
+
+    Strategy (cache-first):
+      1. Check ticker_stats — if the row is < max_age_hours old, return it instantly
+         without touching news_articles at all.
+      2. Cache miss → compute fresh from news_articles.published_at and store the
+         result in ticker_stats so the next call within the TTL window is free.
+
+    The value is per-CALENDAR-DAY (total_articles / days_since_oldest_article).
+    This is the correct unit for pump-and-dump velocity detection.
+
+    Args:
+        ticker:         Stock ticker symbol
+        days:           Lookback window for fresh computation (default 180)
+        max_age_hours:  Cache TTL in hours (default 1 h)
+        db_path:        Path to database
+
+    Returns:
+        Average articles per calendar day, or None if no data exists.
+    """
+    try:
+        # ── 1. Cache hit ──────────────────────────────────────────────────────
+        stats = get_ticker_stats(ticker, max_age_hours=max_age_hours, db_path=db_path)
+        if stats is not None:
+            avg = float(stats["daily_article_avg"])
+            logger.debug(
+                f"Article baseline for {ticker} (cache): {avg:.2f} articles/day"
+            )
+            return avg
+
+        # ── 2. Cache miss — compute and store ─────────────────────────────────
+        avg = compute_and_store_ticker_stats(ticker, days=days, db_path=db_path)
+        if avg is not None:
+            logger.info(
+                f"Article baseline for {ticker} (computed): {avg:.2f} articles/day"
+            )
+        else:
+            logger.debug(
+                f"Article baseline unavailable for {ticker} — no published articles in DB"
+            )
+        return avg
+
+    except Exception as e:
+        logger.error(
+            f"Failed to get article count baseline for {ticker}: {str(e)}"
+        )
+        return None

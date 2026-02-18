@@ -179,6 +179,26 @@ CREATE INDEX idx_type_effectiveness ON news_type_effectiveness(ticker, news_type
 
 
 -- ============================================================================
+-- TICKER STATS (Velocity Baseline Cache)
+-- ============================================================================
+-- Stores the true per-calendar-day article average per ticker so the velocity
+-- detector never has to do a full DB scan on repeat runs.
+-- Written by Node 2 after any live API fetch.
+-- Read by get_article_count_baseline() — cache is considered fresh for 1 hour.
+
+CREATE TABLE IF NOT EXISTS ticker_stats (
+    ticker               TEXT PRIMARY KEY,
+    daily_article_avg    REAL    NOT NULL,   -- articles per calendar day (true mean)
+    total_articles       INTEGER NOT NULL,   -- total articles counted in the window
+    date_range_days      INTEGER NOT NULL,   -- calendar days from oldest article to today
+    oldest_article_date  TEXT,               -- earliest published_at date in window
+    computed_at          TIMESTAMP NOT NULL  -- when this row was last updated
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_stats_computed ON ticker_stats(ticker, computed_at DESC);
+
+
+-- ============================================================================
 -- RELATED COMPANIES
 -- ============================================================================
 
@@ -461,6 +481,83 @@ FROM news_with_outcomes
 GROUP BY ticker, source
 HAVING total_articles >= 5
 ORDER BY ticker, accuracy_pct DESC;
+
+-- View: Daily Behavioural Aggregates (price-based metrics per ticker/day)
+-- Used by Node 9B Historical Pattern Matcher.
+-- NOTE: The Python get_historical_daily_aggregates() computes this in-process
+-- so Node 9B never queries this view directly, but it is available for ad-hoc
+-- SQL analysis and dashboards.
+CREATE VIEW IF NOT EXISTS daily_behavioral_aggregates AS
+SELECT
+    p.ticker,
+    p.date,
+    p.volume,
+    CASE
+        WHEN (SELECT AVG(v.volume) FROM price_data v
+              WHERE v.ticker = p.ticker
+                AND v.date >  date(p.date, '-31 days')
+                AND v.date <= p.date) > 0
+        THEN CAST(p.volume AS REAL) /
+             (SELECT AVG(v.volume) FROM price_data v
+              WHERE v.ticker = p.ticker
+                AND v.date >  date(p.date, '-31 days')
+                AND v.date <= p.date)
+        ELSE 1.0
+    END AS volume_ratio,
+    CASE
+        WHEN (SELECT close FROM price_data pr
+              WHERE pr.ticker = p.ticker AND pr.date < p.date
+              ORDER BY pr.date DESC LIMIT 1) > 0
+        THEN (p.close -
+              (SELECT close FROM price_data pr
+               WHERE pr.ticker = p.ticker AND pr.date < p.date
+               ORDER BY pr.date DESC LIMIT 1))
+             / (SELECT close FROM price_data pr
+                WHERE pr.ticker = p.ticker AND pr.date < p.date
+                ORDER BY pr.date DESC LIMIT 1) * 100
+        ELSE 0.0
+    END AS price_change_1d,
+    CASE
+        WHEN (SELECT close FROM price_data pf
+              WHERE pf.ticker = p.ticker
+                AND pf.date >  p.date
+                AND pf.date <= date(p.date, '+12 days')
+              ORDER BY pf.date ASC LIMIT 1) IS NOT NULL
+        THEN ((SELECT close FROM price_data pf
+               WHERE pf.ticker = p.ticker
+                 AND pf.date >  p.date
+                 AND pf.date <= date(p.date, '+12 days')
+               ORDER BY pf.date ASC LIMIT 1) - p.close)
+             / p.close * 100
+        ELSE NULL
+    END AS price_change_7d
+FROM price_data p;
+
+-- View: Daily News Aggregates (article-level metrics per ticker/day)
+CREATE VIEW IF NOT EXISTS daily_news_aggregates AS
+SELECT
+    n.ticker,
+    DATE(n.published_at)                                                  AS date,
+    COUNT(*)                                                              AS article_count,
+    AVG(CASE WHEN n.is_filtered = 1 THEN 0.7
+             ELSE ABS(COALESCE(n.sentiment_score, 0)) * 0.3 END)         AS avg_composite_anomaly,
+    COALESCE(
+        (SELECT AVG(sr.accuracy_rate)
+         FROM source_reliability sr
+         WHERE sr.ticker = n.ticker),
+        0.5)                                                              AS avg_source_credibility,
+    AVG(CASE WHEN n.is_filtered = 0
+             THEN COALESCE(n.sentiment_score, 0) ELSE 0 END)             AS sentiment_avg,
+    CASE
+        WHEN AVG(CASE WHEN n.is_filtered = 0
+                      THEN COALESCE(n.sentiment_score, 0) ELSE 0 END) >  0.05 THEN 'positive'
+        WHEN AVG(CASE WHEN n.is_filtered = 0
+                      THEN COALESCE(n.sentiment_score, 0) ELSE 0 END) < -0.05 THEN 'negative'
+        ELSE 'neutral'
+    END                                                                   AS sentiment_label
+FROM news_articles n
+WHERE n.published_at IS NOT NULL
+GROUP BY n.ticker, DATE(n.published_at);
 
 -- View: Latest Signals with Confidence
 CREATE VIEW IF NOT EXISTS latest_signals AS

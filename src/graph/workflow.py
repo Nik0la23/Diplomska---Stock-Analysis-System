@@ -30,6 +30,9 @@ from src.langgraph_nodes.node_05_sentiment_analysis import sentiment_analysis_no
 from src.langgraph_nodes.node_06_market_context import market_context_node
 from src.langgraph_nodes.node_07_monte_carlo import monte_carlo_forecasting_node
 from src.langgraph_nodes.node_08_news_verification import news_verification_node
+from src.langgraph_nodes.node_09b_behavioral_anomaly import (
+    behavioral_anomaly_detection_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +153,10 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_node("market_context", market_context_node)
     workflow.add_node("monte_carlo", monte_carlo_forecasting_node)
     
-    # Phase 3: Background outcomes (before Node 8) then Learning
+    # Phase 3: Background outcomes (before Node 8) then Learning + 9B
     workflow.add_node("run_background_outcomes", run_background_outcomes_node)
     workflow.add_node("news_verification", news_verification_node)
+    workflow.add_node("behavioral_anomaly_detection", behavioral_anomaly_detection_node)
     
     # ========================================================================
     # DEFINE EDGES (Sequential Flow)
@@ -203,9 +207,10 @@ def create_stock_analysis_workflow() -> StateGraph:
         {"continue": "run_background_outcomes", "end": END}
     )
     
-    # Background outcomes runs first (fills news_outcomes when needed), then Node 8
+    # Background outcomes runs first (fills news_outcomes when needed), then Node 8, then 9B
     workflow.add_edge("run_background_outcomes", "news_verification")
-    workflow.add_edge("news_verification", END)
+    workflow.add_edge("news_verification", "behavioral_anomaly_detection")
+    workflow.add_edge("behavioral_anomaly_detection", END)
     
     logger.info("Workflow built successfully (parallel → background outcomes → Node 8)")
     

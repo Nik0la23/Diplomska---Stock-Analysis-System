@@ -38,6 +38,7 @@ class StockAnalysisState(TypedDict):
     stock_news: List[Dict[str, Any]]               # Stock-specific news
     market_news: List[Dict[str, Any]]              # Broad market news
     related_company_news: List[Dict[str, Any]]     # Related company news
+    news_fetch_metadata: Optional[Dict[str, Any]]  # Fetch stats for Node 9B velocity detection
     
     
     # ========================================================================
@@ -97,8 +98,7 @@ class StockAnalysisState(TypedDict):
     # ========================================================================
     # NODE 9B: Behavioral Anomaly Detection
     # ========================================================================
-    behavioral_anomalies: List[Dict[str, Any]]        # Pump-and-dump patterns
-    manipulation_risk: Optional[str]                  # 'LOW', 'MEDIUM', 'HIGH'
+    behavioral_anomaly_detection: Optional[Dict[str, Any]]  # Detailed behavioral risk assessment
     
     
     # ========================================================================
@@ -175,6 +175,7 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         stock_news=[],
         market_news=[],
         related_company_news=[],
+        news_fetch_metadata=None,
         related_companies=[],
         technical_indicators=None,
         technical_signal=None,
@@ -194,8 +195,7 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         cleaned_market_news=[],
         cleaned_related_company_news=[],
         content_analysis_summary=None,
-        behavioral_anomalies=[],
-        manipulation_risk=None,
+        behavioral_anomaly_detection=None,
         backtest_results=None,
         adaptive_weights=None,
         final_signal=None,

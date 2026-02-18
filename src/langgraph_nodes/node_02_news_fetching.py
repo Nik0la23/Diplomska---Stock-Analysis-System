@@ -20,6 +20,7 @@ import logging
 from src.utils.config import ALPHA_VANTAGE_API_KEY, FINNHUB_API_KEY
 from src.database.db_manager import (
     cache_news,
+    compute_and_store_ticker_stats,
     get_cached_news,
     get_latest_news_date,
     get_news_for_ticker,
@@ -334,6 +335,20 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             state['stock_news'] = cached_stock_news
             state['market_news'] = cached_market_news
             state['related_company_news'] = []
+            # Read stored velocity baseline (no DB scan needed — TTL-cached)
+            from src.database.db_manager import get_ticker_stats
+            _cached_stats = get_ticker_stats(ticker)
+            state['news_fetch_metadata'] = {
+                'from_date': None,
+                'to_date': to_date.isoformat(),
+                'fetch_window_days': 0,
+                'newly_fetched_count': 0,  # No new articles - cache hit
+                'total_in_state': len(cached_stock_news) + len(cached_market_news),
+                'newly_fetched_stock': 0,
+                'newly_fetched_market': 0,
+                'was_cache_hit': True,
+                'daily_article_avg': _cached_stats['daily_article_avg'] if _cached_stats else None,
+            }
             elapsed = (datetime.now() - start_time).total_seconds()
             state['node_execution_times']['node_2'] = elapsed
             logger.info(f"Node 2: Completed (cache hit) in {elapsed:.2f}s")
@@ -356,6 +371,19 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     state['stock_news'] = stock_from_db
                     state['market_news'] = market_from_db
                     state['related_company_news'] = []
+                    from src.database.db_manager import get_ticker_stats
+                    _db_stats = get_ticker_stats(ticker)
+                    state['news_fetch_metadata'] = {
+                        'from_date': None,
+                        'to_date': to_date.isoformat(),
+                        'fetch_window_days': 0,
+                        'newly_fetched_count': 0,  # No new articles - loaded from DB
+                        'total_in_state': len(stock_from_db) + len(market_from_db),
+                        'newly_fetched_stock': 0,
+                        'newly_fetched_market': 0,
+                        'was_db_load': True,
+                        'daily_article_avg': _db_stats['daily_article_avg'] if _db_stats else None,
+                    }
                     elapsed = (datetime.now() - start_time).total_seconds()
                     state['node_execution_times']['node_2'] = elapsed
                     return state
@@ -412,6 +440,12 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 seen_headlines.add(key)
                 stock_news.append(article)
         logger.info(f"Node 2: Stock news merged: {len(av_news)} Alpha Vantage + {len(finnhub_company_news)} Finnhub company → {len(stock_news)} total")
+
+        # Track how many articles were newly fetched from APIs (before date filtering)
+        newly_fetched_stock_count = len(av_news) + len(finnhub_company_news)
+        newly_fetched_market_count = len(market_news)
+        newly_fetched_total = newly_fetched_stock_count + newly_fetched_market_count
+        logger.info(f"Node 2: Newly fetched from APIs: {newly_fetched_total} articles ({newly_fetched_stock_count} stock + {newly_fetched_market_count} market)")
         
         # ====================================================================
         # Filter by Date Range
@@ -447,21 +481,47 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             stock_news = get_news_for_ticker(ticker, 'stock', days=NEWS_LOOKBACK_DAYS)
             market_news = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
             logger.info(f"Node 2: Loaded full 6-month series from DB — stock: {len(stock_news)}, market: {len(market_news)}")
-        
+
+        # ====================================================================
+        # Persist velocity baseline (ticker_stats) — live API fetch only.
+        # Cache and DB-load paths skip this; their stats are already fresh.
+        # ====================================================================
+        try:
+            daily_avg = compute_and_store_ticker_stats(ticker)
+            if daily_avg is not None:
+                logger.info(f"Node 2: Velocity baseline stored — {daily_avg:.2f} articles/day for {ticker}")
+        except Exception as _stats_err:
+            logger.warning(f"Node 2: Could not update ticker_stats for {ticker}: {_stats_err}")
+
         # ====================================================================
         # Update State
         # ====================================================================
         state['stock_news'] = stock_news
         state['market_news'] = market_news
         state['related_company_news'] = []  # Alpha Vantage doesn't separate related news
-        
+
+        # Add metadata about this fetch for Node 9B velocity detection
+        fetch_window_days = max(1, (to_date - from_date).days + 1)
+        state['news_fetch_metadata'] = {
+            'from_date': from_date.isoformat(),
+            'to_date': to_date.isoformat(),
+            'fetch_window_days': fetch_window_days,
+            'newly_fetched_count': newly_fetched_total,   # Articles fetched from APIs this run
+            'total_in_state': len(stock_news) + len(market_news),  # Full 6-month batch
+            'newly_fetched_stock': newly_fetched_stock_count,
+            'newly_fetched_market': newly_fetched_market_count,
+            'was_incremental_fetch': latest_news_date is not None,
+            'daily_article_avg': daily_avg,  # True per-calendar-day baseline (from ticker_stats)
+        }
+
         total_articles = len(stock_news) + len(market_news)
         elapsed = (datetime.now() - start_time).total_seconds()
         state['node_execution_times']['node_2'] = elapsed
-        
+
         logger.info(f"Node 2: Successfully fetched {total_articles} total articles in {elapsed:.2f}s (6-month window)")
         logger.info(f"Node 2:   Stock news: {len(stock_news)} (Alpha Vantage + Finnhub company, 6-month range)")
         logger.info(f"Node 2:   Market news: {len(market_news)} (Finnhub general, filtered by date)")
+        logger.info(f"Node 2:   Newly fetched: {newly_fetched_total} articles over {fetch_window_days} days")
         
         return state
         
