@@ -3,16 +3,19 @@ LangGraph Workflow Builder
 
 Defines the complete stock analysis workflow with all nodes and edges.
 
-Current Flow (Nodes 1-8, 9A):
+Current Flow (Nodes 1-11):
 1. Node 1: Price Data Fetching
 2. Node 3: Related Companies Detection
 3. Node 2: Multi-Source News Fetching
 4. Node 9A: Content Analysis & Feature Extraction
 5. PARALLEL: Nodes 4, 5, 6, 7 (Technical, Sentiment, Market Context, Monte Carlo)
 6. Node 8: News Verification & Learning (thesis innovation)
+7. Node 9B: Behavioral Anomaly Detection
+8. Node 10: Backtesting (raw accuracy metrics)
+9. Node 11: Adaptive Weights Calculation
 
 Future additions:
-- Nodes 9B-15: Remaining pipeline
+- Nodes 12-15: Signal generation, explanations, dashboard
 """
 
 from langgraph.graph import StateGraph, END
@@ -33,6 +36,9 @@ from src.langgraph_nodes.node_08_news_verification import news_verification_node
 from src.langgraph_nodes.node_09b_behavioral_anomaly import (
     behavioral_anomaly_detection_node,
 )
+from src.langgraph_nodes.node_10_backtesting import backtesting_node
+from src.langgraph_nodes.node_11_adaptive_weights import adaptive_weights_node
+from src.langgraph_nodes.node_12_signal_generation import signal_generation_node
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +163,15 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_node("run_background_outcomes", run_background_outcomes_node)
     workflow.add_node("news_verification", news_verification_node)
     workflow.add_node("behavioral_anomaly_detection", behavioral_anomaly_detection_node)
+
+    # Phase 4: Backtesting (Node 10)
+    workflow.add_node("backtesting", backtesting_node)
+
+    # Phase 5: Adaptive Weights (Node 11)
+    workflow.add_node("adaptive_weights", adaptive_weights_node)
+
+    # Phase 6: Final Signal Generation (Node 12)
+    workflow.add_node("signal_generation", signal_generation_node)
     
     # ========================================================================
     # DEFINE EDGES (Sequential Flow)
@@ -210,9 +225,12 @@ def create_stock_analysis_workflow() -> StateGraph:
     # Background outcomes runs first (fills news_outcomes when needed), then Node 8, then 9B
     workflow.add_edge("run_background_outcomes", "news_verification")
     workflow.add_edge("news_verification", "behavioral_anomaly_detection")
-    workflow.add_edge("behavioral_anomaly_detection", END)
+    workflow.add_edge("behavioral_anomaly_detection", "backtesting")
+    workflow.add_edge("backtesting", "adaptive_weights")
+    workflow.add_edge("adaptive_weights", "signal_generation")
+    workflow.add_edge("signal_generation", END)  # temporary until Node 13
     
-    logger.info("Workflow built successfully (parallel → background outcomes → Node 8)")
+    logger.info("Workflow built successfully (parallel → background outcomes → Node 8 → Node 9B → Node 10 → Node 11 → Node 12)")
     
     # Compile and return
     return workflow.compile()

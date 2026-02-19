@@ -81,9 +81,8 @@ class StockAnalysisState(TypedDict):
     # ========================================================================
     # NODE 8: News Verification & Learning (THESIS INNOVATION)
     # ========================================================================
-    verified_sentiment: Optional[float]               # Sentiment after reliability adjustment
-    verified_confidence: Optional[float]              # Adjusted confidence
-    source_reliability_scores: Dict[str, float]       # Per-source accuracy
+    news_impact_verification: Optional[Dict[str, Any]]  # Learning results (source reliability, correlation, learning_adjustment)
+    sentiment_analysis: Optional[Dict[str, Any]]         # Adjusted sentiment dict written back by Node 8
     
     
     # ========================================================================
@@ -188,9 +187,8 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         monte_carlo_results=None,
         forecasted_price=None,
         price_range=None,
-        verified_sentiment=None,
-        verified_confidence=None,
-        source_reliability_scores={},
+        news_impact_verification=None,
+        sentiment_analysis=None,
         cleaned_stock_news=[],
         cleaned_market_news=[],
         cleaned_related_company_news=[],
