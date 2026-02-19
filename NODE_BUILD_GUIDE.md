@@ -1246,7 +1246,7 @@ def should_halt_for_risk(state: StockAnalysisState) -> str:
 ### Success Criteria
 - [ ] Correctly identifies critical risk
 - [ ] Routes to Node 13 only when risk detected
-- [ ] Routes to Node 12 for normal analysis
+- [ ] Routes to  for normal analysis
 - [ ] Logs routing decisions
 
 ### Estimated Time
