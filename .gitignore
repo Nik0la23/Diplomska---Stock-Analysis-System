@@ -46,6 +46,7 @@ data/cache/*
 *.log
 logs/
 graph_schema.png
+documentation/
 
 # Jupyter
 .ipynb_checkpoints/
