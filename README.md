@@ -85,7 +85,7 @@ Enterprise-level architecture and code quality:
 - **Forecasting:** Monte Carlo simulation (1000 paths, GBM)
 - **UI:** Streamlit dashboard with 6 interactive tabs
 - **Database:** SQLite with 15 tables and 3 views
-- **APIs (Optimized Free-Tier ✅):** yfinance, Alpha Vantage, Finnhub (peers + market news), Polygon.io (backup price)
+- **APIs:** yfinance, Alpha Vantage, Finnhub (peers + market news), Polygon.io (backup price)
 
 ---
 
