@@ -9,23 +9,26 @@ CRITICAL: Uses cleaned_*_news from Node 9A, NOT raw news.
 
 Dual-mode approach:
 - Phase 1: Aggregate existing Alpha Vantage sentiment scores
-- Phase 2: FinBERT infrastructure for articles lacking sentiment
+- Phase 2: FinBERT for articles lacking AV sentiment (e.g. Finnhub articles)
+
+Output philosophy:
+- aggregated_sentiment (float) and sentiment_confidence are used by Node 8 and Node 12
+- sentiment_breakdown is a rich narrative dict for Node 13 (LLM explainer):
+  per-stream scores, dominant labels, top article headlines, credibility breakdown
+- BUY/SELL/HOLD signal generation is NOT this node's job — that belongs to Node 12
 
 Runs in PARALLEL with: Nodes 4, 6, 7
 Runs AFTER: Node 9A (content analysis)
 Runs BEFORE: Node 8 (verification)
 """
 
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime
+from typing import Dict, List, Any
 import logging
 import numpy as np
 
 # Sentiment configuration
 from src.utils.sentiment_config import (
-    BUY_THRESHOLD,
-    SELL_THRESHOLD,
     STOCK_NEWS_WEIGHT,
     MARKET_NEWS_WEIGHT,
     RELATED_NEWS_WEIGHT,
@@ -34,7 +37,6 @@ from src.utils.sentiment_config import (
     FINBERT_DEVICE,
     USE_TICKER_SENTIMENT,
     normalize_sentiment_score,
-    classify_sentiment,
     CREDIBILITY_SOURCE_WEIGHT,
     CREDIBILITY_ANOMALY_WEIGHT,
     CREDIBILITY_RELEVANCE_WEIGHT,
@@ -57,71 +59,78 @@ _FINBERT_MODEL = None
 def extract_alpha_vantage_sentiment(articles: List[Dict]) -> List[Dict]:
     """
     Extract existing sentiment scores from Alpha Vantage articles.
-    
-    Alpha Vantage provides:
-    - overall_sentiment_score: Overall article sentiment
-    - ticker_sentiment_score: Ticker-specific sentiment
-    
+
+    Alpha Vantage provides per article:
+    - overall_sentiment_score: Overall article sentiment (-1.0 to +1.0)
+    - overall_sentiment_label: AV's own label (e.g. 'Bullish', 'Somewhat-Bullish',
+      'Neutral', 'Somewhat-Bearish', 'Bearish')
+    - ticker_sentiment_score: Ticker-specific score (stock articles only)
+    - ticker_relevance_score: Ticker relevance (stock articles only)
+
+    For AV articles the label is kept as-is from AV (not recalculated).
+    For non-AV articles (e.g. Finnhub) with no score, FinBERT handles them
+    later in analyze_articles_batch(); their label is set there.
+
     Algorithm:
-    1. For each article, check for sentiment scores
-    2. Extract ticker_sentiment_score (preferred) or overall_sentiment_score
-    3. Normalize to -1.0 to +1.0 range
-    4. Mark articles with sentiment vs without
-    
+    1. Prefer ticker_sentiment_score when available and USE_TICKER_SENTIMENT is True
+    2. Fall back to overall_sentiment_score
+    3. If neither present, mark has_sentiment=False (FinBERT fallback later)
+    4. Preserve AV's own label for AV articles — do NOT recalculate
+
     Args:
         articles: List of news articles (may include Alpha Vantage and Finnhub)
-        
+
     Returns:
-        List of articles with 'sentiment_score' and 'has_sentiment' fields added
-        
+        List of articles with 'sentiment_score', 'sentiment_label',
+        'has_sentiment', and 'sentiment_source' fields added.
+
     Example:
         >>> articles = [
-        ...     {'title': 'Good news', 'overall_sentiment_score': 0.5, 'ticker_sentiment_score': 0.7},
+        ...     {'title': 'Good news', 'overall_sentiment_score': 0.5,
+        ...      'overall_sentiment_label': 'Somewhat-Bullish', 'ticker_sentiment_score': 0.7},
         ...     {'title': 'Bad news', 'source': 'finnhub'}
         ... ]
         >>> result = extract_alpha_vantage_sentiment(articles)
-        >>> result[0]['sentiment_score']  # 0.7 (ticker sentiment)
-        >>> result[1]['has_sentiment']     # False (no sentiment from Finnhub)
+        >>> result[0]['sentiment_score']   # 0.7 (ticker score)
+        >>> result[0]['sentiment_label']   # 'Somewhat-Bullish' (kept from AV)
+        >>> result[1]['has_sentiment']     # False (no AV sentiment)
     """
     processed_articles = []
-    
+
     for article in articles:
         article_copy = article.copy()
-        
-        # Try to extract sentiment from Alpha Vantage
+
         if USE_TICKER_SENTIMENT and 'ticker_sentiment_score' in article:
-            # Prefer ticker-specific sentiment
+            # Prefer ticker-specific sentiment score
             raw_score = article.get('ticker_sentiment_score', 0.0)
-            sentiment_score = normalize_sentiment_score(raw_score)
-            article_copy['sentiment_score'] = sentiment_score
+            article_copy['sentiment_score'] = normalize_sentiment_score(raw_score)
             article_copy['has_sentiment'] = True
             article_copy['sentiment_source'] = 'alpha_vantage_ticker'
-            
+            # Use AV's overall label (no ticker-level label from AV — fall back to overall)
+            article_copy['sentiment_label'] = article.get('overall_sentiment_label', 'Neutral')
+
         elif 'overall_sentiment_score' in article:
-            # Fallback to overall sentiment
+            # Fall back to overall sentiment score
             raw_score = article.get('overall_sentiment_score', 0.0)
-            sentiment_score = normalize_sentiment_score(raw_score)
-            article_copy['sentiment_score'] = sentiment_score
+            article_copy['sentiment_score'] = normalize_sentiment_score(raw_score)
             article_copy['has_sentiment'] = True
             article_copy['sentiment_source'] = 'alpha_vantage_overall'
-            
+            # Keep AV's label directly — no need to recalculate
+            article_copy['sentiment_label'] = article.get('overall_sentiment_label', 'Neutral')
+
         else:
-            # No sentiment available (likely Finnhub article)
-            article_copy['sentiment_score'] = 0.0  # Neutral default
+            # No AV sentiment (likely Finnhub) — FinBERT will fill this in later
+            article_copy['sentiment_score'] = 0.0
             article_copy['has_sentiment'] = False
             article_copy['sentiment_source'] = 'none'
-        
-        # Add sentiment label
-        article_copy['sentiment_label'] = classify_sentiment(article_copy['sentiment_score'])
-        
+            article_copy['sentiment_label'] = 'Neutral'
+
         processed_articles.append(article_copy)
-    
-    # Log statistics
+
     with_sentiment = sum(1 for a in processed_articles if a['has_sentiment'])
     without_sentiment = len(processed_articles) - with_sentiment
-    
-    logger.info(f"Sentiment extraction: {with_sentiment} with sentiment, {without_sentiment} without")
-    
+    logger.info(f"Sentiment extraction: {with_sentiment} with AV sentiment, {without_sentiment} without")
+
     return processed_articles
 
 
@@ -387,38 +396,45 @@ def calculate_credibility_weight(article: Dict) -> float:
 def aggregate_sentiment_by_type(articles: List[Dict], news_type: str) -> Dict[str, Any]:
     """
     Aggregate sentiment across articles of one type.
-    
+
     Algorithm:
-    1. Calculate average sentiment
-    2. Count positive/negative/neutral
-    3. Calculate weighted sentiment (recent articles weigh more)
-    4. Calculate confidence based on article count and consistency
-    
+    1. Calculate simple and credibility+time-weighted sentiment averages
+    2. Count positive/negative/neutral labels
+    3. Derive dominant_label (most frequent label)
+    4. Select top_articles (top 3 by credibility_weight, for Node 13 narrative)
+    5. Calculate confidence from consistency, article count, and avg credibility
+
+    Note: No BUY/SELL/HOLD signal is generated here — that is Node 12's job.
+
     Args:
-        articles: List of articles (same type: stock, market, or related)
-        news_type: Type label for logging ('stock', 'market', 'related')
-        
+        articles:  List of articles of the same type (stock, market, or related)
+        news_type: Label for logging ('stock', 'market', 'related')
+
     Returns:
         {
             'news_type': str,
             'article_count': int,
-            'average_sentiment': float,           # Simple average
-            'weighted_sentiment': float,          # Time-weighted average
+            'average_sentiment': float,    # Simple mean
+            'weighted_sentiment': float,   # Time-decay + credibility weighted mean
             'positive_count': int,
             'negative_count': int,
             'neutral_count': int,
-            'sentiment_signal': 'BUY'|'SELL'|'HOLD',
-            'confidence': float
+            'dominant_label': str,         # 'positive' | 'negative' | 'neutral'
+            'top_articles': List[Dict],    # Top 3 by credibility_weight
+            'confidence': float            # 0.0 to 1.0
         }
-        
+
     Example:
         >>> articles = [
-        ...     {'sentiment_score': 0.8, 'sentiment_label': 'positive'},
-        ...     {'sentiment_score': 0.6, 'sentiment_label': 'positive'}
+        ...     {'sentiment_score': 0.8, 'sentiment_label': 'Bullish',
+        ...      'title': 'AAPL beats earnings', 'source': 'Bloomberg'},
+        ...     {'sentiment_score': 0.6, 'sentiment_label': 'Somewhat-Bullish',
+        ...      'title': 'Strong iPhone sales', 'source': 'Reuters'}
         ... ]
         >>> result = aggregate_sentiment_by_type(articles, 'stock')
-        >>> result['average_sentiment']  # 0.7
-        >>> result['sentiment_signal']   # 'BUY'
+        >>> result['average_sentiment']   # 0.7
+        >>> result['dominant_label']      # 'positive' (both > 0)
+        >>> result['top_articles']        # [{'title': ..., 'source': ..., ...}, ...]
     """
     if not articles:
         return {
@@ -429,70 +445,82 @@ def aggregate_sentiment_by_type(articles: List[Dict], news_type: str) -> Dict[st
             'positive_count': 0,
             'negative_count': 0,
             'neutral_count': 0,
-            'sentiment_signal': 'HOLD',
+            'dominant_label': 'neutral',
+            'top_articles': [],
             'confidence': 0.0
         }
-    
-    # Extract sentiment scores
+
     sentiments = [a.get('sentiment_score', 0.0) for a in articles]
-    
-    # Calculate simple average
+
     average_sentiment = np.mean(sentiments) if sentiments else 0.0
-    
-    # Calculate weighted average with BOTH time decay AND credibility weighting
-    # Assuming articles are sorted by time (newest first)
+
+    # Time-decay + credibility combined weights (articles assumed newest-first)
     combined_weights = []
     for i, article in enumerate(articles):
-        time_weight = 0.95 ** i  # Exponential time decay
+        time_weight = 0.95 ** i
         credibility_weight = calculate_credibility_weight(article)
-        combined_weight = time_weight * credibility_weight
-        combined_weights.append(combined_weight)
-    
-    # Calculate weighted sentiment using combined weights
+        combined_weights.append(time_weight * credibility_weight)
+
     if combined_weights and sum(combined_weights) > 0:
         weighted_sentiment = np.average(sentiments, weights=combined_weights)
     else:
         weighted_sentiment = 0.0
-    
-    # Count sentiment labels
-    labels = [a.get('sentiment_label', 'neutral') for a in articles]
-    positive_count = labels.count('positive')
-    negative_count = labels.count('negative')
-    neutral_count = labels.count('neutral')
-    
-    # Determine signal based on weighted sentiment
-    if weighted_sentiment > BUY_THRESHOLD:
-        signal = 'BUY'
-    elif weighted_sentiment < SELL_THRESHOLD:
-        signal = 'SELL'
-    else:
-        signal = 'HOLD'
-    
-    # Calculate confidence based on:
-    # 1. Number of articles (more = higher confidence)
-    # 2. Consistency of sentiment (all positive/negative = higher)
-    # 3. Average source credibility (NEW: high-credibility sources = higher confidence)
+
+    # Label counts — normalise AV labels to positive/negative/neutral for counting
+    def _normalise_label(label: str) -> str:
+        """Map any sentiment label variant to positive/negative/neutral."""
+        label_lower = label.lower()
+        if any(k in label_lower for k in ('bullish', 'positive')):
+            return 'positive'
+        if any(k in label_lower for k in ('bearish', 'negative')):
+            return 'negative'
+        return 'neutral'
+
+    normalised_labels = [_normalise_label(a.get('sentiment_label', 'neutral')) for a in articles]
+    positive_count = normalised_labels.count('positive')
+    negative_count = normalised_labels.count('negative')
+    neutral_count  = normalised_labels.count('neutral')
+
+    # Dominant label: most frequent normalised label
+    counts = {'positive': positive_count, 'negative': negative_count, 'neutral': neutral_count}
+    dominant_label = max(counts, key=counts.get)
+
+    # Top 3 articles by credibility weight (for Node 13 narrative)
+    articles_with_cw = [
+        (calculate_credibility_weight(a), a) for a in articles
+    ]
+    articles_with_cw.sort(key=lambda x: x[0], reverse=True)
+    top_articles = [
+        {
+            'title': a.get('title') or a.get('headline', ''),
+            'source': a.get('source', ''),
+            'sentiment_score': float(a.get('sentiment_score', 0.0)),
+            'sentiment_label': a.get('sentiment_label', 'Neutral'),
+            'credibility_weight': round(cw, 3),
+        }
+        for cw, a in articles_with_cw[:3]
+    ]
+
+    # Confidence: consistency × count factor × credibility factor
     article_count = len(articles)
-    consistency = max(positive_count, negative_count, neutral_count) / article_count if article_count > 0 else 0
-    
-    # Base confidence formula
-    count_factor = min(article_count / 10.0, 1.0)  # Max at 10 articles
-    base_confidence = (consistency * 0.7 + count_factor * 0.3)  # Weighted combination
-    
-    # Average credibility of sources used (NEW)
+    consistency = max(positive_count, negative_count, neutral_count) / article_count
+    count_factor = min(article_count / 10.0, 1.0)
+    base_confidence = consistency * 0.7 + count_factor * 0.3
+
     avg_credibility = sum(
-        article.get('source_credibility_score', 0.5) for article in articles
-    ) / len(articles) if articles else 0.5
-    
-    # Adjust confidence: high-credibility sources = higher confidence
-    # Scale: avg_credibility of 0.9 boosts confidence by ~10%
-    #        avg_credibility of 0.3 reduces confidence by ~20%
-    credibility_factor = CREDIBILITY_CONFIDENCE_MIN + (avg_credibility * (CREDIBILITY_CONFIDENCE_MAX - CREDIBILITY_CONFIDENCE_MIN))
+        a.get('source_credibility_score', 0.5) for a in articles
+    ) / article_count
+
+    credibility_factor = CREDIBILITY_CONFIDENCE_MIN + (
+        avg_credibility * (CREDIBILITY_CONFIDENCE_MAX - CREDIBILITY_CONFIDENCE_MIN)
+    )
     confidence = min(1.0, base_confidence * credibility_factor)
-    
-    logger.info(f"{news_type.capitalize()} sentiment: {weighted_sentiment:.3f} "
-                f"({positive_count}+ {negative_count}- {neutral_count}~) → {signal}")
-    
+
+    logger.info(
+        f"{news_type.capitalize()} sentiment: {weighted_sentiment:.3f} "
+        f"({positive_count}+ {negative_count}- {neutral_count}~) dominant={dominant_label}"
+    )
+
     return {
         'news_type': news_type,
         'article_count': article_count,
@@ -501,7 +529,8 @@ def aggregate_sentiment_by_type(articles: List[Dict], news_type: str) -> Dict[st
         'positive_count': positive_count,
         'negative_count': negative_count,
         'neutral_count': neutral_count,
-        'sentiment_signal': signal,
+        'dominant_label': dominant_label,
+        'top_articles': top_articles,
         'confidence': float(confidence)
     }
 
@@ -516,129 +545,183 @@ def calculate_combined_sentiment(
     related_sentiment: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Calculate combined weighted sentiment from three news types.
-    
+    Calculate combined weighted sentiment from three news streams.
+
     Weighting (from sentiment_config.py):
-    - Stock news: 50%
-    - Market news: 25%
-    - Related companies: 25%
-    
-    Algorithm:
-    1. Extract weighted sentiment from each type
-    2. Apply type weights (50/25/25)
-    3. Calculate combined sentiment
-    4. Calculate combined confidence
-    5. Generate final signal
-    
+    - Stock news:   50%
+    - Market news:  25%
+    - Related news: 25%
+
+    Note: BUY/SELL/HOLD signal generation is NOT done here — that is
+    Node 12's responsibility. This function only aggregates the float
+    scores and confidence values.
+
     Args:
-        stock_sentiment: Aggregated stock news sentiment
-        market_sentiment: Aggregated market news sentiment
-        related_sentiment: Aggregated related companies sentiment
-        
+        stock_sentiment:   Aggregated stock news sentiment dict
+        market_sentiment:  Aggregated market news sentiment dict
+        related_sentiment: Aggregated related company news sentiment dict
+
     Returns:
         {
-            'combined_sentiment': float,          # -1.0 to +1.0
-            'sentiment_signal': 'BUY'|'SELL'|'HOLD',
-            'confidence': float,                  # 0.0 to 1.0
-            'breakdown': {
-                'stock': {...},
-                'market': {...},
-                'related': {...}
-            }
+            'combined_sentiment': float,   # -1.0 to +1.0
+            'confidence': float,           # 0.0 to 1.0
         }
-        
+
     Example:
         >>> stock = {'weighted_sentiment': 0.7, 'confidence': 0.8}
         >>> market = {'weighted_sentiment': 0.3, 'confidence': 0.6}
         >>> related = {'weighted_sentiment': 0.5, 'confidence': 0.7}
         >>> result = calculate_combined_sentiment(stock, market, related)
         >>> result['combined_sentiment']  # 0.5*0.7 + 0.25*0.3 + 0.25*0.5 = 0.55
-        >>> result['sentiment_signal']    # 'BUY' (> 0.2)
     """
-    # Extract weighted sentiments
     stock_sent = stock_sentiment.get('weighted_sentiment', 0.0)
     market_sent = market_sentiment.get('weighted_sentiment', 0.0)
     related_sent = related_sentiment.get('weighted_sentiment', 0.0)
-    
-    # Apply type weights (50/25/25)
+
     combined_sentiment = (
         stock_sent * STOCK_NEWS_WEIGHT +
         market_sent * MARKET_NEWS_WEIGHT +
         related_sent * RELATED_NEWS_WEIGHT
     )
-    
-    # Extract confidences
+
     stock_conf = stock_sentiment.get('confidence', 0.0)
     market_conf = market_sentiment.get('confidence', 0.0)
     related_conf = related_sentiment.get('confidence', 0.0)
-    
-    # Combined confidence (weighted average)
+
     combined_confidence = (
         stock_conf * STOCK_NEWS_WEIGHT +
         market_conf * MARKET_NEWS_WEIGHT +
         related_conf * RELATED_NEWS_WEIGHT
     )
-    
-    # Generate signal
-    signal = generate_sentiment_signal(combined_sentiment, combined_confidence)
-    
-    logger.info(f"Combined sentiment: {combined_sentiment:.3f} → {signal} "
-                f"(confidence: {combined_confidence:.2f})")
-    
+
+    logger.info(f"Combined sentiment: {combined_sentiment:.3f} (confidence: {combined_confidence:.2f})")
+
     return {
         'combined_sentiment': float(combined_sentiment),
-        'sentiment_signal': signal,
         'confidence': float(combined_confidence),
-        'breakdown': {
-            'stock': stock_sentiment,
-            'market': market_sentiment,
-            'related': related_sentiment
-        }
     }
 
 
 # ============================================================================
-# HELPER FUNCTION 7: Generate Sentiment Signal
+# HELPER FUNCTION 7: Build Sentiment Breakdown for Node 13
 # ============================================================================
 
-def generate_sentiment_signal(combined_sentiment: float, confidence: float) -> str:
+def build_sentiment_breakdown(
+    stock_sentiment: Dict[str, Any],
+    market_sentiment: Dict[str, Any],
+    related_sentiment: Dict[str, Any],
+    combined_sentiment: float,
+    combined_confidence: float,
+    all_articles: List[Dict],
+) -> Dict[str, Any]:
     """
-    Generate final sentiment signal based on combined sentiment and confidence.
-    
-    Thresholds:
-    - BUY: sentiment > 0.2
-    - SELL: sentiment < -0.2
-    - HOLD: -0.2 to 0.2 (or low confidence)
-    
-    Algorithm:
-    1. Check confidence threshold
-    2. If low confidence, default to HOLD
-    3. Otherwise, use sentiment thresholds
-    
+    Build a rich narrative dict for Node 13 (LLM explainer).
+
+    Combines per-stream sentiment data with credibility stats and sentiment
+    source mix so that Node 13 can tell a meaningful story rather than
+    just repeating a number.
+
     Args:
-        combined_sentiment: Combined weighted sentiment (-1.0 to +1.0)
-        confidence: Combined confidence (0.0 to 1.0)
-        
+        stock_sentiment:    Output of aggregate_sentiment_by_type for 'stock'
+        market_sentiment:   Output of aggregate_sentiment_by_type for 'market'
+        related_sentiment:  Output of aggregate_sentiment_by_type for 'related'
+        combined_sentiment: Weighted average across all streams (-1.0 to +1.0)
+        combined_confidence: Weighted confidence across all streams (0.0 to 1.0)
+        all_articles:       Flat list of all analyzed articles (all three streams)
+
     Returns:
-        Signal: 'BUY', 'SELL', or 'HOLD'
-        
+        {
+            'stock':   { weighted_sentiment, article_count, positive_count,
+                         negative_count, neutral_count, dominant_label,
+                         top_articles },
+            'market':  { ... same structure ... },
+            'related': { ... same structure ... },
+            'overall': {
+                'combined_sentiment': float,
+                'confidence': float,
+                'credibility': {
+                    'avg_source_credibility': float,
+                    'high_credibility_articles': int,   # score >= 0.8
+                    'medium_credibility_articles': int, # 0.5 to 0.8
+                    'low_credibility_articles': int,    # < 0.5
+                    'avg_composite_anomaly': float
+                },
+                'sentiment_source_mix': {
+                    'alpha_vantage_ticker': int,
+                    'alpha_vantage_overall': int,
+                    'finbert': int,
+                    'none': int
+                }
+            }
+        }
+
     Example:
-        >>> generate_sentiment_signal(0.5, 0.8)   # 'BUY'
-        >>> generate_sentiment_signal(-0.5, 0.8)  # 'SELL'
-        >>> generate_sentiment_signal(0.5, 0.3)   # 'HOLD' (low confidence)
+        >>> breakdown = build_sentiment_breakdown(stock, market, related,
+        ...                                       0.43, 0.71, all_articles)
+        >>> breakdown['stock']['dominant_label']     # 'positive'
+        >>> breakdown['overall']['credibility']['high_credibility_articles']  # 6
     """
-    # Low confidence → HOLD
-    if confidence < 0.5:
-        logger.info(f"Low confidence ({confidence:.2f}) → HOLD")
-        return 'HOLD'
-    
-    # High confidence → use thresholds
-    if combined_sentiment > BUY_THRESHOLD:
-        return 'BUY'
-    elif combined_sentiment < SELL_THRESHOLD:
-        return 'SELL'
+    # Per-stream data (drop internal fields not useful for narration)
+    def _stream_dict(agg: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'weighted_sentiment': agg.get('weighted_sentiment', 0.0),
+            'article_count':      agg.get('article_count', 0),
+            'positive_count':     agg.get('positive_count', 0),
+            'negative_count':     agg.get('negative_count', 0),
+            'neutral_count':      agg.get('neutral_count', 0),
+            'dominant_label':     agg.get('dominant_label', 'neutral'),
+            'top_articles':       agg.get('top_articles', []),
+        }
+
+    # Credibility stats across all articles
+    if all_articles:
+        avg_source_credibility = sum(
+            a.get('source_credibility_score', 0.5) for a in all_articles
+        ) / len(all_articles)
+
+        avg_composite_anomaly = sum(
+            a.get('composite_anomaly_score', 0.3) for a in all_articles
+        ) / len(all_articles)
+
+        high_cred   = sum(1 for a in all_articles if a.get('source_credibility_score', 0.5) >= 0.8)
+        medium_cred = sum(1 for a in all_articles if 0.5 <= a.get('source_credibility_score', 0.5) < 0.8)
+        low_cred    = sum(1 for a in all_articles if a.get('source_credibility_score', 0.5) < 0.5)
     else:
-        return 'HOLD'
+        avg_source_credibility = 0.5
+        avg_composite_anomaly  = 0.3
+        high_cred = medium_cred = low_cred = 0
+
+    # How sentiment scores were obtained
+    source_mix: Dict[str, int] = {
+        'alpha_vantage_ticker':  0,
+        'alpha_vantage_overall': 0,
+        'finbert':               0,
+        'none':                  0,
+    }
+    for a in all_articles:
+        src = a.get('sentiment_source', 'none')
+        if src in source_mix:
+            source_mix[src] += 1
+        else:
+            source_mix['none'] += 1
+
+    return {
+        'stock':   _stream_dict(stock_sentiment),
+        'market':  _stream_dict(market_sentiment),
+        'related': _stream_dict(related_sentiment),
+        'overall': {
+            'combined_sentiment': float(combined_sentiment),
+            'confidence':         float(combined_confidence),
+            'credibility': {
+                'avg_source_credibility':    round(float(avg_source_credibility), 3),
+                'high_credibility_articles': high_cred,
+                'medium_credibility_articles': medium_cred,
+                'low_credibility_articles':  low_cred,
+                'avg_composite_anomaly':     round(float(avg_composite_anomaly), 3),
+            },
+            'sentiment_source_mix': source_mix,
+        },
+    }
 
 
 # ============================================================================
@@ -648,213 +731,154 @@ def generate_sentiment_signal(combined_sentiment: float, confidence: float) -> s
 def sentiment_analysis_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Node 5: Sentiment Analysis
-    
+
     Execution flow:
     1. Get cleaned news from state (from Node 9A)
-    2. Extract/analyze sentiment for all articles (Alpha Vantage + FinBERT)
-    3. Aggregate sentiment by type (stock, market, related)
-    4. Calculate combined weighted sentiment (50/25/25)
-    5. Generate sentiment signal (BUY/SELL/HOLD)
-    6. Return partial state update (for parallel execution)
-    
+    2. Extract/analyse sentiment for each article (Alpha Vantage primary, FinBERT fallback)
+    3. Aggregate sentiment by stream (stock, market, related)
+    4. Calculate combined weighted sentiment (50 / 25 / 25)
+    5. Build sentiment_breakdown for Node 13 (LLM narrative)
+    6. Derive directional label (POSITIVE / NEGATIVE / NEUTRAL) for state
+    7. Return partial state update (parallel execution safe)
+
     Runs in PARALLEL with: Nodes 4, 6, 7
-    Runs AFTER: Node 9A (content analysis)
-    Runs BEFORE: Node 8 (verification)
-    
+    Runs AFTER:  Node 9A (content analysis — provides credibility scores)
+    Runs BEFORE: Node 8  (verification — adjusts sentiment_confidence)
+
     Args:
-        state: LangGraph state containing cleaned news
-        
+        state: LangGraph state containing cleaned_*_news from Node 9A
+
     Returns:
-        Partial state update with sentiment analysis results
+        Partial state update:
+            raw_sentiment_scores   — per-article list (for Node 8)
+            aggregated_sentiment   — float -1.0..+1.0  (for Node 8 / Node 12)
+            sentiment_signal       — 'POSITIVE'|'NEGATIVE'|'NEUTRAL' (for Node 8)
+            sentiment_confidence   — float 0.0..1.0    (for Node 8 / Node 11)
+            sentiment_breakdown    — rich dict for Node 13 narrative
     """
     start_time = datetime.now()
     ticker = state['ticker']
-    
+
     try:
         logger.info(f"Node 5: Starting sentiment analysis for {ticker}")
-        
+
         # ====================================================================
         # STEP 1: Get Cleaned News from Node 9A
         # ====================================================================
-        stock_news = state.get('cleaned_stock_news', [])
-        market_news = state.get('cleaned_market_news', [])
+        stock_news   = state.get('cleaned_stock_news', [])
+        market_news  = state.get('cleaned_market_news', [])
         related_news = state.get('cleaned_related_company_news', [])
-        
-        logger.info(f"Processing: {len(stock_news)} stock, {len(market_news)} market, "
-                   f"{len(related_news)} related articles")
-        
+
+        logger.info(
+            f"Processing: {len(stock_news)} stock, {len(market_news)} market, "
+            f"{len(related_news)} related articles"
+        )
+
         # ====================================================================
-        # STEP 2: Analyze Sentiment for All Articles
+        # STEP 2: Analyse Sentiment for All Articles
         # ====================================================================
-        logger.info("Extracting/analyzing sentiment...")
-        
-        stock_analyzed = analyze_articles_batch(stock_news, use_finbert=USE_FINBERT)
-        market_analyzed = analyze_articles_batch(market_news, use_finbert=USE_FINBERT)
+        logger.info("Extracting/analysing sentiment (AV primary, FinBERT fallback)...")
+
+        stock_analyzed   = analyze_articles_batch(stock_news,   use_finbert=USE_FINBERT)
+        market_analyzed  = analyze_articles_batch(market_news,  use_finbert=USE_FINBERT)
         related_analyzed = analyze_articles_batch(related_news, use_finbert=USE_FINBERT)
-        
+
         # ====================================================================
-        # STEP 3: Aggregate Sentiment by Type
+        # STEP 3: Aggregate Sentiment by Stream
         # ====================================================================
-        logger.info("Aggregating sentiment by news type...")
-        
-        stock_sentiment = aggregate_sentiment_by_type(stock_analyzed, 'stock')
-        market_sentiment = aggregate_sentiment_by_type(market_analyzed, 'market')
+        logger.info("Aggregating sentiment by news stream...")
+
+        stock_sentiment   = aggregate_sentiment_by_type(stock_analyzed,   'stock')
+        market_sentiment  = aggregate_sentiment_by_type(market_analyzed,  'market')
         related_sentiment = aggregate_sentiment_by_type(related_analyzed, 'related')
-        
+
         # ====================================================================
-        # STEP 4: Calculate Combined Sentiment
+        # STEP 4: Calculate Combined Sentiment (50 / 25 / 25)
         # ====================================================================
         logger.info("Calculating combined weighted sentiment (50/25/25)...")
-        
-        combined_result = calculate_combined_sentiment(
-            stock_sentiment,
-            market_sentiment,
-            related_sentiment
-        )
-        
+
+        combined_result    = calculate_combined_sentiment(stock_sentiment, market_sentiment, related_sentiment)
         combined_sentiment = combined_result['combined_sentiment']
-        sentiment_signal = combined_result['sentiment_signal']
         sentiment_confidence = combined_result['confidence']
-        
+
         # ====================================================================
-        # STEP 5: Collect Per-Article Scores (with credibility data)
-        # ====================================================================
-        raw_sentiment_scores = []
-        
-        for article in stock_analyzed:
-            raw_sentiment_scores.append({
-                'type': 'stock',
-                'title': article.get('title', ''),
-                'source': article.get('source', ''),
-                'sentiment_score': article.get('sentiment_score', 0.0),
-                'sentiment_label': article.get('sentiment_label', 'neutral'),
-                'sentiment_source': article.get('sentiment_source', 'none'),
-                # NEW: Credibility-related fields for Node 8 and Node 13
-                'credibility_weight': calculate_credibility_weight(article),
-                'source_credibility_score': article.get('source_credibility_score', 0.5),
-                'composite_anomaly_score': article.get('composite_anomaly_score', 0.3),
-                'relevance_score': article.get('relevance_score', 0.5)
-            })
-        
-        for article in market_analyzed:
-            raw_sentiment_scores.append({
-                'type': 'market',
-                'title': article.get('title', ''),
-                'source': article.get('source', ''),
-                'sentiment_score': article.get('sentiment_score', 0.0),
-                'sentiment_label': article.get('sentiment_label', 'neutral'),
-                'sentiment_source': article.get('sentiment_source', 'none'),
-                # NEW: Credibility-related fields for Node 8 and Node 13
-                'credibility_weight': calculate_credibility_weight(article),
-                'source_credibility_score': article.get('source_credibility_score', 0.5),
-                'composite_anomaly_score': article.get('composite_anomaly_score', 0.3),
-                'relevance_score': article.get('relevance_score', 0.5)
-            })
-        
-        for article in related_analyzed:
-            raw_sentiment_scores.append({
-                'type': 'related',
-                'title': article.get('title', ''),
-                'source': article.get('source', ''),
-                'sentiment_score': article.get('sentiment_score', 0.0),
-                'sentiment_label': article.get('sentiment_label', 'neutral'),
-                'sentiment_source': article.get('sentiment_source', 'none'),
-                # NEW: Credibility-related fields for Node 8 and Node 13
-                'credibility_weight': calculate_credibility_weight(article),
-                'source_credibility_score': article.get('source_credibility_score', 0.5),
-                'composite_anomaly_score': article.get('composite_anomaly_score', 0.3),
-                'relevance_score': article.get('relevance_score', 0.5)
-            })
-        
-        # ====================================================================
-        # STEP 6: Calculate Credibility Summary
+        # STEP 5: Build Narrative Breakdown for Node 13
         # ====================================================================
         all_articles = stock_analyzed + market_analyzed + related_analyzed
-        
-        if all_articles:
-            # Calculate average source credibility
-            avg_source_credibility = sum(
-                a.get('source_credibility_score', 0.5) for a in all_articles
-            ) / len(all_articles)
-            
-            # Calculate average composite anomaly
-            avg_composite_anomaly = sum(
-                a.get('composite_anomaly_score', 0.3) for a in all_articles
-            ) / len(all_articles)
-            
-            # Count articles by credibility tier
-            high_credibility_articles = sum(
-                1 for a in all_articles if a.get('source_credibility_score', 0.5) >= 0.8
-            )
-            medium_credibility_articles = sum(
-                1 for a in all_articles 
-                if 0.5 <= a.get('source_credibility_score', 0.5) < 0.8
-            )
-            low_credibility_articles = sum(
-                1 for a in all_articles if a.get('source_credibility_score', 0.5) < 0.5
-            )
+
+        sentiment_breakdown = build_sentiment_breakdown(
+            stock_sentiment,
+            market_sentiment,
+            related_sentiment,
+            combined_sentiment,
+            sentiment_confidence,
+            all_articles,
+        )
+
+        # ====================================================================
+        # STEP 6: Derive Directional Label (for Node 8 compatibility)
+        # ====================================================================
+        if combined_sentiment > 0.0:
+            sentiment_signal = 'POSITIVE'
+        elif combined_sentiment < 0.0:
+            sentiment_signal = 'NEGATIVE'
         else:
-            avg_source_credibility = 0.5
-            avg_composite_anomaly = 0.3
-            high_credibility_articles = 0
-            medium_credibility_articles = 0
-            low_credibility_articles = 0
-        
-        credibility_summary = {
-            'avg_source_credibility': float(avg_source_credibility),
-            'high_credibility_articles': high_credibility_articles,      # credibility >= 0.8
-            'medium_credibility_articles': medium_credibility_articles,  # 0.5 to 0.8
-            'low_credibility_articles': low_credibility_articles,        # below 0.5
-            'avg_composite_anomaly': float(avg_composite_anomaly),
-            'credibility_weighted': True                                 # flag that weighting was applied
-        }
-        
+            sentiment_signal = 'NEUTRAL'
+
         # ====================================================================
-        # STEP 7: Log Results
+        # STEP 7: Collect Per-Article Scores (for Node 8)
         # ====================================================================
-        logger.info(f"Sentiment Analysis Results:")
-        logger.info(f"  Combined Sentiment: {combined_sentiment:.3f}")
-        logger.info(f"  Signal: {sentiment_signal}")
-        logger.info(f"  Confidence: {sentiment_confidence:.2f}")
-        logger.info(f"  Stock: {stock_sentiment['weighted_sentiment']:.3f} "
-                   f"({stock_sentiment['article_count']} articles)")
-        logger.info(f"  Market: {market_sentiment['weighted_sentiment']:.3f} "
-                   f"({market_sentiment['article_count']} articles)")
-        logger.info(f"  Related: {related_sentiment['weighted_sentiment']:.3f} "
-                   f"({related_sentiment['article_count']} articles)")
-        logger.info(f"  Credibility: {avg_source_credibility:.2f} avg "
-                   f"({high_credibility_articles}H/{medium_credibility_articles}M/{low_credibility_articles}L)")
-        
+        raw_sentiment_scores = []
+        for news_type, analyzed in [('stock', stock_analyzed), ('market', market_analyzed), ('related', related_analyzed)]:
+            for article in analyzed:
+                raw_sentiment_scores.append({
+                    'type':                   news_type,
+                    'title':                  article.get('title') or article.get('headline', ''),
+                    'source':                 article.get('source', ''),
+                    'sentiment_score':        article.get('sentiment_score', 0.0),
+                    'sentiment_label':        article.get('sentiment_label', 'Neutral'),
+                    'sentiment_source':       article.get('sentiment_source', 'none'),
+                    'credibility_weight':     calculate_credibility_weight(article),
+                    'source_credibility_score': article.get('source_credibility_score', 0.5),
+                    'composite_anomaly_score':  article.get('composite_anomaly_score', 0.3),
+                    'relevance_score':          article.get('relevance_score', 0.5),
+                })
+
         # ====================================================================
-        # STEP 8: Return Partial State Update (for parallel execution)
+        # STEP 8: Log Summary
+        # ====================================================================
+        cred = sentiment_breakdown['overall']['credibility']
+        logger.info("Sentiment Analysis Results:")
+        logger.info(f"  Combined: {combined_sentiment:.3f} ({sentiment_signal}) confidence={sentiment_confidence:.2f}")
+        logger.info(f"  Stock:   {stock_sentiment['weighted_sentiment']:.3f} dominant={stock_sentiment['dominant_label']} ({stock_sentiment['article_count']} articles)")
+        logger.info(f"  Market:  {market_sentiment['weighted_sentiment']:.3f} dominant={market_sentiment['dominant_label']} ({market_sentiment['article_count']} articles)")
+        logger.info(f"  Related: {related_sentiment['weighted_sentiment']:.3f} dominant={related_sentiment['dominant_label']} ({related_sentiment['article_count']} articles)")
+        logger.info(f"  Credibility: avg={cred['avg_source_credibility']:.2f} H={cred['high_credibility_articles']} M={cred['medium_credibility_articles']} L={cred['low_credibility_articles']}")
+
+        # ====================================================================
+        # STEP 9: Return Partial State Update
         # ====================================================================
         elapsed = (datetime.now() - start_time).total_seconds()
-        
-        logger.info(f"Node 5: Sentiment analysis completed in {elapsed:.2f}s")
-        
-        # Return only the fields this node updates
+        logger.info(f"Node 5: Completed in {elapsed:.2f}s")
+
         return {
             'raw_sentiment_scores': raw_sentiment_scores,
             'aggregated_sentiment': combined_sentiment,
-            'sentiment_signal': sentiment_signal,
+            'sentiment_signal':     sentiment_signal,
             'sentiment_confidence': sentiment_confidence,
-            'sentiment_credibility_summary': credibility_summary,  # NEW
-            'node_execution_times': {'node_5': elapsed}
+            'sentiment_breakdown':  sentiment_breakdown,
+            'node_execution_times': {'node_5': elapsed},
         }
-        
+
     except Exception as e:
-        # Catch-all for any unexpected errors
         logger.error(f"Node 5: Sentiment analysis failed for {ticker}: {str(e)}")
-        
         elapsed = (datetime.now() - start_time).total_seconds()
-        
-        # Return only the fields this node updates (for parallel execution)
         return {
-            'errors': [f"Node 5: Sentiment analysis failed - {str(e)}"],
+            'errors':               [f"Node 5: Sentiment analysis failed - {str(e)}"],
             'raw_sentiment_scores': [],
             'aggregated_sentiment': None,
-            'sentiment_signal': None,
+            'sentiment_signal':     None,
             'sentiment_confidence': None,
-            'sentiment_credibility_summary': None,
-            'node_execution_times': {'node_5': elapsed}
+            'sentiment_breakdown':  None,
+            'node_execution_times': {'node_5': elapsed},
         }

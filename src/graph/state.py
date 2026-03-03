@@ -58,10 +58,11 @@ class StockAnalysisState(TypedDict):
     # ========================================================================
     # NODE 5: Sentiment Analysis (FinBERT)
     # ========================================================================
-    raw_sentiment_scores: List[Dict[str, float]]      # Per-article scores
-    aggregated_sentiment: Optional[float]             # Overall sentiment
-    sentiment_signal: Optional[str]                   # 'POSITIVE', 'NEGATIVE', 'NEUTRAL'
+    raw_sentiment_scores: List[Dict[str, Any]]        # Per-article scores (mixed types)
+    aggregated_sentiment: Optional[float]             # Overall sentiment (-1.0 to +1.0)
+    sentiment_signal: Optional[str]                   # Direction: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL'
     sentiment_confidence: Optional[float]             # 0.0 to 1.0
+    sentiment_breakdown: Optional[Dict[str, Any]]     # Rich narrative data for Node 13 (stream breakdown, top articles, credibility)
     
     
     # ========================================================================
@@ -183,6 +184,7 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         aggregated_sentiment=None,
         sentiment_signal=None,
         sentiment_confidence=None,
+        sentiment_breakdown=None,
         market_context=None,
         monte_carlo_results=None,
         forecasted_price=None,

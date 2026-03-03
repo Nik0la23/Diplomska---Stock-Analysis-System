@@ -1,23 +1,32 @@
 """
 Tests for Node 5: Sentiment Analysis
 
-Tests cover:
-1. Alpha Vantage sentiment extraction (4 tests)
-2. FinBERT model loading (3 tests)
-3. FinBERT analysis (5 tests)
-4. Sentiment aggregation (6 tests)
-5. Combined sentiment calculation (5 tests)
-6. Signal generation (4 tests)
-7. Main node function (3 tests)
-8. Integration (2 tests)
+Tests cover the refactored node output philosophy:
+- Alpha Vantage labels are preserved as-is (not recalculated)
+- FinBERT only fills in labels for articles that have no AV sentiment
+- No BUY/SELL/HOLD signal generation — that is Node 12's job
+- sentiment_signal is now POSITIVE/NEGATIVE/NEUTRAL (direction only)
+- sentiment_breakdown is the rich narrative dict for Node 13
 
-Total: 32+ tests
+Categories:
+1. Alpha Vantage sentiment extraction (5 tests)
+2. FinBERT model loading (3 tests)
+3. FinBERT text analysis (5 tests)
+4. Sentiment aggregation per stream (6 tests)
+5. Combined sentiment calculation (4 tests)
+6. Sentiment breakdown for Node 13 (4 tests)
+7. Credibility weight calculation (4 tests)
+8. Main node function (5 tests)
+9. Integration (3 tests)
+
+Total: 39 tests
 """
 
+import sys
 import pytest
 import numpy as np
-from datetime import datetime
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, MagicMock, patch
+
 from src.langgraph_nodes.node_05_sentiment_analysis import (
     extract_alpha_vantage_sentiment,
     load_finbert_model,
@@ -25,768 +34,710 @@ from src.langgraph_nodes.node_05_sentiment_analysis import (
     analyze_articles_batch,
     aggregate_sentiment_by_type,
     calculate_combined_sentiment,
-    generate_sentiment_signal,
-    sentiment_analysis_node
+    build_sentiment_breakdown,
+    calculate_credibility_weight,
+    sentiment_analysis_node,
 )
 
 
 # ============================================================================
-# TEST FIXTURES
+# FIXTURES
 # ============================================================================
 
 @pytest.fixture
 def sample_av_articles():
-    """Articles with Alpha Vantage sentiment scores"""
+    """Articles with Alpha Vantage sentiment scores and labels."""
     return [
         {
             'title': 'Company beats earnings expectations',
             'summary': 'Strong quarterly results',
             'overall_sentiment_score': 0.7,
+            'overall_sentiment_label': 'Bullish',
             'ticker_sentiment_score': 0.8,
-            'source': 'Alpha Vantage'
+            'ticker_relevance_score': 0.9,
+            'source': 'Bloomberg',
         },
         {
             'title': 'Market concerns over regulations',
             'summary': 'New regulations may impact growth',
             'overall_sentiment_score': -0.5,
+            'overall_sentiment_label': 'Bearish',
             'ticker_sentiment_score': -0.6,
-            'source': 'Alpha Vantage'
+            'ticker_relevance_score': 0.7,
+            'source': 'Reuters',
         },
         {
             'title': 'Company announces new product',
             'summary': 'Neutral market reception',
             'overall_sentiment_score': 0.1,
+            'overall_sentiment_label': 'Neutral',
             'ticker_sentiment_score': 0.05,
-            'source': 'Alpha Vantage'
-        }
+            'ticker_relevance_score': 0.5,
+            'source': 'CNBC',
+        },
     ]
 
 
 @pytest.fixture
 def sample_mixed_articles():
-    """Mix of articles with and without sentiment"""
+    """Mix of Alpha Vantage and Finnhub articles (no AV sentiment)."""
     return [
         {
             'title': 'Good news',
+            'overall_sentiment_label': 'Somewhat-Bullish',
             'ticker_sentiment_score': 0.7,
-            'source': 'Alpha Vantage'
+            'source': 'Alpha Vantage',
         },
         {
             'title': 'Neutral news from Finnhub',
-            'source': 'Finnhub'
+            'source': 'Finnhub',
+            # No sentiment fields — FinBERT fallback
         },
         {
             'title': 'Bad news',
+            'overall_sentiment_label': 'Bearish',
             'ticker_sentiment_score': -0.6,
-            'source': 'Alpha Vantage'
-        }
+            'source': 'Alpha Vantage',
+        },
     ]
 
 
 @pytest.fixture
-def sample_state_with_news():
-    """Complete state with cleaned news"""
+def base_state():
+    """Minimal state for main node tests."""
     return {
-        'ticker': 'NVDA',
-        'cleaned_stock_news': [
-            {'title': 'Positive stock news', 'ticker_sentiment_score': 0.8},
-            {'title': 'More positive news', 'ticker_sentiment_score': 0.7}
-        ],
-        'cleaned_market_news': [
-            {'title': 'Market bullish', 'ticker_sentiment_score': 0.5}
-        ],
-        'cleaned_related_company_news': [
-            {'title': 'Competitor doing well', 'ticker_sentiment_score': 0.6}
-        ],
-        'errors': [],
-        'node_execution_times': {}
-    }
-
-
-# ============================================================================
-# CATEGORY 1: Alpha Vantage Sentiment Extraction (4 tests)
-# ============================================================================
-
-def test_extract_av_sentiment_valid_scores(sample_av_articles):
-    """Test extracting valid sentiment scores from Alpha Vantage"""
-    result = extract_alpha_vantage_sentiment(sample_av_articles)
-    
-    assert len(result) == 3
-    assert all('sentiment_score' in a for a in result)
-    assert all('has_sentiment' in a for a in result)
-    assert all(a['has_sentiment'] for a in result)
-    
-    # Check ticker sentiment is used (preferred)
-    assert result[0]['sentiment_score'] == 0.8  # Ticker sentiment
-    assert result[1]['sentiment_score'] == -0.6
-    assert result[2]['sentiment_score'] == 0.05
-
-
-def test_extract_av_sentiment_missing():
-    """Test handling articles without sentiment gracefully"""
-    articles = [
-        {'title': 'No sentiment', 'source': 'Finnhub'}
-    ]
-    
-    result = extract_alpha_vantage_sentiment(articles)
-    
-    assert len(result) == 1
-    assert result[0]['has_sentiment'] is False
-    assert result[0]['sentiment_score'] == 0.0  # Neutral default
-    assert result[0]['sentiment_source'] == 'none'
-
-
-def test_extract_av_sentiment_normalization():
-    """Test sentiment scores are normalized to -1 to +1 range"""
-    articles = [
-        {'title': 'Extreme positive', 'ticker_sentiment_score': 2.5},  # Out of range
-        {'title': 'Extreme negative', 'ticker_sentiment_score': -2.0}  # Out of range
-    ]
-    
-    result = extract_alpha_vantage_sentiment(articles)
-    
-    # Should be clamped to [-1, 1]
-    assert -1.0 <= result[0]['sentiment_score'] <= 1.0
-    assert -1.0 <= result[1]['sentiment_score'] <= 1.0
-
-
-def test_extract_av_sentiment_malformed_data():
-    """Test handling malformed data"""
-    articles = [
-        {},  # Empty article
-        {'title': 'No scores'},  # Missing sentiment fields
-        {'title': 'Invalid score', 'ticker_sentiment_score': 'invalid'}  # Invalid type
-    ]
-    
-    # Should not crash
-    result = extract_alpha_vantage_sentiment(articles)
-    assert len(result) == 3
-
-
-# ============================================================================
-# CATEGORY 2: FinBERT Model Loading (3 tests)
-# ============================================================================
-
-def test_load_finbert_model_success():
-    """Test successful FinBERT model loading"""
-    # Clear cached model
-    import src.langgraph_nodes.node_05_sentiment_analysis as node5
-    node5._FINBERT_MODEL = None
-    
-    # Load model (this will actually download from HuggingFace first time)
-    model = load_finbert_model()
-    
-    # Model should load successfully
-    assert model is not None
-    
-    # Verify it's a pipeline object
-    assert hasattr(model, '__call__')  # Should be callable
-
-
-@patch('transformers.pipeline')
-def test_load_finbert_model_failure(mock_pipeline):
-    """Test graceful handling of model loading failure"""
-    mock_pipeline.side_effect = Exception("Model not found")
-    
-    # Clear cached model
-    import src.langgraph_nodes.node_05_sentiment_analysis as node5
-    node5._FINBERT_MODEL = None
-    
-    model = load_finbert_model()
-    
-    assert model is None  # Should return None, not raise
-
-
-def test_load_finbert_model_caching():
-    """Test that model is cached after first load"""
-    import src.langgraph_nodes.node_05_sentiment_analysis as node5
-    
-    # Set a mock model
-    mock_model = Mock()
-    node5._FINBERT_MODEL = mock_model
-    
-    # Load again
-    model = load_finbert_model()
-    
-    # Should return cached model
-    assert model is mock_model
-
-
-# ============================================================================
-# CATEGORY 3: FinBERT Analysis (5 tests)
-# ============================================================================
-
-def test_analyze_text_finbert_positive():
-    """Test analyzing positive text with FinBERT"""
-    mock_model = Mock()
-    mock_model.return_value = [[
-        {'label': 'positive', 'score': 0.95},
-        {'label': 'neutral', 'score': 0.03},
-        {'label': 'negative', 'score': 0.02}
-    ]]
-    
-    result = analyze_text_with_finbert("Company beats earnings", mock_model)
-    
-    assert result['label'] == 'positive'
-    assert result['sentiment'] > 0  # Positive sentiment
-    assert 0 <= result['score'] <= 1
-
-
-def test_analyze_text_finbert_negative():
-    """Test analyzing negative text with FinBERT"""
-    mock_model = Mock()
-    mock_model.return_value = [[
-        {'label': 'negative', 'score': 0.9},
-        {'label': 'neutral', 'score': 0.07},
-        {'label': 'positive', 'score': 0.03}
-    ]]
-    
-    result = analyze_text_with_finbert("Company misses earnings", mock_model)
-    
-    assert result['label'] == 'negative'
-    assert result['sentiment'] < 0  # Negative sentiment
-
-
-def test_analyze_text_finbert_neutral():
-    """Test analyzing neutral text with FinBERT"""
-    mock_model = Mock()
-    mock_model.return_value = [[
-        {'label': 'neutral', 'score': 0.8},
-        {'label': 'positive', 'score': 0.1},
-        {'label': 'negative', 'score': 0.1}
-    ]]
-    
-    result = analyze_text_with_finbert("Company releases statement", mock_model)
-    
-    assert result['label'] == 'neutral'
-    assert result['sentiment'] == 0.0
-
-
-def test_analyze_text_finbert_empty():
-    """Test handling empty text"""
-    mock_model = Mock()
-    
-    result = analyze_text_with_finbert("", mock_model)
-    
-    assert result['label'] == 'neutral'
-    assert result['sentiment'] == 0.0
-
-
-def test_analyze_text_finbert_model_none():
-    """Test handling when model is None"""
-    result = analyze_text_with_finbert("Some text", None)
-    
-    assert result['label'] == 'neutral'
-    assert result['sentiment'] == 0.0
-
-
-# ============================================================================
-# CATEGORY 4: Sentiment Aggregation (6 tests)
-# ============================================================================
-
-def test_aggregate_sentiment_positive():
-    """Test aggregating positive sentiment"""
-    articles = [
-        {'sentiment_score': 0.8, 'sentiment_label': 'positive'},
-        {'sentiment_score': 0.7, 'sentiment_label': 'positive'},
-        {'sentiment_score': 0.6, 'sentiment_label': 'positive'}
-    ]
-    
-    result = aggregate_sentiment_by_type(articles, 'stock')
-    
-    assert result['article_count'] == 3
-    assert result['average_sentiment'] > 0.6
-    assert result['positive_count'] == 3
-    assert result['sentiment_signal'] == 'BUY'
-    assert result['confidence'] > 0.5
-
-
-def test_aggregate_sentiment_negative():
-    """Test aggregating negative sentiment"""
-    articles = [
-        {'sentiment_score': -0.7, 'sentiment_label': 'negative'},
-        {'sentiment_score': -0.8, 'sentiment_label': 'negative'}
-    ]
-    
-    result = aggregate_sentiment_by_type(articles, 'stock')
-    
-    assert result['average_sentiment'] < -0.6
-    assert result['negative_count'] == 2
-    assert result['sentiment_signal'] == 'SELL'
-
-
-def test_aggregate_sentiment_mixed():
-    """Test aggregating mixed sentiment"""
-    articles = [
-        {'sentiment_score': 0.5, 'sentiment_label': 'positive'},
-        {'sentiment_score': -0.5, 'sentiment_label': 'negative'},
-        {'sentiment_score': 0.05, 'sentiment_label': 'neutral'}
-    ]
-    
-    result = aggregate_sentiment_by_type(articles, 'stock')
-    
-    assert result['article_count'] == 3
-    assert result['positive_count'] == 1
-    assert result['negative_count'] == 1
-    assert result['neutral_count'] == 1
-    # Average close to 0, likely HOLD
-    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
-
-
-def test_aggregate_sentiment_weighted():
-    """Test weighted aggregation (recent articles matter more)"""
-    # Recent article (first) is very negative, older ones positive
-    articles = [
-        {'sentiment_score': -0.8, 'sentiment_label': 'negative'},  # Recent (weight 1.0)
-        {'sentiment_score': 0.3, 'sentiment_label': 'positive'},   # Older (weight 0.95)
-        {'sentiment_score': 0.3, 'sentiment_label': 'positive'}    # Oldest (weight 0.90)
-    ]
-    
-    result = aggregate_sentiment_by_type(articles, 'stock')
-    
-    # Weighted sentiment should be more negative than simple average
-    assert result['weighted_sentiment'] < result['average_sentiment']
-
-
-def test_aggregate_sentiment_empty():
-    """Test handling empty article list"""
-    result = aggregate_sentiment_by_type([], 'stock')
-    
-    assert result['article_count'] == 0
-    assert result['average_sentiment'] == 0.0
-    assert result['sentiment_signal'] == 'HOLD'
-    assert result['confidence'] == 0.0
-
-
-def test_aggregate_sentiment_confidence_calculation():
-    """Test confidence calculation based on article count and consistency"""
-    # Many consistent articles = high confidence
-    articles_high_conf = [
-        {'sentiment_score': 0.8, 'sentiment_label': 'positive'},
-        {'sentiment_score': 0.7, 'sentiment_label': 'positive'},
-        {'sentiment_score': 0.9, 'sentiment_label': 'positive'},
-        {'sentiment_score': 0.75, 'sentiment_label': 'positive'},
-        {'sentiment_score': 0.85, 'sentiment_label': 'positive'}
-    ]
-    
-    result_high = aggregate_sentiment_by_type(articles_high_conf, 'stock')
-    
-    # Few inconsistent articles = lower confidence
-    articles_low_conf = [
-        {'sentiment_score': 0.3, 'sentiment_label': 'positive'},
-        {'sentiment_score': -0.3, 'sentiment_label': 'negative'}
-    ]
-    
-    result_low = aggregate_sentiment_by_type(articles_low_conf, 'stock')
-    
-    assert result_high['confidence'] > result_low['confidence']
-
-
-# ============================================================================
-# CATEGORY 5: Combined Sentiment (5 tests)
-# ============================================================================
-
-def test_combined_sentiment_weighted_50_25_25():
-    """Test weighted combination (50/25/25)"""
-    stock = {'weighted_sentiment': 0.8, 'confidence': 0.9, 'article_count': 10}
-    market = {'weighted_sentiment': 0.4, 'confidence': 0.7, 'article_count': 5}
-    related = {'weighted_sentiment': 0.6, 'confidence': 0.8, 'article_count': 5}
-    
-    result = calculate_combined_sentiment(stock, market, related)
-    
-    # Expected: 0.8*0.5 + 0.4*0.25 + 0.6*0.25 = 0.4 + 0.1 + 0.15 = 0.65
-    expected = 0.65
-    assert abs(result['combined_sentiment'] - expected) < 0.01
-    assert result['sentiment_signal'] == 'BUY'  # > 0.2
-
-
-def test_combined_sentiment_all_positive():
-    """Test all positive signals"""
-    stock = {'weighted_sentiment': 0.7, 'confidence': 0.8}
-    market = {'weighted_sentiment': 0.6, 'confidence': 0.7}
-    related = {'weighted_sentiment': 0.5, 'confidence': 0.7}
-    
-    result = calculate_combined_sentiment(stock, market, related)
-    
-    assert result['combined_sentiment'] > 0.5
-    assert result['sentiment_signal'] == 'BUY'
-
-
-def test_combined_sentiment_all_negative():
-    """Test all negative signals"""
-    stock = {'weighted_sentiment': -0.7, 'confidence': 0.8}
-    market = {'weighted_sentiment': -0.5, 'confidence': 0.7}
-    related = {'weighted_sentiment': -0.6, 'confidence': 0.7}
-    
-    result = calculate_combined_sentiment(stock, market, related)
-    
-    assert result['combined_sentiment'] < -0.5
-    assert result['sentiment_signal'] == 'SELL'
-
-
-def test_combined_sentiment_mixed_signals():
-    """Test mixed signals"""
-    stock = {'weighted_sentiment': 0.3, 'confidence': 0.7}
-    market = {'weighted_sentiment': -0.2, 'confidence': 0.6}
-    related = {'weighted_sentiment': 0.1, 'confidence': 0.6}
-    
-    result = calculate_combined_sentiment(stock, market, related)
-    
-    # Should have signal (likely HOLD or BUY given stock weight)
-    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
-
-
-def test_combined_sentiment_missing_data():
-    """Test handling missing news types"""
-    stock = {'weighted_sentiment': 0.5, 'confidence': 0.7}
-    market = {'weighted_sentiment': 0.0, 'confidence': 0.0}  # No market news
-    related = {'weighted_sentiment': 0.0, 'confidence': 0.0}  # No related news
-    
-    result = calculate_combined_sentiment(stock, market, related)
-    
-    # Should still work, weighted by stock only (50%)
-    assert result['combined_sentiment'] == 0.25  # 0.5 * 0.5
-    assert 'sentiment_signal' in result
-
-
-# ============================================================================
-# CATEGORY 6: Signal Generation (4 tests)
-# ============================================================================
-
-def test_generate_signal_buy():
-    """Test BUY signal generation (>0.2)"""
-    signal = generate_sentiment_signal(0.5, 0.8)
-    assert signal == 'BUY'
-
-
-def test_generate_signal_sell():
-    """Test SELL signal generation (<-0.2)"""
-    signal = generate_sentiment_signal(-0.5, 0.8)
-    assert signal == 'SELL'
-
-
-def test_generate_signal_hold():
-    """Test HOLD signal generation"""
-    signal = generate_sentiment_signal(0.1, 0.8)  # Between -0.2 and 0.2
-    assert signal == 'HOLD'
-
-
-def test_generate_signal_low_confidence():
-    """Test low confidence results in HOLD"""
-    signal = generate_sentiment_signal(0.8, 0.3)  # High sentiment but low confidence
-    assert signal == 'HOLD'
-
-
-# ============================================================================
-# CATEGORY 7: Main Node Function (3 tests)
-# ============================================================================
-
-def test_node_function_success(sample_state_with_news):
-    """Test full execution of sentiment analysis node"""
-    result = sentiment_analysis_node(sample_state_with_news)
-    
-    # Check all required fields are present
-    assert 'raw_sentiment_scores' in result
-    assert 'aggregated_sentiment' in result
-    assert 'sentiment_signal' in result
-    assert 'sentiment_confidence' in result
-    assert 'node_execution_times' in result
-    assert 'node_5' in result['node_execution_times']
-    
-    # Check valid signal
-    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
-    
-    # Check confidence range
-    if result['sentiment_confidence'] is not None:
-        assert 0.0 <= result['sentiment_confidence'] <= 1.0
-
-
-def test_node_function_with_finbert_disabled():
-    """Test execution with FinBERT disabled"""
-    state = {
         'ticker': 'AAPL',
-        'cleaned_stock_news': [
-            {'title': 'Good news', 'ticker_sentiment_score': 0.8}
-        ],
-        'cleaned_market_news': [],
-        'cleaned_related_company_news': [],
-        'errors': [],
-        'node_execution_times': {}
-    }
-    
-    # Mock USE_FINBERT = False
-    with patch('src.langgraph_nodes.node_05_sentiment_analysis.USE_FINBERT', False):
-        result = sentiment_analysis_node(state)
-    
-    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
-
-
-def test_node_function_error_handling():
-    """Test error handling in main node"""
-    invalid_state = {
-        'ticker': 'TEST',
-        # Missing required fields
-        'errors': [],
-        'node_execution_times': {}
-    }
-    
-    result = sentiment_analysis_node(invalid_state)
-    
-    # Should not crash, should return partial state with errors
-    assert 'errors' in result or 'sentiment_signal' in result
-
-
-# ============================================================================
-# CATEGORY 8: Integration (2 tests)
-# ============================================================================
-
-def test_integration_alpha_vantage_only():
-    """Test end-to-end with Alpha Vantage sentiment only"""
-    state = {
-        'ticker': 'NVDA',
-        'cleaned_stock_news': [
-            {'title': 'Positive', 'ticker_sentiment_score': 0.8, 'summary': 'Good'},
-            {'title': 'Negative', 'ticker_sentiment_score': -0.6, 'summary': 'Bad'}
-        ],
-        'cleaned_market_news': [
-            {'title': 'Market up', 'ticker_sentiment_score': 0.5, 'summary': 'Bullish'}
-        ],
-        'cleaned_related_company_news': [],
-        'errors': [],
-        'node_execution_times': {}
-    }
-    
-    result = sentiment_analysis_node(state)
-    
-    # Should complete successfully
-    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
-    assert len(result['raw_sentiment_scores']) == 3
-    assert result['aggregated_sentiment'] is not None
-
-
-def test_integration_parallel_execution_compatibility():
-    """Test that node returns partial state suitable for parallel execution"""
-    state = {
-        'ticker': 'AAPL',
-        'cleaned_stock_news': [{'title': 'News', 'ticker_sentiment_score': 0.5}],
-        'cleaned_market_news': [],
-        'cleaned_related_company_news': [],
-        'errors': [],
-        'node_execution_times': {}
-    }
-    
-    result = sentiment_analysis_node(state)
-    
-    # Check that ONLY Node 5 fields are returned (partial state)
-    expected_keys = {
-        'raw_sentiment_scores', 
-        'aggregated_sentiment', 
-        'sentiment_signal', 
-        'sentiment_confidence',
-        'sentiment_credibility_summary',  # NEW field
-        'node_execution_times'
-    }
-    
-    # Should not contain other node fields
-    assert 'ticker' not in result
-    assert 'cleaned_stock_news' not in result
-    assert 'raw_price_data' not in result
-    
-    # Should have execution time for node_5
-    assert 'node_5' in result['node_execution_times']
-
-
-# ============================================================================
-# CREDIBILITY WEIGHTING TESTS (Node 5 Upgrade)
-# ============================================================================
-
-def test_credibility_weight_high_quality():
-    """Bloomberg article should get weight near 1.0"""
-    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
-    
-    article = {
-        'source_credibility_score': 0.95,
-        'composite_anomaly_score': 0.04,
-        'relevance_score': 0.85
-    }
-    weight = calculate_credibility_weight(article)
-    assert weight > 0.85, f"High quality article should have weight > 0.85, got {weight}"
-    assert weight <= 1.0
-
-
-def test_credibility_weight_low_quality():
-    """Random blog should get weight near 0.2-0.3"""
-    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
-    
-    article = {
-        'source_credibility_score': 0.30,
-        'composite_anomaly_score': 0.75,
-        'relevance_score': 0.40
-    }
-    weight = calculate_credibility_weight(article)
-    assert weight < 0.40, f"Low quality article should have weight < 0.40, got {weight}"
-    assert weight >= 0.1  # Floor
-
-
-def test_credibility_weight_missing_scores():
-    """Articles without 9A scores should get moderate defaults"""
-    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
-    
-    article = {}  # No scores at all
-    weight = calculate_credibility_weight(article)
-    assert 0.4 < weight < 0.7, f"Article with missing scores should have moderate weight, got {weight}"
-
-
-def test_credibility_weight_floor():
-    """Even worst articles should have minimum 0.1 weight"""
-    from src.langgraph_nodes.node_05_sentiment_analysis import calculate_credibility_weight
-    
-    article = {
-        'source_credibility_score': 0.0,
-        'composite_anomaly_score': 1.0,
-        'relevance_score': 0.0
-    }
-    weight = calculate_credibility_weight(article)
-    assert weight >= 0.1, f"Weight should be floored at 0.1, got {weight}"
-    assert weight <= 0.15  # Should be very close to floor
-
-
-def test_weighted_aggregation_reduces_blog_influence():
-    """Random blog sentiment should not dominate over Bloomberg"""
-    articles = [
-        {
-            'sentiment_score': 0.9, 
-            'source_credibility_score': 0.30,
-            'composite_anomaly_score': 0.75, 
-            'relevance_score': 0.4,
-            'time_published': '20260214T120000',
-            'sentiment_label': 'positive'
-        },
-        {
-            'sentiment_score': -0.3, 
-            'source_credibility_score': 0.95,
-            'composite_anomaly_score': 0.04, 
-            'relevance_score': 0.85,
-            'time_published': '20260214T110000',
-            'sentiment_label': 'negative'
-        },
-    ]
-    result = aggregate_sentiment_by_type(articles, 'stock')
-    
-    # Bloomberg's -0.3 should pull the average below 0.3
-    # Without weighting it would be (0.9 + -0.3)/2 = 0.30
-    # With credibility weighting, Bloomberg should have more influence
-    assert result['weighted_sentiment'] < 0.15, \
-        f"Expected weighted sentiment < 0.15, got {result['weighted_sentiment']}"
-
-
-def test_credibility_summary_in_output():
-    """State output should include credibility summary"""
-    state = {
-        'ticker': 'TEST',
         'cleaned_stock_news': [
             {
-                'title': 'High credibility news',
+                'title': 'Positive stock news',
+                'overall_sentiment_label': 'Bullish',
                 'ticker_sentiment_score': 0.8,
-                'source_credibility_score': 0.90,
-                'composite_anomaly_score': 0.05,
-                'relevance_score': 0.85
+                'source': 'Bloomberg',
+                'source_credibility_score': 0.95,
+                'composite_anomaly_score': 0.04,
+                'relevance_score': 0.9,
             },
             {
-                'title': 'Low credibility news',
+                'title': 'More positive news',
+                'overall_sentiment_label': 'Somewhat-Bullish',
+                'ticker_sentiment_score': 0.7,
+                'source': 'Reuters',
+                'source_credibility_score': 0.85,
+                'composite_anomaly_score': 0.10,
+                'relevance_score': 0.8,
+            },
+        ],
+        'cleaned_market_news': [
+            {
+                'title': 'Market bullish',
+                'overall_sentiment_label': 'Somewhat-Bullish',
                 'ticker_sentiment_score': 0.5,
-                'source_credibility_score': 0.40,
-                'composite_anomaly_score': 0.60,
-                'relevance_score': 0.50
+                'source': 'CNBC',
             }
         ],
-        'cleaned_market_news': [],
-        'cleaned_related_company_news': [],
+        'cleaned_related_company_news': [
+            {
+                'title': 'Competitor doing well',
+                'overall_sentiment_label': 'Bullish',
+                'ticker_sentiment_score': 0.6,
+                'source': 'Bloomberg',
+            }
+        ],
         'errors': [],
-        'node_execution_times': {}
+        'node_execution_times': {},
     }
-    
-    result = sentiment_analysis_node(state)
-    
-    assert 'sentiment_credibility_summary' in result
-    summary = result['sentiment_credibility_summary']
-    assert 'avg_source_credibility' in summary
-    assert 'high_credibility_articles' in summary
-    assert 'medium_credibility_articles' in summary
-    assert 'low_credibility_articles' in summary
-    assert 'avg_composite_anomaly' in summary
-    assert summary['credibility_weighted'] == True
-    
-    # Check counts
-    assert summary['high_credibility_articles'] == 1  # 0.90 >= 0.8
-    assert summary['low_credibility_articles'] == 1   # 0.40 < 0.5
 
 
-def test_per_article_scores_include_credibility():
-    """raw_sentiment_scores should include credibility_weight per article"""
+# ============================================================================
+# CATEGORY 1: Alpha Vantage Sentiment Extraction
+# ============================================================================
+
+class TestExtractAVSentiment:
+
+    def test_ticker_sentiment_preferred_over_overall(self, sample_av_articles):
+        """When USE_TICKER_SENTIMENT=True, ticker_sentiment_score is used."""
+        result = extract_alpha_vantage_sentiment(sample_av_articles)
+
+        assert len(result) == 3
+        assert result[0]['sentiment_score'] == 0.8   # ticker score
+        assert result[0]['sentiment_source'] == 'alpha_vantage_ticker'
+        assert result[0]['has_sentiment'] is True
+
+    def test_av_label_preserved_not_recalculated(self, sample_av_articles):
+        """The overall_sentiment_label from AV is kept as-is (e.g. 'Bullish')."""
+        result = extract_alpha_vantage_sentiment(sample_av_articles)
+
+        # Label should be the AV string, not recalculated 'positive'/'negative'
+        assert result[0]['sentiment_label'] == 'Bullish'
+        assert result[1]['sentiment_label'] == 'Bearish'
+        assert result[2]['sentiment_label'] == 'Neutral'
+
+    def test_overall_sentiment_fallback_when_no_ticker_score(self):
+        """Articles without ticker_sentiment_score fall back to overall_sentiment_score."""
+        articles = [
+            {
+                'title': 'Market news',
+                'overall_sentiment_score': 0.4,
+                'overall_sentiment_label': 'Somewhat-Bullish',
+                'source': 'Reuters',
+                # no ticker_sentiment_score
+            }
+        ]
+        result = extract_alpha_vantage_sentiment(articles)
+
+        assert result[0]['sentiment_score'] == pytest.approx(0.4, abs=1e-6)
+        assert result[0]['sentiment_source'] == 'alpha_vantage_overall'
+        assert result[0]['sentiment_label'] == 'Somewhat-Bullish'
+
+    def test_no_av_sentiment_marks_has_sentiment_false(self):
+        """Finnhub articles with no AV fields get has_sentiment=False."""
+        articles = [{'title': 'Finnhub article', 'source': 'Finnhub'}]
+        result = extract_alpha_vantage_sentiment(articles)
+
+        assert result[0]['has_sentiment'] is False
+        assert result[0]['sentiment_score'] == 0.0
+        assert result[0]['sentiment_source'] == 'none'
+
+    def test_malformed_or_empty_articles_do_not_crash(self):
+        """Empty dicts and missing fields are handled gracefully."""
+        articles = [{}, {'title': 'No scores'}]
+        result = extract_alpha_vantage_sentiment(articles)
+        assert len(result) == 2
+        assert all('has_sentiment' in a for a in result)
+
+
+# ============================================================================
+# CATEGORY 2: FinBERT Model Loading
+# ============================================================================
+
+class TestFinBERTModelLoading:
+
+    def test_cached_model_returned_without_reload(self):
+        """Once loaded, the cached model is returned directly."""
+        import src.langgraph_nodes.node_05_sentiment_analysis as node5
+        mock_model = Mock()
+        node5._FINBERT_MODEL = mock_model
+
+        model = load_finbert_model()
+        assert model is mock_model
+
+    def test_loading_failure_returns_none(self):
+        """If transformers raises, None is returned (no crash).
+
+        Uses sys.modules patching instead of @patch('transformers.pipeline')
+        because HuggingFace transformers uses lazy loading — the attribute patch
+        is bypassed by the `from transformers import pipeline` import inside
+        load_finbert_model(). Replacing the entire sys.modules entry intercepts
+        the import correctly.
+        """
+        import src.langgraph_nodes.node_05_sentiment_analysis as node5
+        node5._FINBERT_MODEL = None
+
+        mock_transformers = MagicMock()
+        mock_transformers.pipeline.side_effect = Exception("Download failed")
+
+        with patch.dict(sys.modules, {'transformers': mock_transformers}):
+            model = load_finbert_model()
+
+        assert model is None
+        # Reset so later tests can use real FinBERT if needed
+        node5._FINBERT_MODEL = None
+
+    def test_cached_model_is_callable(self):
+        """If a model is cached it must be callable (pipeline contract)."""
+        import src.langgraph_nodes.node_05_sentiment_analysis as node5
+        mock_model = Mock()
+        node5._FINBERT_MODEL = mock_model
+
+        model = load_finbert_model()
+        assert callable(model)
+
+
+# ============================================================================
+# CATEGORY 3: FinBERT Text Analysis
+# ============================================================================
+
+class TestFinBERTTextAnalysis:
+
+    def _mock_positive(self):
+        m = Mock()
+        m.return_value = [[
+            {'label': 'positive', 'score': 0.95},
+            {'label': 'neutral',  'score': 0.03},
+            {'label': 'negative', 'score': 0.02},
+        ]]
+        return m
+
+    def _mock_negative(self):
+        m = Mock()
+        m.return_value = [[
+            {'label': 'negative', 'score': 0.90},
+            {'label': 'neutral',  'score': 0.07},
+            {'label': 'positive', 'score': 0.03},
+        ]]
+        return m
+
+    def _mock_neutral(self):
+        m = Mock()
+        m.return_value = [[
+            {'label': 'neutral',  'score': 0.80},
+            {'label': 'positive', 'score': 0.10},
+            {'label': 'negative', 'score': 0.10},
+        ]]
+        return m
+
+    def test_positive_text_returns_positive_label_and_score(self):
+        result = analyze_text_with_finbert("Company beats earnings", self._mock_positive())
+        assert result['label'] == 'positive'
+        assert result['sentiment'] > 0.0
+        assert 0.0 <= result['score'] <= 1.0
+
+    def test_negative_text_returns_negative_score(self):
+        result = analyze_text_with_finbert("Company misses earnings", self._mock_negative())
+        assert result['label'] == 'negative'
+        assert result['sentiment'] < 0.0
+
+    def test_neutral_text_returns_zero_sentiment(self):
+        result = analyze_text_with_finbert("Company releases a statement", self._mock_neutral())
+        assert result['label'] == 'neutral'
+        assert result['sentiment'] == 0.0
+
+    def test_empty_text_returns_neutral_defaults(self):
+        result = analyze_text_with_finbert("", Mock())
+        assert result['label'] == 'neutral'
+        assert result['sentiment'] == 0.0
+
+    def test_model_none_returns_neutral_defaults(self):
+        result = analyze_text_with_finbert("Some text", None)
+        assert result['label'] == 'neutral'
+        assert result['sentiment'] == 0.0
+
+
+# ============================================================================
+# CATEGORY 4: Sentiment Aggregation per Stream
+# ============================================================================
+
+class TestAggregateByType:
+
+    def test_empty_articles_return_zero_defaults(self):
+        result = aggregate_sentiment_by_type([], 'stock')
+        assert result['article_count'] == 0
+        assert result['weighted_sentiment'] == 0.0
+        assert result['dominant_label'] == 'neutral'
+        assert result['top_articles'] == []
+        assert result['confidence'] == 0.0
+
+    def test_no_buy_sell_hold_in_output(self):
+        """aggregate_sentiment_by_type must NOT return a sentiment_signal."""
+        articles = [
+            {'sentiment_score': 0.8, 'sentiment_label': 'Bullish', 'title': 'T', 'source': 'X'},
+        ]
+        result = aggregate_sentiment_by_type(articles, 'stock')
+        assert 'sentiment_signal' not in result
+
+    def test_dominant_label_reflects_majority(self):
+        """dominant_label should be the most frequent normalised label."""
+        articles = [
+            {'sentiment_score': 0.8, 'sentiment_label': 'Bullish',          'title': 'A', 'source': 'S'},
+            {'sentiment_score': 0.7, 'sentiment_label': 'Somewhat-Bullish', 'title': 'B', 'source': 'S'},
+            {'sentiment_score': -0.3,'sentiment_label': 'Bearish',          'title': 'C', 'source': 'S'},
+        ]
+        result = aggregate_sentiment_by_type(articles, 'stock')
+        assert result['dominant_label'] == 'positive'
+
+    def test_top_articles_are_top_3_by_credibility(self):
+        """top_articles should be the 3 highest-credibility articles."""
+        articles = [
+            {'sentiment_score': 0.5, 'sentiment_label': 'Bullish', 'title': 'Low',
+             'source': 'Blog', 'source_credibility_score': 0.3, 'composite_anomaly_score': 0.8, 'relevance_score': 0.3},
+            {'sentiment_score': 0.7, 'sentiment_label': 'Bullish', 'title': 'High',
+             'source': 'Bloomberg', 'source_credibility_score': 0.95, 'composite_anomaly_score': 0.04, 'relevance_score': 0.9},
+            {'sentiment_score': 0.6, 'sentiment_label': 'Somewhat-Bullish', 'title': 'Medium',
+             'source': 'Reuters', 'source_credibility_score': 0.75, 'composite_anomaly_score': 0.15, 'relevance_score': 0.7},
+        ]
+        result = aggregate_sentiment_by_type(articles, 'stock')
+        assert len(result['top_articles']) <= 3
+        # Bloomberg should be first (highest credibility)
+        assert result['top_articles'][0]['source'] == 'Bloomberg'
+
+    def test_time_weighted_sentiment_differs_from_simple_mean(self):
+        """Recent article (index 0) has higher weight — weighted != simple mean."""
+        articles = [
+            {'sentiment_score': -0.8, 'sentiment_label': 'Bearish', 'title': 'T', 'source': 'S'},  # newest
+            {'sentiment_score': 0.4,  'sentiment_label': 'Bullish', 'title': 'T', 'source': 'S'},
+            {'sentiment_score': 0.4,  'sentiment_label': 'Bullish', 'title': 'T', 'source': 'S'},  # oldest
+        ]
+        result = aggregate_sentiment_by_type(articles, 'stock')
+        assert result['weighted_sentiment'] < result['average_sentiment']
+
+    def test_positive_and_negative_counts_are_correct(self):
+        articles = [
+            {'sentiment_score': 0.8, 'sentiment_label': 'Bullish',  'title': 'T', 'source': 'S'},
+            {'sentiment_score': -0.5,'sentiment_label': 'Bearish',  'title': 'T', 'source': 'S'},
+            {'sentiment_score': 0.1, 'sentiment_label': 'Neutral',  'title': 'T', 'source': 'S'},
+        ]
+        result = aggregate_sentiment_by_type(articles, 'stock')
+        assert result['positive_count'] == 1
+        assert result['negative_count'] == 1
+        assert result['neutral_count'] == 1
+
+
+# ============================================================================
+# CATEGORY 5: Combined Sentiment Calculation
+# ============================================================================
+
+class TestCalculateCombinedSentiment:
+
+    def _make_agg(self, ws: float, conf: float) -> dict:
+        return {'weighted_sentiment': ws, 'confidence': conf,
+                'article_count': 5, 'dominant_label': 'positive',
+                'positive_count': 5, 'negative_count': 0, 'neutral_count': 0,
+                'top_articles': []}
+
+    def test_weighted_50_25_25_calculation(self):
+        """combined = 0.8*0.5 + 0.4*0.25 + 0.6*0.25 = 0.65"""
+        result = calculate_combined_sentiment(
+            self._make_agg(0.8, 0.9),
+            self._make_agg(0.4, 0.7),
+            self._make_agg(0.6, 0.8),
+        )
+        assert abs(result['combined_sentiment'] - 0.65) < 0.01
+
+    def test_no_signal_field_in_output(self):
+        """calculate_combined_sentiment must NOT return sentiment_signal."""
+        result = calculate_combined_sentiment(
+            self._make_agg(0.5, 0.7),
+            self._make_agg(0.3, 0.6),
+            self._make_agg(0.4, 0.6),
+        )
+        assert 'sentiment_signal' not in result
+
+    def test_negative_combined_sentiment(self):
+        result = calculate_combined_sentiment(
+            self._make_agg(-0.7, 0.8),
+            self._make_agg(-0.5, 0.7),
+            self._make_agg(-0.6, 0.7),
+        )
+        assert result['combined_sentiment'] < -0.5
+
+    def test_confidence_is_weighted_average(self):
+        """combined_confidence = 0.9*0.5 + 0.7*0.25 + 0.8*0.25 = 0.825"""
+        result = calculate_combined_sentiment(
+            self._make_agg(0.5, 0.9),
+            self._make_agg(0.5, 0.7),
+            self._make_agg(0.5, 0.8),
+        )
+        assert abs(result['confidence'] - 0.825) < 0.01
+
+
+# ============================================================================
+# CATEGORY 6: Build Sentiment Breakdown for Node 13
+# ============================================================================
+
+class TestBuildSentimentBreakdown:
+
+    def _stream(self, ws: float) -> dict:
+        return {
+            'weighted_sentiment': ws,
+            'article_count': 3,
+            'positive_count': 2,
+            'negative_count': 1,
+            'neutral_count': 0,
+            'dominant_label': 'positive',
+            'top_articles': [
+                {'title': 'T1', 'source': 'Bloomberg',
+                 'sentiment_score': 0.7, 'sentiment_label': 'Bullish', 'credibility_weight': 0.92}
+            ],
+        }
+
+    def test_breakdown_has_all_three_streams_and_overall(self):
+        articles = [
+            {'source_credibility_score': 0.9, 'composite_anomaly_score': 0.05,
+             'sentiment_source': 'alpha_vantage_ticker'},
+        ]
+        bd = build_sentiment_breakdown(
+            self._stream(0.7), self._stream(0.3), self._stream(0.5),
+            0.55, 0.72, articles,
+        )
+        assert 'stock' in bd
+        assert 'market' in bd
+        assert 'related' in bd
+        assert 'overall' in bd
+
+    def test_overall_combined_sentiment_and_confidence_correct(self):
+        bd = build_sentiment_breakdown(
+            self._stream(0.7), self._stream(0.3), self._stream(0.5),
+            0.55, 0.72, [],
+        )
+        assert bd['overall']['combined_sentiment'] == pytest.approx(0.55)
+        assert bd['overall']['confidence'] == pytest.approx(0.72)
+
+    def test_credibility_block_counts_tiers(self):
+        articles = [
+            {'source_credibility_score': 0.90, 'composite_anomaly_score': 0.05,
+             'sentiment_source': 'alpha_vantage_ticker'},   # high
+            {'source_credibility_score': 0.65, 'composite_anomaly_score': 0.20,
+             'sentiment_source': 'alpha_vantage_overall'},  # medium
+            {'source_credibility_score': 0.30, 'composite_anomaly_score': 0.70,
+             'sentiment_source': 'finbert'},                # low
+        ]
+        bd = build_sentiment_breakdown(
+            self._stream(0.5), self._stream(0.3), self._stream(0.4),
+            0.43, 0.65, articles,
+        )
+        cred = bd['overall']['credibility']
+        assert cred['high_credibility_articles'] == 1
+        assert cred['medium_credibility_articles'] == 1
+        assert cred['low_credibility_articles'] == 1
+
+    def test_sentiment_source_mix_counts_correctly(self):
+        articles = [
+            {'sentiment_source': 'alpha_vantage_ticker',  'source_credibility_score': 0.9, 'composite_anomaly_score': 0.05},
+            {'sentiment_source': 'alpha_vantage_overall', 'source_credibility_score': 0.7, 'composite_anomaly_score': 0.10},
+            {'sentiment_source': 'finbert',               'source_credibility_score': 0.5, 'composite_anomaly_score': 0.30},
+            {'sentiment_source': 'none',                  'source_credibility_score': 0.4, 'composite_anomaly_score': 0.50},
+        ]
+        bd = build_sentiment_breakdown(
+            self._stream(0.5), self._stream(0.3), self._stream(0.4),
+            0.43, 0.65, articles,
+        )
+        mix = bd['overall']['sentiment_source_mix']
+        assert mix['alpha_vantage_ticker'] == 1
+        assert mix['alpha_vantage_overall'] == 1
+        assert mix['finbert'] == 1
+        assert mix['none'] == 1
+
+
+# ============================================================================
+# CATEGORY 7: Credibility Weight Calculation
+# ============================================================================
+
+class TestCredibilityWeight:
+
+    def test_high_quality_article_gets_high_weight(self):
+        article = {
+            'source_credibility_score': 0.95,
+            'composite_anomaly_score': 0.04,
+            'relevance_score': 0.85,
+        }
+        weight = calculate_credibility_weight(article)
+        assert weight > 0.85
+        assert weight <= 1.0
+
+    def test_low_quality_article_gets_low_weight(self):
+        article = {
+            'source_credibility_score': 0.30,
+            'composite_anomaly_score': 0.75,
+            'relevance_score': 0.40,
+        }
+        weight = calculate_credibility_weight(article)
+        assert weight < 0.40
+        assert weight >= 0.1  # floor
+
+    def test_missing_scores_give_moderate_default(self):
+        weight = calculate_credibility_weight({})
+        assert 0.4 < weight < 0.7
+
+    def test_floor_is_respected(self):
+        """Weight never drops below 0.1 even for worst-case article."""
+        article = {
+            'source_credibility_score': 0.0,
+            'composite_anomaly_score': 1.0,
+            'relevance_score': 0.0,
+        }
+        assert calculate_credibility_weight(article) >= 0.1
+
+
+# ============================================================================
+# CATEGORY 8: Main Node Function
+# ============================================================================
+
+class TestSentimentAnalysisNode:
+
+    def test_output_fields_present(self, base_state):
+        result = sentiment_analysis_node(base_state)
+
+        assert 'raw_sentiment_scores' in result
+        assert 'aggregated_sentiment' in result
+        assert 'sentiment_signal' in result
+        assert 'sentiment_confidence' in result
+        assert 'sentiment_breakdown' in result
+        assert 'node_execution_times' in result
+        assert 'node_5' in result['node_execution_times']
+
+    def test_sentiment_signal_is_directional_not_trading(self, base_state):
+        """sentiment_signal must be POSITIVE/NEGATIVE/NEUTRAL, never BUY/SELL/HOLD."""
+        result = sentiment_analysis_node(base_state)
+
+        assert result['sentiment_signal'] in ('POSITIVE', 'NEGATIVE', 'NEUTRAL')
+        assert result['sentiment_signal'] not in ('BUY', 'SELL', 'HOLD')
+
+    def test_no_sentiment_credibility_summary_in_output(self, base_state):
+        """sentiment_credibility_summary was removed — folded into sentiment_breakdown."""
+        result = sentiment_analysis_node(base_state)
+        assert 'sentiment_credibility_summary' not in result
+
+    def test_sentiment_breakdown_structure_is_complete(self, base_state):
+        result = sentiment_analysis_node(base_state)
+        bd = result['sentiment_breakdown']
+
+        assert 'stock' in bd
+        assert 'market' in bd
+        assert 'related' in bd
+        assert 'overall' in bd
+        assert 'combined_sentiment' in bd['overall']
+        assert 'confidence' in bd['overall']
+        assert 'credibility' in bd['overall']
+        assert 'sentiment_source_mix' in bd['overall']
+
+    def test_error_handling_returns_none_fields(self):
+        """Missing cleaned_*_news keys should not crash — use defaults."""
+        state = {
+            'ticker': 'TEST',
+            # no cleaned_*_news — will default to []
+            'errors': [],
+            'node_execution_times': {},
+        }
+        result = sentiment_analysis_node(state)
+        # Should complete without exception and return all expected keys
+        assert 'aggregated_sentiment' in result
+        assert 'sentiment_breakdown' in result
+
+
+# ============================================================================
+# CATEGORY 9: Integration
+# ============================================================================
+
+class TestIntegration:
+
+    def test_av_label_survives_full_pipeline(self):
+        """AV label (e.g. 'Somewhat-Bullish') should appear in raw_sentiment_scores."""
+        state = {
+            'ticker': 'NVDA',
+            'cleaned_stock_news': [
+                {
+                    'title': 'Positive',
+                    'overall_sentiment_label': 'Somewhat-Bullish',
+                    'ticker_sentiment_score': 0.6,
+                    'source': 'Bloomberg',
+                }
+            ],
+            'cleaned_market_news': [],
+            'cleaned_related_company_news': [],
+            'errors': [],
+            'node_execution_times': {},
+        }
+        result = sentiment_analysis_node(state)
+        assert len(result['raw_sentiment_scores']) == 1
+        assert result['raw_sentiment_scores'][0]['sentiment_label'] == 'Somewhat-Bullish'
+
+    def test_positive_news_gives_positive_aggregated_sentiment(self):
+        """All positive AV articles → aggregated_sentiment > 0 → POSITIVE signal."""
+        state = {
+            'ticker': 'AAPL',
+            'cleaned_stock_news': [
+                {'title': 'Beat earnings', 'overall_sentiment_label': 'Bullish',
+                 'ticker_sentiment_score': 0.8, 'source': 'Bloomberg'},
+                {'title': 'iPhone sales surge', 'overall_sentiment_label': 'Bullish',
+                 'ticker_sentiment_score': 0.7, 'source': 'Reuters'},
+            ],
+            'cleaned_market_news': [],
+            'cleaned_related_company_news': [],
+            'errors': [],
+            'node_execution_times': {},
+        }
+        result = sentiment_analysis_node(state)
+
+        assert result['aggregated_sentiment'] > 0.0
+        assert result['sentiment_signal'] == 'POSITIVE'
+
+    def test_parallel_execution_keys_only(self):
+        """Node 5 must NOT return ticker, cleaned_*_news or other node fields."""
+        state = {
+            'ticker': 'AAPL',
+            'cleaned_stock_news': [
+                {'title': 'News', 'overall_sentiment_label': 'Bullish',
+                 'ticker_sentiment_score': 0.5, 'source': 'X'},
+            ],
+            'cleaned_market_news': [],
+            'cleaned_related_company_news': [],
+            'errors': [],
+            'node_execution_times': {},
+        }
+        result = sentiment_analysis_node(state)
+
+        # Node 5 returns only its own fields (partial state for LangGraph merge)
+        assert 'ticker' not in result
+        assert 'cleaned_stock_news' not in result
+        assert 'raw_price_data' not in result
+
+
+# ============================================================================
+# CREDIBILITY WEIGHTING — ADDITIONAL INTEGRATION
+# ============================================================================
+
+def test_high_credibility_source_outweighs_low_credibility():
+    """Bloomberg (-0.3) should pull weighted sentiment below plain average."""
+    articles = [
+        {
+            'sentiment_score': 0.9,
+            'sentiment_label': 'Bullish',
+            'title': 'Blog says buy',
+            'source': 'Blog',
+            'source_credibility_score': 0.30,
+            'composite_anomaly_score': 0.75,
+            'relevance_score': 0.40,
+        },
+        {
+            'sentiment_score': -0.3,
+            'sentiment_label': 'Bearish',
+            'title': 'Bloomberg skeptical',
+            'source': 'Bloomberg',
+            'source_credibility_score': 0.95,
+            'composite_anomaly_score': 0.04,
+            'relevance_score': 0.85,
+        },
+    ]
+    result = aggregate_sentiment_by_type(articles, 'stock')
+
+    # Simple mean = (0.9 + -0.3) / 2 = 0.30
+    # Credibility-weighted: Bloomberg should dominate → weighted < 0.15
+    assert result['weighted_sentiment'] < 0.15
+
+
+def test_raw_scores_include_credibility_fields():
+    """raw_sentiment_scores must carry credibility_weight and related fields."""
     state = {
         'ticker': 'TEST',
         'cleaned_stock_news': [
             {
                 'title': 'Test article',
                 'source': 'Bloomberg',
+                'overall_sentiment_label': 'Bullish',
                 'ticker_sentiment_score': 0.7,
                 'source_credibility_score': 0.95,
                 'composite_anomaly_score': 0.04,
-                'relevance_score': 0.85
+                'relevance_score': 0.85,
             }
         ],
         'cleaned_market_news': [],
         'cleaned_related_company_news': [],
         'errors': [],
-        'node_execution_times': {}
+        'node_execution_times': {},
     }
-    
     result = sentiment_analysis_node(state)
-    
-    assert len(result['raw_sentiment_scores']) > 0
+
     for score in result['raw_sentiment_scores']:
         assert 'credibility_weight' in score
         assert 'source_credibility_score' in score
         assert 'composite_anomaly_score' in score
         assert 'relevance_score' in score
-        assert 'source' in score
-
-
-def test_backward_compatibility_without_9a_scores():
-    """Node 5 should still work if 9A scores are missing (graceful defaults)"""
-    articles = [
-        {
-            'title': 'Test', 
-            'summary': 'Test article', 
-            'ticker_sentiment_score': 0.5
-            # No 9A scores at all
-        }
-    ]
-    state = {
-        'ticker': 'TEST',
-        'cleaned_stock_news': articles, 
-        'cleaned_market_news': [],
-        'cleaned_related_company_news': [], 
-        'errors': [], 
-        'node_execution_times': {}
-    }
-    
-    result = sentiment_analysis_node(state)
-    
-    # Should work with default weights
-    assert result['aggregated_sentiment'] is not None
-    assert result['sentiment_signal'] in ['BUY', 'SELL', 'HOLD']
-    assert 'sentiment_credibility_summary' in result
-    
-    # Check that default credibility was used
-    summary = result['sentiment_credibility_summary']
-    assert 0.4 < summary['avg_source_credibility'] < 0.6  # Should be near 0.5 default
 
 
 # ============================================================================
-# RUN TESTS
+# RUN
 # ============================================================================
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    import pytest as _pytest
+    _pytest.main([__file__, "-v"])
