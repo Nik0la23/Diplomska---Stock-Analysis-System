@@ -2,11 +2,16 @@
 Node 3: Related Companies Detection
 Identifies competitor and related companies using Finnhub Peers API and correlation analysis.
 
-Runs AFTER: Node 1 (uses price data for correlation)
+Data Sources:
+- Finnhub: peer ticker list
+- yfinance (primary) / Polygon (fallback): peer price data for correlation (180 days)
+
+Runs AFTER: Node 1 (uses target price data for correlation)
 Runs BEFORE: Node 2 (news fetching needs related company list)
 Can run in PARALLEL with: Nothing
 """
 
+import time
 import pandas as pd
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -14,7 +19,8 @@ import logging
 import finnhub
 
 from src.utils.config import FINNHUB_API_KEY
-from src.database.db_manager import get_cached_price_data
+from src.database.db_manager import get_cached_price_data, cache_price_data
+from src.langgraph_nodes.node_01_data_fetching import fetch_from_yfinance, fetch_from_polygon
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,54 @@ def fetch_peers_from_finnhub(ticker: str) -> List[str]:
 
 
 # ============================================================================
+# HELPER FUNCTION: Fetch and Cache Peer Price Data
+# ============================================================================
+
+def fetch_and_cache_peer_price_data(peer_ticker: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch 180 days of price data for a peer ticker, using cache when available.
+
+    Follows the cache-first pattern: check SQLite first, then yfinance (primary),
+    then Polygon (fallback). Caches any freshly fetched data for 24 hours.
+
+    Args:
+        peer_ticker: Peer stock ticker symbol (e.g., 'AMD')
+
+    Returns:
+        DataFrame with columns: date, open, high, low, close, volume
+        None if all sources fail
+
+    Example:
+        >>> df = fetch_and_cache_peer_price_data('AMD')
+        >>> print(len(df))
+        126
+    """
+    # 1. Check cache first (saves API calls on repeated runs)
+    cached = get_cached_price_data(peer_ticker, max_age_hours=24)
+    if cached is not None:
+        logger.info(f"Cache hit for peer price data: {peer_ticker}")
+        return cached
+
+    logger.info(f"Cache miss for {peer_ticker}, fetching from API")
+
+    # 2. Try yfinance (primary - no API key required)
+    df = fetch_from_yfinance(peer_ticker, days=180)
+
+    # 3. Fallback to Polygon
+    if df is None or df.empty:
+        logger.info(f"yfinance failed for {peer_ticker}, trying Polygon")
+        df = fetch_from_polygon(peer_ticker, days=180)
+
+    # 4. Cache and return if data was fetched
+    if df is not None and not df.empty:
+        cache_price_data(peer_ticker, df)
+        return df
+
+    logger.warning(f"All price sources failed for peer {peer_ticker}")
+    return None
+
+
+# ============================================================================
 # HELPER FUNCTION: Calculate Price Correlation
 # ============================================================================
 
@@ -94,11 +148,11 @@ def calculate_price_correlation(
         Correlation: 0.85
     """
     try:
-        # Get peer price data from cache
-        peer_df = get_cached_price_data(peer_ticker, max_age_hours=24)
-        
+        # Get peer price data (cache-first, then yfinance/Polygon)
+        peer_df = fetch_and_cache_peer_price_data(peer_ticker)
+
         if peer_df is None or peer_df.empty:
-            logger.debug(f"No cached price data for {peer_ticker}")
+            logger.debug(f"No price data available for peer {peer_ticker}")
             return None
         
         # Align dataframes by date
@@ -167,6 +221,7 @@ def rank_peers_by_correlation(
         corr = calculate_price_correlation(target_ticker, peer, target_df)
         if corr is not None:
             peer_correlations.append((peer, corr))
+        time.sleep(0.2)  # avoid hammering yfinance for bulk peer fetches
     
     if not peer_correlations:
         # No correlations calculated, return first N peers

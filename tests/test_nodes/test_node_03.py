@@ -6,6 +6,7 @@ Tests peer discovery, correlation analysis, and error handling.
 import pytest
 import pandas as pd
 from datetime import datetime
+from unittest.mock import patch, MagicMock
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from src.graph.state import create_initial_state
 from src.langgraph_nodes.node_03_related_companies import (
     detect_related_companies_node,
     fetch_peers_from_finnhub,
+    fetch_and_cache_peer_price_data,
     calculate_price_correlation,
     rank_peers_by_correlation
 )
@@ -183,6 +185,165 @@ class TestNode03RelatedCompanies:
         
         # Should return None (not enough data)
         assert corr is None or isinstance(corr, float)
+
+
+# ============================================================================
+# Unit Tests: fetch_and_cache_peer_price_data (new helper)
+# ============================================================================
+
+class TestFetchAndCachePeerPriceData:
+    """Unit tests for the fetch_and_cache_peer_price_data helper (uses mocks)."""
+
+    _SAMPLE_DF = pd.DataFrame({
+        'date': pd.date_range('2025-01-01', periods=180),
+        'open':   [100.0] * 180,
+        'high':   [101.0] * 180,
+        'low':    [99.0]  * 180,
+        'close':  [100.0] * 180,
+        'volume': [1_000_000] * 180,
+    })
+
+    @patch('src.langgraph_nodes.node_03_related_companies.get_cached_price_data')
+    def test_returns_cached_data_without_calling_api(self, mock_cache_get):
+        """Cache hit: should return cached DataFrame and never call yfinance."""
+        mock_cache_get.return_value = self._SAMPLE_DF.copy()
+
+        with patch('src.langgraph_nodes.node_03_related_companies.fetch_from_yfinance') as mock_yf:
+            result = fetch_and_cache_peer_price_data('AMD')
+
+        assert result is not None
+        assert len(result) == 180
+        mock_yf.assert_not_called()
+        mock_cache_get.assert_called_once_with('AMD', max_age_hours=24)
+
+    @patch('src.langgraph_nodes.node_03_related_companies.cache_price_data')
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_from_yfinance')
+    @patch('src.langgraph_nodes.node_03_related_companies.get_cached_price_data')
+    def test_fetches_yfinance_on_cache_miss_and_caches_result(
+        self, mock_cache_get, mock_yf, mock_cache_set
+    ):
+        """Cache miss: should fetch from yfinance and cache the result."""
+        mock_cache_get.return_value = None
+        mock_yf.return_value = self._SAMPLE_DF.copy()
+
+        result = fetch_and_cache_peer_price_data('AMD')
+
+        assert result is not None
+        mock_yf.assert_called_once_with('AMD', days=180)
+        mock_cache_set.assert_called_once_with('AMD', mock_yf.return_value)
+
+    @patch('src.langgraph_nodes.node_03_related_companies.cache_price_data')
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_from_polygon')
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_from_yfinance')
+    @patch('src.langgraph_nodes.node_03_related_companies.get_cached_price_data')
+    def test_falls_back_to_polygon_when_yfinance_fails(
+        self, mock_cache_get, mock_yf, mock_polygon, mock_cache_set
+    ):
+        """yfinance failure: should fall back to Polygon and still cache."""
+        mock_cache_get.return_value = None
+        mock_yf.return_value = None
+        mock_polygon.return_value = self._SAMPLE_DF.copy()
+
+        result = fetch_and_cache_peer_price_data('AMD')
+
+        assert result is not None
+        mock_polygon.assert_called_once_with('AMD', days=180)
+        mock_cache_set.assert_called_once()
+
+    @patch('src.langgraph_nodes.node_03_related_companies.cache_price_data')
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_from_polygon')
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_from_yfinance')
+    @patch('src.langgraph_nodes.node_03_related_companies.get_cached_price_data')
+    def test_returns_none_when_all_sources_fail(
+        self, mock_cache_get, mock_yf, mock_polygon, mock_cache_set
+    ):
+        """All sources fail: should return None without caching anything."""
+        mock_cache_get.return_value = None
+        mock_yf.return_value = None
+        mock_polygon.return_value = None
+
+        result = fetch_and_cache_peer_price_data('UNKNOWN')
+
+        assert result is None
+        mock_cache_set.assert_not_called()
+
+
+# ============================================================================
+# Unit Tests: correlation now produces real values (not always None)
+# ============================================================================
+
+class TestCorrelationWithNewHelper:
+    """Tests that verify correlation ranking actually works after the fix."""
+
+    # Shared dates used across tests
+    _DATES = pd.date_range('2025-01-01', periods=60)
+
+    def _make_df(self, values):
+        return pd.DataFrame({'date': self._DATES, 'close': values})
+
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_and_cache_peer_price_data')
+    def test_correlation_returns_float_when_peer_data_available(self, mock_fetch):
+        """Should return a valid float in [0, 1] when peer data is present."""
+        mock_fetch.return_value = self._make_df([50.0 + i * 0.5 for i in range(60)])
+        target_df = self._make_df([100.0 + i for i in range(60)])
+
+        corr = calculate_price_correlation('NVDA', 'AMD', target_df)
+
+        assert corr is not None
+        assert isinstance(corr, float)
+        assert 0.0 <= corr <= 1.0
+
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_and_cache_peer_price_data')
+    def test_correlation_returns_none_when_peer_data_unavailable(self, mock_fetch):
+        """Should return None when the new helper also returns None."""
+        mock_fetch.return_value = None
+        target_df = self._make_df([100.0 + i for i in range(60)])
+
+        corr = calculate_price_correlation('NVDA', 'UNKNOWN', target_df)
+
+        assert corr is None
+
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_and_cache_peer_price_data')
+    def test_higher_correlated_peer_ranked_first(self, mock_fetch):
+        """Peer with higher absolute correlation should rank before a weaker one."""
+        target_close = [100.0 + i for i in range(60)]
+        target_df = self._make_df(target_close)
+
+        # AMD moves nearly in lockstep → high correlation
+        amd_close = [50.0 + i * 0.99 for i in range(60)]
+        # INTC alternates around a flat line → near-zero correlation
+        intc_close = [80.0 + (1 if i % 2 == 0 else -1) for i in range(60)]
+
+        def side_effect(ticker):
+            if ticker == 'AMD':
+                return self._make_df(amd_close)
+            if ticker == 'INTC':
+                return self._make_df(intc_close)
+            return None
+
+        mock_fetch.side_effect = side_effect
+
+        ranked = rank_peers_by_correlation('NVDA', ['AMD', 'INTC'], target_df, max_peers=2)
+
+        assert ranked[0] == 'AMD', "AMD (high correlation) should rank first"
+        assert ranked[1] == 'INTC'
+
+    @patch('src.langgraph_nodes.node_03_related_companies.fetch_and_cache_peer_price_data')
+    def test_peers_with_no_data_excluded_from_ranking(self, mock_fetch):
+        """Peers for which no price data can be fetched should be dropped."""
+        target_df = self._make_df([100.0 + i for i in range(60)])
+
+        def side_effect(ticker):
+            if ticker == 'AMD':
+                return self._make_df([50.0 + i for i in range(60)])
+            return None  # All others fail
+
+        mock_fetch.side_effect = side_effect
+
+        ranked = rank_peers_by_correlation('NVDA', ['AMD', 'INTC', 'TSM'], target_df, max_peers=5)
+
+        # Only AMD should appear (it's the only one with data)
+        assert ranked == ['AMD']
 
 
 # ============================================================================
