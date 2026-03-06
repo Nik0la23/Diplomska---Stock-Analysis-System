@@ -10,6 +10,8 @@ Responsibilities deliberately NOT done by Node 10:
 2. Guard against statistically insufficient or insignificant streams —
    assign neutral weight (0.5) when the signal stream cannot be trusted
 3. Normalize: weight_i = weighted_accuracy_i / sum(all_weighted_accuracies)
+4. Apply Node 8 learning_adjustment (capped to [0.30, 0.90]) to news stream
+   weighted accuracies before normalizing — technical stream is excluded.
 
 Neutral weight (0.5) is used when:
 - Stream data is None (Node 10 failed for that stream)
@@ -46,6 +48,12 @@ RECENCY_WEIGHT: float = 0.7       # proportion given to recent_accuracy (last 60
 FULL_WEIGHT: float = 0.3          # proportion given to full_accuracy (all 180 days)
 NEUTRAL_ACCURACY: float = 0.5     # neutral (coin-flip) fallback for unreliable streams
 EQUAL_WEIGHT: float = 0.25        # equal weight across 4 streams when backtest failed
+
+# Node 8 learning_adjustment integration (Option B: capped boost)
+NEWS_STREAM_KEYS: tuple = ("stock_news", "market_news", "related_news")  # technical excluded
+MIN_ADJUSTED_ACCURACY: float = 0.30   # floor: news still contributes even if sources unreliable
+MAX_ADJUSTED_ACCURACY: float = 0.90   # ceiling: no news stream dominates unrealistically
+DEFAULT_LEARNING_ADJUSTMENT: float = 1.0  # neutral when Node 8 data unavailable
 
 
 # Stream keys and their corresponding output weight field names
@@ -138,6 +146,7 @@ def _compute_weighted_accuracy(
 
 def calculate_adaptive_weights(
     backtest_results: Dict[str, Any],
+    learning_adjustment: float = DEFAULT_LEARNING_ADJUSTMENT,
 ) -> Dict[str, Any]:
     """
     Calculate normalized adaptive weights from Node 10's backtest results.
@@ -145,8 +154,11 @@ def calculate_adaptive_weights(
     Process:
     1. For each of the 4 streams call _compute_weighted_accuracy to get the
        recency-weighted accuracy (or neutral 0.5 when the stream cannot be trusted).
-    2. Normalize: weight_i = weighted_accuracy_i / sum(all_weighted_accuracies).
-    3. Validate: weights must sum to 1.0 ± 0.001; if not, fall back to equal weights.
+    2. Apply Node 8's learning_adjustment (capped to [MIN_ADJUSTED_ACCURACY,
+       MAX_ADJUSTED_ACCURACY]) to the 3 news streams only. Technical stream is
+       excluded. Neutral streams (0.5 fallback) are left unchanged.
+    3. Normalize: weight_i = weighted_accuracy_i / sum(all_weighted_accuracies).
+    4. Validate: weights must sum to 1.0 ± 0.001; if not, fall back to equal weights.
 
     Why even unreliable streams contribute to the sum:
     All 4 streams get a weighted_accuracy (at minimum NEUTRAL_ACCURACY = 0.5),
@@ -158,15 +170,20 @@ def calculate_adaptive_weights(
         backtest_results: Dict produced by Node 10's backtesting_node().
             Expected keys: 'technical', 'stock_news', 'market_news',
                            'related_news', 'hold_threshold_pct', 'sample_period_days'
+        learning_adjustment: Node 8's reliability factor for news sources.
+            Values > 1.0 boost news stream weights; < 1.0 reduce them.
+            Capped to [MIN_ADJUSTED_ACCURACY, MAX_ADJUSTED_ACCURACY] per stream.
+            Defaults to 1.0 (neutral) when Node 8 data is unavailable.
 
     Returns:
         Dict containing:
             technical_weight, stock_news_weight, market_news_weight, related_news_weight
-            weighted_accuracies  — per-stream weighted accuracy before normalization
-            weight_sources       — how each weight was derived (label from _compute_weighted_accuracy)
-            streams_reliable     — count of streams with source == 'calculated' or 'full_accuracy_only'
-            hold_threshold_pct   — passed through from Node 10 for dashboard
-            sample_period_days   — passed through from Node 10
+            weighted_accuracies      — per-stream weighted accuracy after adjustment, before normalization
+            weight_sources           — how each weight was derived (label from _compute_weighted_accuracy)
+            streams_reliable         — count of streams with source == 'calculated' or 'full_accuracy_only'
+            hold_threshold_pct       — passed through from Node 10 for dashboard
+            sample_period_days       — passed through from Node 10
+            learning_adjustment_applied — the learning_adjustment value actually used
     """
     weighted_accuracies: Dict[str, float] = {}
     weight_sources: Dict[str, str] = {}
@@ -177,6 +194,25 @@ def calculate_adaptive_weights(
         w_acc, source = _compute_weighted_accuracy(stream_metrics, stream_key)
         weighted_accuracies[stream_key] = w_acc
         weight_sources[stream_key] = source
+
+    # Apply Node 8's learning_adjustment to news streams only (Option B: capped boost).
+    # Only adjusts streams with actual data ('calculated' or 'full_accuracy_only').
+    # Neutral streams (0.5 fallback) are left unchanged — they are already penalized.
+    if learning_adjustment != DEFAULT_LEARNING_ADJUSTMENT:
+        logger.info(
+            f"Applying Node 8 learning_adjustment={learning_adjustment:.3f} to news streams:"
+        )
+        for stream_key in NEWS_STREAM_KEYS:
+            if weight_sources[stream_key] in ("calculated", "full_accuracy_only"):
+                raw = weighted_accuracies[stream_key]
+                adjusted = max(
+                    MIN_ADJUSTED_ACCURACY,
+                    min(MAX_ADJUSTED_ACCURACY, raw * learning_adjustment),
+                )
+                weighted_accuracies[stream_key] = adjusted
+                logger.info(
+                    f"  {stream_key}: {raw:.3f} → {adjusted:.3f} (×{learning_adjustment:.3f})"
+                )
 
     total = sum(weighted_accuracies.values())
 
@@ -204,6 +240,7 @@ def calculate_adaptive_weights(
         "streams_reliable": streams_reliable,
         "hold_threshold_pct": backtest_results.get("hold_threshold_pct"),
         "sample_period_days": backtest_results.get("sample_period_days", 180),
+        "learning_adjustment_applied": round(learning_adjustment, 4),
     }
 
 
@@ -239,7 +276,8 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
         'streams_reliable':  int,      # number of non-neutral streams (0–4)
         'hold_threshold_pct': float,   # passed through from Node 10
         'sample_period_days': int,     # passed through from Node 10
-        'fallback_equal_weights': bool # True if error forced equal weights
+        'fallback_equal_weights': bool,# True if error forced equal weights
+        'learning_adjustment_applied': float  # Node 8 factor used (1.0 = neutral)
     }
 
     Runs AFTER: Node 10 (backtesting)
@@ -277,14 +315,25 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "hold_threshold_pct": None,
                 "sample_period_days": 180,
                 "fallback_equal_weights": True,
+                "learning_adjustment_applied": DEFAULT_LEARNING_ADJUSTMENT,
             }
             state.setdefault("node_execution_times", {})["node_11"] = (
                 datetime.now() - start_time
             ).total_seconds()
             return state
 
+        # Extract Node 8's learning adjustment (1.0 = neutral when Node 8 didn't run)
+        niv = state.get("news_impact_verification") or {}
+        learning_adjustment: float = float(
+            niv.get("learning_adjustment", DEFAULT_LEARNING_ADJUSTMENT)
+        )
+        logger.info(
+            f"  Node 8 learning_adjustment: {learning_adjustment:.3f} "
+            f"({'from Node 8' if niv else 'default — Node 8 not available'})"
+        )
+
         # Main calculation
-        adaptive_weights = calculate_adaptive_weights(backtest_results)
+        adaptive_weights = calculate_adaptive_weights(backtest_results, learning_adjustment)
         adaptive_weights["fallback_equal_weights"] = False
 
         state["adaptive_weights"] = adaptive_weights
@@ -322,6 +371,7 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "hold_threshold_pct": None,
             "sample_period_days": 180,
             "fallback_equal_weights": True,
+            "learning_adjustment_applied": DEFAULT_LEARNING_ADJUSTMENT,
         }
         state.setdefault("node_execution_times", {})["node_11"] = (
             datetime.now() - start_time

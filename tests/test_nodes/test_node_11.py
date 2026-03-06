@@ -19,9 +19,13 @@ import pytest
 from copy import deepcopy
 
 from src.langgraph_nodes.node_11_adaptive_weights import (
+    DEFAULT_LEARNING_ADJUSTMENT,
     EQUAL_WEIGHT,
     FULL_WEIGHT,
+    MAX_ADJUSTED_ACCURACY,
+    MIN_ADJUSTED_ACCURACY,
     NEUTRAL_ACCURACY,
+    NEWS_STREAM_KEYS,
     RECENCY_WEIGHT,
     STREAM_KEYS,
     _compute_weighted_accuracy,
@@ -91,14 +95,20 @@ def _make_backtest_results(
     }
 
 
-def _make_base_state(backtest_results: dict = None) -> dict:
+def _make_base_state(
+    backtest_results: dict = None,
+    news_impact_verification: dict = None,
+) -> dict:
     """Return a minimal state dict for adaptive_weights_node."""
-    return {
+    state = {
         "ticker": "AAPL",
         "backtest_results": backtest_results,
         "errors": [],
         "node_execution_times": {},
     }
+    if news_impact_verification is not None:
+        state["news_impact_verification"] = news_impact_verification
+    return state
 
 
 # ============================================================================
@@ -628,3 +638,117 @@ class TestIntegration:
         backtest_partial["related_news"]["is_significant"] = False
         result_partial = adaptive_weights_node(_make_base_state(backtest_partial))
         assert result_partial["adaptive_weights"]["streams_reliable"] == 2
+
+
+# ============================================================================
+# 6. Learning Adjustment (Node 8 integration)
+# ============================================================================
+
+
+class TestLearningAdjustment:
+    """
+    Option B: Node 8's learning_adjustment is a capped multiplier applied to
+    the 3 news stream weighted-accuracies before normalization.
+    Technical stream is NOT affected.
+    """
+
+    def _niv(self, adjustment: float) -> dict:
+        """Minimal news_impact_verification dict with a given learning_adjustment."""
+        return {"learning_adjustment": adjustment, "insufficient_data": False}
+
+    def test_boost_increases_news_avg_weight(self):
+        """learning_adjustment > 1.0 raises average news stream weight vs technical."""
+        backtest = _make_backtest_results()
+        result_no = adaptive_weights_node(_make_base_state(backtest))
+        result_adj = adaptive_weights_node(
+            _make_base_state(deepcopy(backtest), self._niv(1.5))
+        )
+
+        def avg_news(aw):
+            return (
+                aw["stock_news_weight"]
+                + aw["market_news_weight"]
+                + aw["related_news_weight"]
+            ) / 3
+
+        assert avg_news(result_adj["adaptive_weights"]) > avg_news(result_no["adaptive_weights"])
+
+    def test_reduction_decreases_news_avg_weight(self):
+        """learning_adjustment < 1.0 lowers average news stream weight vs technical."""
+        backtest = _make_backtest_results()
+        result_no = adaptive_weights_node(_make_base_state(backtest))
+        result_adj = adaptive_weights_node(
+            _make_base_state(deepcopy(backtest), self._niv(0.6))
+        )
+
+        def avg_news(aw):
+            return (
+                aw["stock_news_weight"]
+                + aw["market_news_weight"]
+                + aw["related_news_weight"]
+            ) / 3
+
+        assert avg_news(result_adj["adaptive_weights"]) < avg_news(result_no["adaptive_weights"])
+
+    def test_technical_stream_unaffected(self):
+        """weighted_accuracies['technical'] must be identical with and without adjustment."""
+        backtest = _make_backtest_results()
+        result_no = adaptive_weights_node(_make_base_state(deepcopy(backtest)))
+        result_adj = adaptive_weights_node(
+            _make_base_state(deepcopy(backtest), self._niv(1.8))
+        )
+        wa_no = result_no["adaptive_weights"]["weighted_accuracies"]["technical"]
+        wa_adj = result_adj["adaptive_weights"]["weighted_accuracies"]["technical"]
+        assert abs(wa_no - wa_adj) < 1e-9
+
+    def test_default_1_0_when_no_node8_data(self):
+        """Missing news_impact_verification produces same result as explicit 1.0."""
+        backtest = _make_backtest_results()
+        result_missing = adaptive_weights_node(_make_base_state(deepcopy(backtest)))
+        result_one = adaptive_weights_node(
+            _make_base_state(deepcopy(backtest), self._niv(1.0))
+        )
+        for _, wk in STREAM_KEYS:
+            assert abs(
+                result_missing["adaptive_weights"][wk]
+                - result_one["adaptive_weights"][wk]
+            ) < 1e-6
+
+    def test_cap_prevents_above_max(self):
+        """Extreme boost (2.0) cannot push any news stream above MAX_ADJUSTED_ACCURACY."""
+        state = _make_base_state(_make_backtest_results(), self._niv(2.0))
+        result = adaptive_weights_node(state)
+        wa = result["adaptive_weights"]["weighted_accuracies"]
+        for sk in NEWS_STREAM_KEYS:
+            assert wa[sk] <= MAX_ADJUSTED_ACCURACY + 1e-6
+
+    def test_floor_prevents_below_min(self):
+        """Extreme reduction (0.1) cannot push any news stream below MIN_ADJUSTED_ACCURACY."""
+        state = _make_base_state(_make_backtest_results(), self._niv(0.1))
+        result = adaptive_weights_node(state)
+        wa = result["adaptive_weights"]["weighted_accuracies"]
+        for sk in NEWS_STREAM_KEYS:
+            assert wa[sk] >= MIN_ADJUSTED_ACCURACY - 1e-6
+
+    def test_weights_still_sum_to_1_with_adjustment(self):
+        """Normalization must hold after learning_adjustment is applied."""
+        state = _make_base_state(_make_backtest_results(), self._niv(1.5))
+        result = adaptive_weights_node(state)
+        total = sum(result["adaptive_weights"][wk] for _, wk in STREAM_KEYS)
+        assert abs(total - 1.0) < 0.001
+
+    def test_adjustment_stored_in_output(self):
+        """learning_adjustment_applied must equal the value extracted from state."""
+        state = _make_base_state(_make_backtest_results(), self._niv(1.3))
+        result = adaptive_weights_node(state)
+        assert "learning_adjustment_applied" in result["adaptive_weights"]
+        assert abs(result["adaptive_weights"]["learning_adjustment_applied"] - 1.3) < 1e-4
+
+    def test_neutral_streams_not_adjusted(self):
+        """Insufficient streams (neutral 0.5) stay at NEUTRAL_ACCURACY regardless of boost."""
+        backtest = _make_backtest_results()
+        backtest["stock_news"] = _make_stream_metrics(is_sufficient=False)
+        state = _make_base_state(backtest, self._niv(2.0))
+        result = adaptive_weights_node(state)
+        wa = result["adaptive_weights"]["weighted_accuracies"]["stock_news"]
+        assert abs(wa - NEUTRAL_ACCURACY) < 1e-6
