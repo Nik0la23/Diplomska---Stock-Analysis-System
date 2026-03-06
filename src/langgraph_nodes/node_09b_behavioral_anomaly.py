@@ -351,7 +351,6 @@ def detect_news_velocity_anomaly(
 # ============================================================================
 
 def detect_news_price_divergence(
-    sentiment_signal: Optional[str],
     sentiment_score: Optional[float],
     price_change: float,
     todays_articles: List[Dict[str, Any]],
@@ -369,8 +368,8 @@ def detect_news_price_divergence(
     sector momentum is not flagged as suspicious.
 
     Args:
-        sentiment_signal: Signal string from Node 5 ('POSITIVE'/'NEGATIVE'/'NEUTRAL').
-        sentiment_score: Aggregated sentiment score in [-1, +1].
+        sentiment_score: Aggregated sentiment score in [-1, +1].  Direction
+            (positive/negative/neutral) is derived from this value directly.
         price_change: 1-day price change in percent.
         todays_articles: List of cleaned article dicts (from Node 9A) for the
             stock stream.  Each dict may contain ``composite_anomaly_score``
@@ -564,9 +563,10 @@ def detect_cross_stream_incoherence(
     stock_market_diff = abs(stock_sentiment - market_sentiment)
     stock_related_diff = abs(stock_sentiment - related_sentiment)
 
-    # Divide by 2.0: the max possible total diff is 2.0 (each diff ≤ 1.0),
-    # so coherence stays in [0, 1] and is appropriately sensitive to divergence.
-    coherence = 1.0 - (stock_market_diff + stock_related_diff) / 2.0
+    # Divide by 4.0: each sentiment is in [-1, +1] so each diff can be up to 2.0,
+    # making the maximum total diff 4.0.  Dividing by 4.0 keeps coherence in [0, 1]
+    # without over-triggering on moderate divergence.
+    coherence = 1.0 - (stock_market_diff + stock_related_diff) / 4.0
     coherence = max(0.0, min(1.0, coherence))
 
     isolated_signal = False
@@ -682,7 +682,7 @@ def match_historical_patterns(
             - float(hist.get("avg_composite_anomaly", 0.0))
         )
         diff_reliab = abs(
-            float(today.get("avg_source_reliability", 0.0))
+            float(today.get("avg_source_credibility", 0.0))
             - float(hist.get("avg_source_credibility", 0.0))
         )
 
@@ -1072,7 +1072,6 @@ def behavioral_anomaly_detection_node(
 
         # 4) News-price divergence (Type C uses idiosyncratic move when market_context available)
         divergence_result = detect_news_price_divergence(
-            sentiment_signal=sentiment_signal,
             sentiment_score=aggregated_sentiment,
             price_change=price_change_1d,
             todays_articles=cleaned_stock_news,
@@ -1096,7 +1095,7 @@ def behavioral_anomaly_detection_node(
         today_profile = {
             "article_count": len(cleaned_stock_news),
             "avg_composite_anomaly": stock_avg_anomaly,
-            "avg_source_reliability": historical_avg_reliability,
+            "avg_source_credibility": historical_avg_reliability,
             "volume_ratio": volume_result.get("volume_ratio", 1.0),
             "sentiment_direction": (
                 "positive"
@@ -1189,7 +1188,7 @@ def behavioral_anomaly_detection_node(
             "source_reliability_divergence": reliability_result,
             "news_velocity_anomaly": velocity_result,
             "news_price_divergence": divergence_result,
-            "cross_stream_coherence": coherence_result,
+            "cross_stream_incoherence": coherence_result,
             "historical_pattern_match": pattern_result,
             "detection_breakdown": composite_result["detection_breakdown"],
             "primary_risk_factors": composite_result["primary_risk_factors"],
@@ -1225,7 +1224,7 @@ def behavioral_anomaly_detection_node(
             "source_reliability_divergence": _neutral_detector_result(),
             "news_velocity_anomaly": _neutral_detector_result(),
             "news_price_divergence": _neutral_detector_result(),
-            "cross_stream_coherence": _neutral_detector_result(),
+            "cross_stream_incoherence": _neutral_detector_result(),
             "historical_pattern_match": _neutral_detector_result(),
             "detection_breakdown": {
                 "volume_anomaly": 0,

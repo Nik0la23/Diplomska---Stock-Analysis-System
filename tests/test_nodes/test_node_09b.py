@@ -408,22 +408,21 @@ def test_news_velocity_high_spike_with_coordination():
 
 def test_divergence_type_a_positive_news_negative_price():
     """Type A: Positive sentiment but price falling."""
-    sentiment_signal = "BUY"
     sentiment_score = 0.6  # Positive
     price_change = -3.5  # Down 3.5%
-    
+
     articles = [
         {"source": "Bloomberg", "composite_anomaly_score": 0.1},
         {"source": "Reuters", "composite_anomaly_score": 0.12},
     ]
-    
+
     reliability = {
         "Bloomberg": {"accuracy_rate": 0.84},
         "Reuters": {"accuracy_rate": 0.78},
     }
-    
+
     result = detect_news_price_divergence(
-        sentiment_signal, sentiment_score, price_change, articles, reliability
+        sentiment_score, price_change, articles, reliability
     )
     
     assert result["detected"] == True
@@ -435,20 +434,19 @@ def test_divergence_type_a_positive_news_negative_price():
 
 def test_divergence_type_b_negative_news_positive_price():
     """Type B: Negative sentiment but price rising."""
-    sentiment_signal = "SELL"
     sentiment_score = -0.5  # Negative
     price_change = 2.8  # Up 2.8%
-    
+
     articles = [
         {"source": "CNBC", "composite_anomaly_score": 0.15},
     ]
-    
+
     reliability = {
         "CNBC": {"accuracy_rate": 0.72},
     }
-    
+
     result = detect_news_price_divergence(
-        sentiment_signal, sentiment_score, price_change, articles, reliability
+        sentiment_score, price_change, articles, reliability
     )
     
     assert result["detected"] == True
@@ -460,24 +458,23 @@ def test_divergence_type_b_negative_news_positive_price():
 
 def test_divergence_type_c_pump_and_dump_signal():
     """Type C: Low-cred positive news + rising price + no corroboration = CRITICAL."""
-    sentiment_signal = "BUY"
     sentiment_score = 0.75  # Strong positive
     price_change = 8.5  # Up 8.5%
-    
+
     articles = [
         {"source": "pump-blog.com", "composite_anomaly_score": 0.82},
         {"source": "fake-news.net", "composite_anomaly_score": 0.78},
         {"source": "random-site.com", "composite_anomaly_score": 0.85},
     ]
-    
+
     reliability = {
         "pump-blog.com": {"accuracy_rate": 0.28},
         "fake-news.net": {"accuracy_rate": 0.22},
         "random-site.com": {"accuracy_rate": 0.30},
     }
-    
+
     result = detect_news_price_divergence(
-        sentiment_signal, sentiment_score, price_change, articles, reliability
+        sentiment_score, price_change, articles, reliability
     )
     
     assert result["detected"] == True
@@ -490,24 +487,23 @@ def test_divergence_type_c_pump_and_dump_signal():
 
 def test_divergence_no_detection_aligned_signals():
     """No divergence when sentiment and price align with credible sources."""
-    sentiment_signal = "BUY"
     sentiment_score = 0.5  # Positive
     price_change = 2.3  # Up 2.3%
-    
+
     articles = [
         {"source": "Bloomberg", "composite_anomaly_score": 0.08},
         {"source": "Reuters", "composite_anomaly_score": 0.10},
         {"source": "WSJ", "composite_anomaly_score": 0.12},
     ]
-    
+
     reliability = {
         "Bloomberg": {"accuracy_rate": 0.84},
         "Reuters": {"accuracy_rate": 0.78},
         "WSJ": {"accuracy_rate": 0.82},
     }
-    
+
     result = detect_news_price_divergence(
-        sentiment_signal, sentiment_score, price_change, articles, reliability
+        sentiment_score, price_change, articles, reliability
     )
     
     assert result["detected"] == False
@@ -538,17 +534,24 @@ def test_cross_stream_coherence_aligned():
 
 
 def test_cross_stream_coherence_isolated_signal():
-    """Stock stream strongly positive but market/related neutral = isolation."""
-    stock_sentiment = 0.75
-    market_sentiment = 0.05
-    related_sentiment = -0.02
-    
+    """Stock stream strongly positive but market/related sharply negative = isolation.
+
+    With divisor 4.0:
+      diff1 = |0.8 - (-0.3)| = 1.1
+      diff2 = |0.8 - (-0.4)| = 1.2
+      coherence = 1.0 - 2.3/4.0 = 0.425  → HIGH severity, score=8
+      isolated_signal fires on both sentiment gap and article-count imbalance.
+    """
+    stock_sentiment = 0.8
+    market_sentiment = -0.3
+    related_sentiment = -0.4
+
     result = detect_cross_stream_incoherence(
         stock_sentiment, market_sentiment, related_sentiment,
         stock_article_count=50, market_article_count=5, related_article_count=3,
         stock_avg_anomaly=0.68
     )
-    
+
     assert result["detected"] == True
     assert result["isolated_signal"] == True
     assert result["coherence_score"] < 0.6
@@ -564,7 +567,7 @@ def test_historical_pattern_matcher_no_data():
     today_profile = {
         "article_count": 10,
         "avg_composite_anomaly": 0.2,
-        "avg_source_reliability": 0.7,
+        "avg_source_credibility": 0.7,
         "volume_ratio": 1.5,
     }
     
@@ -580,7 +583,7 @@ def test_historical_pattern_matcher_crash_pattern():
     today_profile = {
         "article_count": 50,
         "avg_composite_anomaly": 0.75,
-        "avg_source_reliability": 0.30,
+        "avg_source_credibility": 0.30,
         "volume_ratio": 6.0,
     }
     
@@ -1092,7 +1095,7 @@ def test_type_c_not_fired_when_move_fully_explained_by_sector():
     }
 
     result = detect_news_price_divergence(
-        "BUY", 0.75, 2.0, articles, reliability, market_context
+        0.75, 2.0, articles, reliability, market_context
     )
 
     assert result["detected"] is False, "Market-explained move should not trigger Type C"
@@ -1121,7 +1124,7 @@ def test_type_c_downgraded_to_high_for_partially_explained_move():
     }
 
     result = detect_news_price_divergence(
-        "BUY", 0.75, 2.5, articles, reliability, market_context
+        0.75, 2.5, articles, reliability, market_context
     )
 
     assert result["detected"] is True
@@ -1150,7 +1153,7 @@ def test_type_c_critical_preserved_for_genuine_pump_in_flat_market():
     }
 
     result = detect_news_price_divergence(
-        "BUY", 0.75, 5.0, articles, reliability, market_context
+        0.75, 5.0, articles, reliability, market_context
     )
 
     assert result["detected"] is True
@@ -1303,7 +1306,7 @@ def test_node_09b_market_context_volume_adjustment_flows_through(
     assert vol["market_context_note"] is not None
 
     # Coherence: bullish stock news against BEARISH/DOWN market context → contradiction
-    coh = bad["cross_stream_coherence"]
+    coh = bad["cross_stream_incoherence"]
     # stock_avg_anomaly is LOW in basic state so bonus may not fire,
     # but the field must be present and True
     assert coh["market_narrative_contradiction"] is True
