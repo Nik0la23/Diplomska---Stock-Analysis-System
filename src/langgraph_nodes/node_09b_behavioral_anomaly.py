@@ -67,26 +67,45 @@ def detect_volume_anomaly(
     current_volume: float,
     historical_volumes: List[float],
     baseline_days: int = 30,
+    market_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Detects volume anomalies by comparing current volume to historical baseline.
 
+    When market_context is provided, applies a beta-adjusted ratio to avoid
+    flagging high-beta stocks during broad market moves as suspicious.  The raw
+    volume_ratio is always preserved in the output; severity and score are
+    derived from market_adjusted_volume_ratio instead.
+
+    Args:
+        current_volume: Today's total trading volume.
+        historical_volumes: List of daily volumes (chronological). The last
+            ``baseline_days`` entries are used as the baseline.
+        baseline_days: Number of recent days used to compute the baseline mean.
+        market_context: Optional dict from Node 6 containing at minimum
+            ``beta`` (float), ``sector_trend`` ('UP'|'DOWN'|'FLAT'), and
+            ``sector_performance`` (float, 1-day sector ETF % change).
+
     Returns:
         Dict with keys:
             - detected: bool
-            - volume_ratio: float
+            - volume_ratio: float (raw, market-unadjusted)
+            - market_adjusted_volume_ratio: float (beta-corrected)
             - severity: 'LOW' | 'MEDIUM' | 'HIGH'
             - contribution_score: int (0-20)
             - baseline_volume: float
             - current_volume: float
+            - market_context_note: str | None
     """
     if current_volume is None or current_volume <= 0 or not historical_volumes:
         result = _neutral_detector_result()
         result.update(
             {
                 "volume_ratio": 1.0,
+                "market_adjusted_volume_ratio": 1.0,
                 "baseline_volume": 0.0,
                 "current_volume": current_volume or 0.0,
+                "market_context_note": None,
             }
         )
         return result
@@ -99,14 +118,39 @@ def detect_volume_anomaly(
 
     volume_ratio = float(current_volume) / float(baseline) if baseline > 0 else 1.0
 
-    # Severity and scoring
-    if volume_ratio < 2.0:
+    # Beta-adjusted ratio: dampen suspicion when broad market/sector movement
+    # naturally elevates volume for correlated, high-beta stocks.
+    market_adjusted_ratio = volume_ratio
+    market_context_note: Optional[str] = None
+    if market_context:
+        beta = float(market_context.get("beta", 1.0))
+        sector_trend = market_context.get("sector_trend", "FLAT")
+        sector_perf = abs(float(market_context.get("sector_performance", 0.0)))
+        if sector_trend in ("UP", "DOWN") and beta > 1.0 and sector_perf > 0:
+            # A high-beta stock in an actively moving sector trades more volume
+            # by nature.  E.g. beta=1.8, sector -4% → expected_boost ≈ 2.2x.
+            expected_boost = min(2.5, 1.0 + (beta - 1.0) * sector_perf / 2.0)
+            market_adjusted_ratio = volume_ratio / expected_boost
+            market_context_note = (
+                f"Volume partially explained by {sector_trend} sector "
+                f"({sector_perf:.1f}% move, beta={beta:.1f}); "
+                f"raw={volume_ratio:.1f}x adjusted={market_adjusted_ratio:.1f}x"
+            )
+            logger.debug(
+                f"Volume anomaly: raw_ratio={volume_ratio:.2f}, "
+                f"beta={beta:.2f}, sector_perf={sector_perf:.2f}%, "
+                f"adjusted_ratio={market_adjusted_ratio:.2f}"
+            )
+
+    # Severity and scoring use market-adjusted ratio to reduce false positives
+    # on high-beta stocks during active market sessions.
+    if market_adjusted_ratio < 2.0:
         severity = "LOW"
         score = 0
-    elif 2.0 <= volume_ratio < 4.0:
+    elif 2.0 <= market_adjusted_ratio < 4.0:
         severity = "MEDIUM"
         score = 10
-    elif 4.0 <= volume_ratio < 6.0:
+    elif 4.0 <= market_adjusted_ratio < 6.0:
         severity = "HIGH"
         score = 15
     else:  # >= 6.0
@@ -116,10 +160,12 @@ def detect_volume_anomaly(
     return {
         "detected": volume_ratio >= 2.0,
         "volume_ratio": volume_ratio,
+        "market_adjusted_volume_ratio": market_adjusted_ratio,
         "severity": severity,
         "contribution_score": score,
         "baseline_volume": baseline,
         "current_volume": current_volume,
+        "market_context_note": market_context_note,
     }
 
 
@@ -310,11 +356,45 @@ def detect_news_price_divergence(
     price_change: float,
     todays_articles: List[Dict[str, Any]],
     source_reliability_dict: Dict[str, Dict[str, Any]],
+    market_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Detect divergence between news sentiment and actual price movement.
+
+    Type C divergence — the pump-and-dump smoking gun — fires when positive
+    news from low-credibility sources coincides with a rising price.  When
+    ``market_context`` is provided the price rise is decomposed into a
+    market-driven component and an idiosyncratic (stock-specific) component.
+    Only the idiosyncratic portion triggers Type C; a move fully explained by
+    sector momentum is not flagged as suspicious.
+
+    Args:
+        sentiment_signal: Signal string from Node 5 ('POSITIVE'/'NEGATIVE'/'NEUTRAL').
+        sentiment_score: Aggregated sentiment score in [-1, +1].
+        price_change: 1-day price change in percent.
+        todays_articles: List of cleaned article dicts (from Node 9A) for the
+            stock stream.  Each dict may contain ``composite_anomaly_score``
+            and ``source`` / ``source_name`` fields.
+        source_reliability_dict: Mapping of source name → reliability metadata
+            (from Node 8), used to count credible-source corroboration.
+        market_context: Optional dict from Node 6 containing at minimum
+            ``market_correlation`` (float, 0–1) and ``sector_performance``
+            (float, 1-day sector ETF % change).
+
+    Returns:
+        Dict with keys:
+            - detected: bool
+            - divergence_type: 'A' | 'B' | 'C' | None
+            - sentiment_direction: 'positive' | 'negative' | 'neutral'
+            - price_direction: 'up' | 'down' | 'flat'
+            - credible_source_corroboration: bool
+            - severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+            - contribution_score: int (0-25)
+            - explanation: str
+            - idiosyncratic_move: float | None
     """
     sentiment_score = sentiment_score or 0.0
+    idiosyncratic_move: Optional[float] = None
 
     if sentiment_score > 0.2:
         sentiment_direction = "positive"
@@ -377,10 +457,43 @@ def detect_news_price_divergence(
             and not credible_source_corroboration
             and avg_anomaly > 0.6
         ):
-            divergence_type = "C"
-            severity = "CRITICAL"
-            score = 25
-            explanation = "Price rising on highly anomalous, low-credibility news only (pump-and-dump signal)."
+            # Decompose price move into market-driven vs stock-specific portions.
+            # Only the idiosyncratic portion constitutes a genuine pump signal;
+            # a rise fully explained by sector momentum is not suspicious.
+            if market_context:
+                market_corr = float(market_context.get("market_correlation", 0.5))
+                sector_perf = float(market_context.get("sector_performance", 0.0))
+                expected_move = sector_perf * market_corr
+                idiosyncratic_move = price_change - expected_move
+                logger.debug(
+                    f"Type C: price={price_change:.2f}%, sector={sector_perf:.2f}%, "
+                    f"corr={market_corr:.2f}, expected={expected_move:.2f}%, "
+                    f"idiosyncratic={idiosyncratic_move:.2f}%"
+                )
+            else:
+                # No market context — conservatively treat entire move as idiosyncratic.
+                idiosyncratic_move = price_change
+
+            if idiosyncratic_move > 0.5:
+                # Genuine pump: stock-specific move driven by low-credibility sources.
+                divergence_type = "C"
+                severity = "CRITICAL"
+                score = 25
+                explanation = (
+                    f"Price +{price_change:.1f}% ({idiosyncratic_move:.1f}% idiosyncratic, "
+                    f"not explained by sector) on low-credibility, highly anomalous "
+                    f"news (pump-and-dump signal)."
+                )
+            elif idiosyncratic_move > -0.5:
+                # Partial pump: move only partly explained by market momentum.
+                divergence_type = "C"
+                severity = "HIGH"
+                score = 15
+                explanation = (
+                    f"Price +{price_change:.1f}% partially explained by sector movement. "
+                    f"Low-credibility news narrative still raises manipulation suspicion."
+                )
+            # else: price move fully market-driven — not a Type C divergence.
 
     detected = divergence_type is not None
 
@@ -393,6 +506,7 @@ def detect_news_price_divergence(
         "severity": severity,
         "contribution_score": score if detected else 0,
         "explanation": explanation,
+        "idiosyncratic_move": idiosyncratic_move,
     }
 
 
@@ -408,9 +522,43 @@ def detect_cross_stream_incoherence(
     market_article_count: int,
     related_article_count: int,
     stock_avg_anomaly: float,
+    market_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Detect when stock news diverges from market/related news in suspicious ways.
+
+    The coherence score measures alignment across the three news streams.  An
+    additional market_narrative_contradiction flag catches a distinct pump
+    pattern invisible to news analysis alone: a bullish stock narrative that
+    contradicts the price-based market context from Node 6 (bearish market
+    trend, sector trending down, or a SELL context_signal).
+
+    Args:
+        stock_sentiment: Average sentiment score for stock-stream articles [-1, +1].
+        market_sentiment: Average sentiment score for market-stream articles [-1, +1].
+        related_sentiment: Average sentiment score for related-company articles [-1, +1].
+        stock_article_count: Number of stock-specific articles.
+        market_article_count: Number of market-wide articles.
+        related_article_count: Number of related-company articles.
+        stock_avg_anomaly: Mean composite_anomaly_score across stock articles
+            (from Node 9A).
+        market_context: Optional dict from Node 6 containing at minimum
+            ``market_trend`` ('BULLISH'|'BEARISH'|'NEUTRAL'),
+            ``sector_trend`` ('UP'|'DOWN'|'FLAT'), and
+            ``context_signal`` ('BUY'|'SELL'|'HOLD').
+
+    Returns:
+        Dict with keys:
+            - detected: bool
+            - coherence_score: float (0–1, higher = more coherent)
+            - stock_stream_sentiment: float
+            - market_stream_sentiment: float
+            - related_stream_sentiment: float
+            - isolated_signal: bool
+            - market_narrative_contradiction: bool
+            - severity: 'LOW' | 'MEDIUM' | 'HIGH'
+            - contribution_score: int (0-10)
+            - explanation: str
     """
     # Sentiment coherence
     stock_market_diff = abs(stock_sentiment - market_sentiment)
@@ -431,6 +579,29 @@ def detect_cross_stream_incoherence(
     if stock_article_count >= 50 and (market_article_count + related_article_count) < 10:
         isolated_signal = True
 
+    # Detect when the stock's bullish news narrative contradicts the price-based
+    # market context from Node 6.  This catches pumps hidden inside bear markets
+    # where the three news streams may appear coherent but contradict reality.
+    market_narrative_contradiction = False
+    mc_market_trend = "NEUTRAL"
+    mc_sector_trend = "FLAT"
+    mc_context_signal = "HOLD"
+    if market_context:
+        mc_market_trend = str(market_context.get("market_trend", "NEUTRAL"))
+        mc_sector_trend = str(market_context.get("sector_trend", "FLAT"))
+        mc_context_signal = str(market_context.get("context_signal", "HOLD"))
+        if stock_sentiment > 0.3 and (
+            mc_context_signal == "SELL"
+            or (mc_market_trend == "BEARISH" and mc_sector_trend == "DOWN")
+        ):
+            market_narrative_contradiction = True
+            isolated_signal = True  # treat price-context contradiction as isolation
+            logger.debug(
+                f"Market narrative contradiction: stock_sentiment={stock_sentiment:.2f}, "
+                f"market_trend={mc_market_trend}, sector_trend={mc_sector_trend}, "
+                f"context_signal={mc_context_signal}"
+            )
+
     if coherence > 0.7:
         severity = "LOW"
         score = 0
@@ -450,6 +621,11 @@ def detect_cross_stream_incoherence(
         explanation = "Stock news sentiment diverges from market/related streams."
         if isolated_signal:
             explanation += " Isolated stock-specific narrative detected."
+        if market_narrative_contradiction:
+            explanation += (
+                f" Bullish stock narrative contradicts {mc_market_trend} market "
+                f"and {mc_sector_trend} sector price context."
+            )
 
     return {
         "detected": detected,
@@ -458,6 +634,7 @@ def detect_cross_stream_incoherence(
         "market_stream_sentiment": market_sentiment,
         "related_stream_sentiment": related_sentiment,
         "isolated_signal": isolated_signal,
+        "market_narrative_contradiction": market_narrative_contradiction,
         "severity": severity,
         "contribution_score": score if detected else 0,
         "explanation": explanation,
@@ -719,8 +896,20 @@ def behavioral_anomaly_detection_node(
             "raw_sentiment_scores", []
         )
 
-        # Market context (Node 6)
+        # Market context (Node 6) — passed to volume, divergence, and coherence detectors
         market_context = state.get("market_context") or {}
+        if market_context:
+            logger.info(
+                f"Node 9B: Market context available — "
+                f"sector_trend={market_context.get('sector_trend', 'N/A')}, "
+                f"market_trend={market_context.get('market_trend', 'N/A')}, "
+                f"beta={market_context.get('beta', 'N/A')}, "
+                f"correlation={market_context.get('market_correlation', 'N/A')}"
+            )
+        else:
+            logger.warning(
+                "Node 9B: No market_context in state — market-aware adjustments disabled"
+            )
 
         # Node 8 output
         news_impact_verification = state.get("news_impact_verification", {})
@@ -793,11 +982,12 @@ def behavioral_anomaly_detection_node(
         if not historical_volumes and volume_baseline is not None:
             historical_volumes = [volume_baseline] * 30
 
-        # 1) Volume anomaly
+        # 1) Volume anomaly (beta-adjusted when market_context is available)
         volume_result = detect_volume_anomaly(
             current_volume=current_volume or 0.0,
             historical_volumes=historical_volumes,
             baseline_days=30,
+            market_context=market_context,
         )
 
         # 2) Source reliability divergence
@@ -880,16 +1070,17 @@ def behavioral_anomaly_detection_node(
                 article_time_window_days=velocity_window,
             )
 
-        # 4) News-price divergence
+        # 4) News-price divergence (Type C uses idiosyncratic move when market_context available)
         divergence_result = detect_news_price_divergence(
             sentiment_signal=sentiment_signal,
             sentiment_score=aggregated_sentiment,
             price_change=price_change_1d,
             todays_articles=cleaned_stock_news,
             source_reliability_dict=source_reliability,
+            market_context=market_context,
         )
 
-        # 5) Cross-stream coherence
+        # 5) Cross-stream coherence (market_narrative_contradiction when market_context available)
         coherence_result = detect_cross_stream_incoherence(
             stock_sentiment=stock_stream_sentiment,
             market_sentiment=market_stream_sentiment,
@@ -898,6 +1089,7 @@ def behavioral_anomaly_detection_node(
             market_article_count=len(cleaned_market_news),
             related_article_count=len(cleaned_related_news),
             stock_avg_anomaly=stock_avg_anomaly,
+            market_context=market_context,
         )
 
         # 6) Historical pattern matcher
@@ -943,9 +1135,12 @@ def behavioral_anomaly_detection_node(
         # Build user-facing alerts
         alerts: List[str] = []
         if volume_result.get("detected"):
-            alerts.append(
-                f"Volume {volume_result.get('volume_ratio', 1.0):.1f}x above 30-day baseline."
-            )
+            vol_ratio = volume_result.get("volume_ratio", 1.0)
+            vol_msg = f"Volume {vol_ratio:.1f}x above 30-day baseline"
+            note = volume_result.get("market_context_note")
+            if note:
+                vol_msg += f" ({note})"
+            alerts.append(vol_msg + ".")
         if reliability_result.get("detected"):
             divergence_pct = reliability_result.get("divergence", 0.0) * 100.0
             alerts.append(

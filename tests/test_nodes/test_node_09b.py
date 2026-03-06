@@ -998,23 +998,341 @@ def test_node_09b_no_false_alarm_normal_velocity(
     print(f"Detected:        {vel['detected']}")
 
 
+# ============================================================================
+# MARKET CONTEXT INTEGRATION TESTS (Node 6 → Node 9B improvements)
+# Tests for all three market-aware enhancements added in the Node 6 integration pass.
+# ============================================================================
+
+# ── Improvement 1: Volume Anomaly – Beta-Adjusted Ratio ──────────────────────
+
+def test_volume_anomaly_beta_adjusted_reduces_score_for_high_beta_stock():
+    """
+    High-beta stock (1.8) during a -4% sector selloff: 3x volume is natural
+    market-driven behaviour.  Beta-adjusted ratio should fall below 2.0 so the
+    score drops to 0 and severity becomes LOW.
+    """
+    historical = [1_000_000] * 30
+    current = 3_000_000  # raw ratio 3.0 → MEDIUM (10 pts) without adjustment
+
+    market_context = {
+        "beta": 1.8,
+        "sector_trend": "DOWN",
+        "sector_performance": -4.0,  # 1-day sector ETF change
+    }
+
+    result = detect_volume_anomaly(current, historical, baseline_days=30, market_context=market_context)
+
+    # expected_boost = min(2.5, 1.0 + (1.8-1.0)*4.0/2.0) = min(2.5, 2.6) = 2.5
+    # adjusted_ratio  = 3.0 / 2.5 = 1.2 → below 2.0 threshold
+    assert result["volume_ratio"] == pytest.approx(3.0, rel=0.01), "Raw ratio must be preserved"
+    assert result["market_adjusted_volume_ratio"] < 2.0, "Adjusted ratio should be < 2.0"
+    assert result["severity"] == "LOW"
+    assert result["contribution_score"] == 0
+    assert result["detected"] is True, "Still detected (raw) for transparency"
+    assert result["market_context_note"] is not None
+    assert "DOWN" in result["market_context_note"]
+
+
+def test_volume_anomaly_low_beta_flat_market_score_unchanged():
+    """
+    Low-beta stock (0.7) in a flat sector: no adjustment applies.
+    Original MEDIUM scoring behaviour must be preserved.
+    """
+    historical = [1_000_000] * 30
+    current = 3_000_000  # raw ratio 3.0
+
+    market_context = {
+        "beta": 0.7,           # beta <= 1.0 → no adjustment
+        "sector_trend": "FLAT",
+        "sector_performance": 0.2,
+    }
+
+    result = detect_volume_anomaly(current, historical, baseline_days=30, market_context=market_context)
+
+    assert result["market_adjusted_volume_ratio"] == pytest.approx(result["volume_ratio"], rel=0.01)
+    assert result["severity"] == "MEDIUM"
+    assert result["contribution_score"] == 10
+    assert result["market_context_note"] is None
+
+
+def test_volume_anomaly_output_always_contains_new_fields():
+    """
+    New output fields market_adjusted_volume_ratio and market_context_note
+    must be present regardless of whether market_context is supplied.
+    """
+    result_no_ctx = detect_volume_anomaly(2_000_000, [1_000_000] * 30)
+    assert "market_adjusted_volume_ratio" in result_no_ctx
+    assert "market_context_note" in result_no_ctx
+    assert result_no_ctx["market_context_note"] is None
+
+    result_early_exit = detect_volume_anomaly(0, [])
+    assert "market_adjusted_volume_ratio" in result_early_exit
+    assert "market_context_note" in result_early_exit
+
+
+# ── Improvement 2: News-Price Divergence – Idiosyncratic Move (Type C) ───────
+
+def test_type_c_not_fired_when_move_fully_explained_by_sector():
+    """
+    If sector is up 4% and the stock (corr=0.9) moves up 2%:
+    expected_move = 4.0 * 0.9 = 3.6%  →  idiosyncratic = 2.0 - 3.6 = -1.6%
+    The move is fully market-driven → Type C must NOT fire.
+    """
+    articles = [
+        {"source": "pump-blog.com", "composite_anomaly_score": 0.82},
+        {"source": "fake-news.net", "composite_anomaly_score": 0.78},
+    ]
+    reliability = {
+        "pump-blog.com": {"accuracy_rate": 0.28},
+        "fake-news.net": {"accuracy_rate": 0.22},
+    }
+    market_context = {
+        "market_correlation": 0.9,
+        "sector_performance": 4.0,  # sector up 4%
+    }
+
+    result = detect_news_price_divergence(
+        "BUY", 0.75, 2.0, articles, reliability, market_context
+    )
+
+    assert result["detected"] is False, "Market-explained move should not trigger Type C"
+    assert result["divergence_type"] is None
+    assert result["contribution_score"] == 0
+    assert result["idiosyncratic_move"] is not None
+    assert result["idiosyncratic_move"] < -0.5
+
+
+def test_type_c_downgraded_to_high_for_partially_explained_move():
+    """
+    Sector up 3%, corr=0.7 → expected_move=2.1%, idiosyncratic = 2.5-2.1 = 0.4%
+    Move is only partially idiosyncratic → Type C fires at HIGH (15 pts), not CRITICAL.
+    """
+    articles = [
+        {"source": "pump-blog.com", "composite_anomaly_score": 0.82},
+        {"source": "fake-news.net", "composite_anomaly_score": 0.78},
+    ]
+    reliability = {
+        "pump-blog.com": {"accuracy_rate": 0.28},
+        "fake-news.net": {"accuracy_rate": 0.22},
+    }
+    market_context = {
+        "market_correlation": 0.7,
+        "sector_performance": 3.0,
+    }
+
+    result = detect_news_price_divergence(
+        "BUY", 0.75, 2.5, articles, reliability, market_context
+    )
+
+    assert result["detected"] is True
+    assert result["divergence_type"] == "C"
+    assert result["severity"] == "HIGH"        # downgraded from CRITICAL
+    assert result["contribution_score"] == 15   # reduced from 25
+    assert -0.5 < result["idiosyncratic_move"] <= 0.5
+
+
+def test_type_c_critical_preserved_for_genuine_pump_in_flat_market():
+    """
+    Sector barely moves (0.2%), corr=0.15 → expected_move≈0.03%, idiosyncratic≈5%.
+    True pump signal: Type C must remain CRITICAL at 25 pts.
+    """
+    articles = [
+        {"source": "pump-blog.com", "composite_anomaly_score": 0.82},
+        {"source": "fake-news.net", "composite_anomaly_score": 0.78},
+    ]
+    reliability = {
+        "pump-blog.com": {"accuracy_rate": 0.28},
+        "fake-news.net": {"accuracy_rate": 0.22},
+    }
+    market_context = {
+        "market_correlation": 0.15,
+        "sector_performance": 0.2,
+    }
+
+    result = detect_news_price_divergence(
+        "BUY", 0.75, 5.0, articles, reliability, market_context
+    )
+
+    assert result["detected"] is True
+    assert result["divergence_type"] == "C"
+    assert result["severity"] == "CRITICAL"
+    assert result["contribution_score"] == 25
+    assert result["idiosyncratic_move"] > 4.0
+
+
+# ── Improvement 3: Cross-Stream Coherence – Market Narrative Contradiction ────
+
+def test_coherence_contradiction_detected_in_bearish_market():
+    """
+    Bullish stock narrative (sentiment=0.6) during a BEARISH market / DOWN sector
+    should set market_narrative_contradiction=True and isolated_signal=True,
+    triggering detection even when news streams are otherwise coherent.
+    """
+    result = detect_cross_stream_incoherence(
+        stock_sentiment=0.6,
+        market_sentiment=0.4,
+        related_sentiment=0.35,
+        stock_article_count=15,
+        market_article_count=8,
+        related_article_count=5,
+        stock_avg_anomaly=0.7,   # > 0.6 → +2 bonus fires
+        market_context={
+            "market_trend": "BEARISH",
+            "sector_trend": "DOWN",
+            "context_signal": "SELL",
+        },
+    )
+
+    assert result["market_narrative_contradiction"] is True
+    assert result["isolated_signal"] is True
+    assert result["detected"] is True
+    assert result["contribution_score"] >= 2   # bonus fires: isolated + anomaly > 0.6
+    assert "BEARISH" in result["explanation"] or "bearish" in result["explanation"].lower()
+
+
+def test_coherence_no_contradiction_when_market_is_bullish():
+    """
+    Bullish stock narrative during a BULLISH market / UP sector should NOT
+    set market_narrative_contradiction.  Market confirms the narrative.
+    """
+    result = detect_cross_stream_incoherence(
+        stock_sentiment=0.6,
+        market_sentiment=0.5,
+        related_sentiment=0.45,
+        stock_article_count=15,
+        market_article_count=8,
+        related_article_count=5,
+        stock_avg_anomaly=0.3,
+        market_context={
+            "market_trend": "BULLISH",
+            "sector_trend": "UP",
+            "context_signal": "BUY",
+        },
+    )
+
+    assert result["market_narrative_contradiction"] is False
+    # News streams are coherent and market confirms → not detected
+    assert result["detected"] is False
+
+
+def test_coherence_new_field_present_without_market_context():
+    """
+    market_narrative_contradiction must appear in the output even when
+    market_context is omitted (backward-compatibility guarantee).
+    """
+    result = detect_cross_stream_incoherence(
+        stock_sentiment=0.5,
+        market_sentiment=0.4,
+        related_sentiment=0.45,
+        stock_article_count=10,
+        market_article_count=8,
+        related_article_count=5,
+        stock_avg_anomaly=0.2,
+    )
+
+    assert "market_narrative_contradiction" in result
+    assert result["market_narrative_contradiction"] is False
+
+
+# ── Integration: full node execution with market_context in state ─────────────
+
+@patch("src.langgraph_nodes.node_09b_behavioral_anomaly.get_historical_daily_aggregates")
+@patch("src.langgraph_nodes.node_09b_behavioral_anomaly.get_volume_baseline")
+@patch("src.langgraph_nodes.node_09b_behavioral_anomaly.get_article_count_baseline")
+def test_node_09b_market_context_volume_adjustment_flows_through(
+    mock_article_baseline, mock_volume_baseline, mock_historical
+):
+    """
+    Full-node integration: market_context present in state → volume detector
+    receives it, applies beta adjustment, and contribution_score reflects the
+    market-explained nature of the volume spike.
+
+    Setup: beta=1.8, sector DOWN 4%, volume 3x → adjusted ratio ≈ 1.2 → LOW.
+    Without market context this would score MEDIUM (10 pts).
+    """
+    mock_volume_baseline.return_value = 1_000_000
+    mock_article_baseline.return_value = 8.0
+    mock_historical.return_value = []
+
+    state = _build_basic_state()
+
+    state["market_context"] = {
+        "sector": "Technology",
+        "industry": "Semiconductors",
+        "sector_performance": -4.0,
+        "sector_trend": "DOWN",
+        "market_trend": "BEARISH",
+        "market_performance": -2.5,
+        "related_companies_signals": [],
+        "related_companies_avg": -1.5,
+        "related_companies_signal": "BEARISH",
+        "market_correlation": 0.85,
+        "correlation_strength": "HIGH",
+        "beta": 1.8,
+        "context_signal": "SELL",
+        "confidence": 72.0,
+    }
+
+    # Raise sentiment above 0.3 so the market_narrative_contradiction threshold fires.
+    # (base state uses 0.2 which is below the >0.3 check in detect_cross_stream_incoherence)
+    state["aggregated_sentiment"] = 0.5
+    state["sentiment_signal"] = "POSITIVE"
+
+    # Volume 3x: should be adjusted to ~1.2x for beta=1.8 in a -4% sector
+    state["raw_price_data"] = pd.DataFrame({
+        "date": pd.date_range("2024-01-01", periods=31, freq="D"),
+        "open":   [100.0] * 31,
+        "high":   [101.0] * 31,
+        "low":    [99.0]  * 31,
+        "close":  [100.0] * 30 + [96.0],   # -4% today (market-driven)
+        "volume": [1_000_000] * 30 + [3_000_000],
+    })
+
+    result = behavioral_anomaly_detection_node(state)
+    bad = result["behavioral_anomaly_detection"]
+    vol = bad["volume_anomaly"]
+
+    assert vol["volume_ratio"] == pytest.approx(3.0, rel=0.1), \
+        "Raw ratio must be preserved for transparency"
+    assert vol["market_adjusted_volume_ratio"] < 2.0, \
+        f"Adjusted ratio should be < 2.0, got {vol['market_adjusted_volume_ratio']:.2f}"
+    assert vol["severity"] == "LOW", \
+        f"Market-driven volume should be LOW, got {vol['severity']}"
+    assert vol["contribution_score"] == 0, \
+        f"Market-driven volume should score 0 pts, got {vol['contribution_score']}"
+    assert vol["market_context_note"] is not None
+
+    # Coherence: bullish stock news against BEARISH/DOWN market context → contradiction
+    coh = bad["cross_stream_coherence"]
+    # stock_avg_anomaly is LOW in basic state so bonus may not fire,
+    # but the field must be present and True
+    assert coh["market_narrative_contradiction"] is True
+
+    print(f"\n=== MARKET CONTEXT INTEGRATION TEST ===")
+    print(f"Volume raw={vol['volume_ratio']:.1f}x  adjusted={vol['market_adjusted_volume_ratio']:.2f}x  score={vol['contribution_score']}")
+    print(f"Volume note: {vol['market_context_note']}")
+    print(f"Market narrative contradiction: {coh['market_narrative_contradiction']}")
+    print(f"Overall risk: {bad['risk_level']}  score={bad['pump_and_dump_score']}")
+
+
 def test_summary_print_test_coverage():
     """Print summary of test coverage for thesis documentation."""
     print("\n" + "="*70)
     print("NODE 9B TEST COVERAGE SUMMARY")
     print("="*70)
     print("\nDetection Systems Tested:")
-    print("  ✓ Volume Anomaly (4 tests)")
+    print("  ✓ Volume Anomaly (4 original + 3 market-context = 7 tests)")
     print("  ✓ Source Reliability Divergence (3 tests)")
     print("  ✓ News Velocity Anomaly (3 tests)")
-    print("  ✓ News-Price Divergence (4 tests including Type C)")
-    print("  ✓ Cross-Stream Coherence (2 tests)")
+    print("  ✓ News-Price Divergence (4 original + 3 idiosyncratic-move = 7 tests)")
+    print("  ✓ Cross-Stream Coherence (2 original + 3 market-contradiction = 5 tests)")
     print("  ✓ Historical Pattern Matcher (2 tests)")
     print("  ✓ Composite Scorer (4 tests)")
     print("\nIntegration Scenarios:")
     print("  ✓ Full pump-and-dump detection (THESIS SHOWCASE)")
     print("  ✓ Legitimate high-volume news (false positive check)")
     print("  ✓ Risk level threshold boundaries")
+    print("  ✓ Market context volume adjustment flows through full node")
     print("\nEdge Cases:")
     print("  ✓ Missing price data")
     print("  ✓ Empty news lists")
@@ -1022,7 +1340,7 @@ def test_summary_print_test_coverage():
     print("  ✓ Malformed articles")
     print("  ✓ State immutability")
     print("  ✓ Execution time performance")
-    print("\nTotal Tests: 27")
+    print("\nTotal Tests: 37 (27 original + 10 market-context improvements)")
     print("="*70 + "\n")
-    
+
     assert True  # This test always passes, just for documentation
