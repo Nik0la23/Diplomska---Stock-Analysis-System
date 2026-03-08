@@ -2,15 +2,18 @@
 Tests for Node 11: Adaptive Weights Calculation
 
 Covers:
-- _compute_weighted_accuracy: all source labels, 70/30 math, edge cases
-- calculate_adaptive_weights: normalization, neutral-stream mixing, sum-to-1
+- _bayesian_smooth: basic smoothing math, edge cases
+- _compute_weighted_accuracy: all source labels, 70/30 + smoothing math, edge cases
+- _compute_per_stream_adjustments: per-stream Node 8 multipliers, fallback
+- calculate_adaptive_weights: normalization, zero-total guard, Node 8 adjustments
 - adaptive_weights_node (main): full flow, missing backtest, fallback equal weights,
   error isolation, design contract verification
 
 Design contract verified throughout:
 - Node 11 is the ONLY place 70/30 recency weighting is applied
-- Neutral weight 0.5 for insufficient / insignificant / missing streams
-- Equal weights 0.25 each when backtest_results is None
+- Bayesian smoothing pulls accuracy toward 0.5 proportional to sample size
+- NEUTRAL_ACCURACY == 0.0: unreliable streams contribute NOTHING to normalization
+- Equal-weight fallback (0.25) when all streams are neutral (total == 0) or on error
 - Weights always sum to 1.0
 - adaptive_weights written to state even on failure
 """
@@ -26,8 +29,11 @@ from src.langgraph_nodes.node_11_adaptive_weights import (
     MIN_ADJUSTED_ACCURACY,
     NEUTRAL_ACCURACY,
     NEWS_STREAM_KEYS,
+    PRIOR_STRENGTH,
     RECENCY_WEIGHT,
     STREAM_KEYS,
+    _bayesian_smooth,
+    _compute_per_stream_adjustments,
     _compute_weighted_accuracy,
     adaptive_weights_node,
     calculate_adaptive_weights,
@@ -39,6 +45,27 @@ from src.langgraph_nodes.node_11_adaptive_weights import (
 # ============================================================================
 
 
+def _smooth(acc: float, n: int) -> float:
+    """Mirror of _bayesian_smooth for computing expected values in tests."""
+    if n <= 0:
+        return 0.5
+    return (acc * n + 0.5 * PRIOR_STRENGTH) / (n + PRIOR_STRENGTH)
+
+
+def _expected_wa(
+    full_acc: float,
+    recent_acc: float | None,
+    n_full: int = 120,
+    n_recent: int = 30,
+) -> float:
+    """Expected weighted accuracy after smoothing and 70/30 blending."""
+    s_full = _smooth(full_acc, n_full)
+    if recent_acc is None:
+        return s_full
+    s_recent = _smooth(recent_acc, n_recent)
+    return RECENCY_WEIGHT * s_recent + FULL_WEIGHT * s_full
+
+
 def _make_stream_metrics(
     full_accuracy: float = 0.60,
     recent_accuracy: float = 0.65,
@@ -46,8 +73,15 @@ def _make_stream_metrics(
     is_sufficient: bool = True,
     is_significant: bool = True,
     p_value: float = 0.02,
+    total_days_evaluated: int = 120,
+    recent_days_evaluated: int = 30,
 ) -> dict:
-    """Return a minimal stream_metrics dict as Node 10 would produce."""
+    """Return a minimal stream_metrics dict as Node 10 would produce.
+
+    total_days_evaluated=120 and recent_days_evaluated=30 are realistic for
+    180 days of backtesting. Bayesian smoothing uses these to pull accuracy
+    toward 0.5. Without them (n=0) every stream collapses to 0.5.
+    """
     return {
         "full_accuracy": full_accuracy,
         "recent_accuracy": recent_accuracy,
@@ -55,6 +89,8 @@ def _make_stream_metrics(
         "buy_count": signal_count // 2,
         "sell_count": signal_count // 2,
         "hold_count": 10,
+        "total_days_evaluated": total_days_evaluated,
+        "recent_days_evaluated": recent_days_evaluated,
         "is_sufficient": is_sufficient,
         "is_significant": is_significant,
         "p_value": p_value,
@@ -112,53 +148,106 @@ def _make_base_state(
 
 
 # ============================================================================
+# 0. _bayesian_smooth
+# ============================================================================
+
+
+class TestBayesianSmooth:
+
+    def test_zero_n_returns_half(self):
+        """n=0 → return 0.5 (no data, full prior)."""
+        assert _bayesian_smooth(0.80, 0) == 0.5
+        assert _bayesian_smooth(0.30, 0) == 0.5
+
+    def test_negative_n_returns_half(self):
+        """Negative n treated same as 0."""
+        assert _bayesian_smooth(0.70, -5) == 0.5
+
+    def test_pulls_toward_half_for_small_n(self):
+        """Small n significantly pulls accuracy toward 0.5."""
+        result = _bayesian_smooth(0.80, 5)
+        # (0.80*5 + 0.5*PRIOR_STRENGTH) / (5 + PRIOR_STRENGTH)
+        expected = (0.80 * 5 + 0.5 * PRIOR_STRENGTH) / (5 + PRIOR_STRENGTH)
+        assert abs(result - expected) < 1e-9
+        assert 0.5 < result < 0.80  # pulled toward 0.5
+
+    def test_minimal_effect_for_large_n(self):
+        """Large n barely changes accuracy (smoothing is negligible)."""
+        result = _bayesian_smooth(0.65, 10000)
+        assert abs(result - 0.65) < 0.001
+
+    def test_formula_matches_expected(self):
+        """Formula: (acc*n + 0.5*PRIOR) / (n + PRIOR)."""
+        acc, n = 0.65, 30
+        expected = (acc * n + 0.5 * PRIOR_STRENGTH) / (n + PRIOR_STRENGTH)
+        assert abs(_bayesian_smooth(acc, n) - expected) < 1e-9
+
+    def test_above_half_stays_above_half(self):
+        """Accuracy > 0.5 stays above 0.5 after smoothing."""
+        assert _bayesian_smooth(0.70, 20) > 0.5
+
+    def test_below_half_stays_below_half(self):
+        """Accuracy < 0.5 stays below 0.5 after smoothing."""
+        assert _bayesian_smooth(0.30, 20) < 0.5
+
+    def test_exactly_half_unchanged(self):
+        """Accuracy == 0.5 stays at 0.5 (it is the prior itself)."""
+        assert abs(_bayesian_smooth(0.5, 50) - 0.5) < 1e-9
+
+
+# ============================================================================
 # 1. _compute_weighted_accuracy
 # ============================================================================
 
 
 class TestComputeWeightedAccuracy:
 
-    def test_full_calculation_applies_70_30(self):
-        """Standard case: 70/30 split is applied correctly."""
+    def test_full_calculation_applies_70_30_with_smoothing(self):
+        """Standard case: Bayesian smoothing then 70/30 split are applied correctly."""
         metrics = _make_stream_metrics(full_accuracy=0.60, recent_accuracy=0.80)
         result, source = _compute_weighted_accuracy(metrics, "test")
-        expected = 0.7 * 0.80 + 0.3 * 0.60
-        assert abs(result - expected) < 1e-9
+        expected = _expected_wa(0.60, 0.80)
+        assert abs(result - expected) < 1e-6
         assert source == "calculated"
 
-    def test_recent_accuracy_60_full_accuracy_50(self):
-        """Exact numeric check."""
+    def test_recency_accuracy_60_full_accuracy_50_smoothed(self):
+        """Numeric check with smoothing: full=0.50, recent=0.60."""
         metrics = _make_stream_metrics(full_accuracy=0.50, recent_accuracy=0.60)
         result, source = _compute_weighted_accuracy(metrics, "test")
-        assert abs(result - (0.7 * 0.60 + 0.3 * 0.50)) < 1e-9
+        expected = _expected_wa(0.50, 0.60)
+        assert abs(result - expected) < 1e-6
         assert source == "calculated"
 
     def test_none_stream_returns_neutral(self):
-        """None stream_metrics → neutral weight."""
+        """None stream_metrics → neutral weight (0.0)."""
         result, source = _compute_weighted_accuracy(None, "test")
         assert result == NEUTRAL_ACCURACY
+        assert result == 0.0
         assert source == "neutral_no_data"
 
     def test_insufficient_signals_returns_neutral(self):
-        """is_sufficient=False → neutral weight."""
+        """is_sufficient=False → neutral weight (0.0)."""
         metrics = _make_stream_metrics(is_sufficient=False, signal_count=5)
         result, source = _compute_weighted_accuracy(metrics, "test")
         assert result == NEUTRAL_ACCURACY
+        assert result == 0.0
         assert source == "neutral_insufficient"
 
     def test_insignificant_returns_neutral(self):
-        """is_significant=False → neutral weight."""
+        """is_significant=False → neutral weight (0.0)."""
         metrics = _make_stream_metrics(is_significant=False, p_value=0.30)
         result, source = _compute_weighted_accuracy(metrics, "test")
         assert result == NEUTRAL_ACCURACY
+        assert result == 0.0
         assert source == "neutral_insignificant"
 
-    def test_none_recent_accuracy_uses_full_only(self):
-        """recent_accuracy=None → falls back to full_accuracy (no 70/30)."""
+    def test_none_recent_accuracy_uses_smoothed_full_only(self):
+        """recent_accuracy=None → falls back to smoothed full_accuracy only."""
         metrics = _make_stream_metrics(full_accuracy=0.65, recent_accuracy=None)
         metrics["recent_accuracy"] = None
         result, source = _compute_weighted_accuracy(metrics, "test")
-        assert abs(result - 0.65) < 1e-9
+        expected = _smooth(0.65, 120)
+        assert abs(result - expected) < 1e-6
         assert source == "full_accuracy_only"
 
     def test_insufficient_takes_priority_over_insignificant(self):
@@ -167,26 +256,101 @@ class TestComputeWeightedAccuracy:
         _, source = _compute_weighted_accuracy(metrics, "test")
         assert source == "neutral_insufficient"
 
-    def test_equal_full_and_recent_accuracy(self):
-        """70/30 with full == recent → weighted == full == recent."""
+    def test_equal_full_and_recent_returns_smoothed_value(self):
+        """Full == recent: result equals smoothed 70/30 blend (not raw accuracy)."""
         metrics = _make_stream_metrics(full_accuracy=0.60, recent_accuracy=0.60)
         result, source = _compute_weighted_accuracy(metrics, "test")
-        assert abs(result - 0.60) < 1e-9
+        expected = _expected_wa(0.60, 0.60)
+        assert abs(result - expected) < 1e-6
         assert source == "calculated"
 
-    def test_high_volatility_stock_larger_recent_weight(self):
-        """When recent_accuracy >> full_accuracy the result is pulled toward recent."""
+    def test_high_recent_accuracy_pulls_result_toward_recent(self):
+        """When recent_accuracy >> full_accuracy, result is closer to recent (70% weight)."""
         metrics = _make_stream_metrics(full_accuracy=0.50, recent_accuracy=0.90)
         result, _ = _compute_weighted_accuracy(metrics, "test")
-        assert result > 0.50 + 0.05   # clearly above full_accuracy
-        assert result < 0.90           # below recent_accuracy
-        # 70% weight on recent → result should be closer to 0.90 than 0.50
-        mid = (0.50 + 0.90) / 2
-        assert result > mid
+        s_full = _smooth(0.50, 120)
+        s_recent = _smooth(0.90, 30)
+        mid = (s_full + s_recent) / 2
+        assert result > mid  # 70% on recent pulls it above the midpoint
+
+    def test_smoothing_applied_separately_to_full_and_recent(self):
+        """Verify smoothing uses correct n values for full vs recent."""
+        metrics = _make_stream_metrics(
+            full_accuracy=0.70, recent_accuracy=0.70,
+            total_days_evaluated=200, recent_days_evaluated=10,
+        )
+        result, _ = _compute_weighted_accuracy(metrics, "test")
+        s_full = _smooth(0.70, 200)   # large n → close to 0.70
+        s_recent = _smooth(0.70, 10)  # small n → pulled more toward 0.5
+        expected = RECENCY_WEIGHT * s_recent + FULL_WEIGHT * s_full
+        assert abs(result - expected) < 1e-6
 
 
 # ============================================================================
-# 2. calculate_adaptive_weights
+# 2. _compute_per_stream_adjustments
+# ============================================================================
+
+
+class TestComputePerStreamAdjustments:
+
+    def _niv_effectiveness(self, stock_acc=0.65, market_acc=0.55, related_acc=0.60, n=30):
+        return {
+            "stock":   {"accuracy_rate": stock_acc,   "sample_size": n},
+            "market":  {"accuracy_rate": market_acc,  "sample_size": n},
+            "related": {"accuracy_rate": related_acc, "sample_size": n},
+        }
+
+    def test_uses_per_type_accuracy_when_sufficient(self):
+        """With sufficient sample, each stream gets its own multiplier."""
+        effectiveness = self._niv_effectiveness(stock_acc=0.70, n=30)
+        adjs = _compute_per_stream_adjustments(effectiveness, 0.7, 1.0)
+        # stock multiplier = (0.70/0.50) * (0.7*2) = 1.4 * 1.4 = 1.96 → clamped to 2.0
+        stock_adj = adjs["stock_news"]
+        assert stock_adj > 1.0  # above neutral (good news type gets boosted)
+
+    def test_falls_back_when_sample_insufficient(self):
+        """If sample_size < MIN_NEWS_TYPE_SAMPLE (10), use fallback."""
+        effectiveness = {"stock": {"accuracy_rate": 0.80, "sample_size": 5}}
+        adjs = _compute_per_stream_adjustments(effectiveness, 0.7, 1.3)
+        # stock has n=5 < 10 → fallback
+        assert abs(adjs["stock_news"] - 1.3) < 1e-6
+
+    def test_empty_effectiveness_uses_fallback(self):
+        """Empty news_type_effectiveness → all streams use fallback."""
+        adjs = _compute_per_stream_adjustments({}, 0.7, 1.2)
+        for sk in NEWS_STREAM_KEYS:
+            assert abs(adjs[sk] - 1.2) < 1e-6
+
+    def test_multiplier_clamped_to_min(self):
+        """Low accuracy + low correlation → multiplier clamped to MIN_ADJ_MULTIPLIER."""
+        effectiveness = {"stock": {"accuracy_rate": 0.10, "sample_size": 50}}
+        adjs = _compute_per_stream_adjustments(effectiveness, 0.1, 1.0)
+        from src.langgraph_nodes.node_11_adaptive_weights import MIN_ADJ_MULTIPLIER
+        assert adjs["stock_news"] >= MIN_ADJ_MULTIPLIER
+
+    def test_multiplier_clamped_to_max(self):
+        """High accuracy + high correlation → multiplier clamped to MAX_ADJ_MULTIPLIER."""
+        effectiveness = {"stock": {"accuracy_rate": 1.0, "sample_size": 50}}
+        adjs = _compute_per_stream_adjustments(effectiveness, 1.0, 1.0)
+        from src.langgraph_nodes.node_11_adaptive_weights import MAX_ADJ_MULTIPLIER
+        assert adjs["stock_news"] <= MAX_ADJ_MULTIPLIER
+
+    def test_neutral_accuracy_and_correlation_gives_neutral_multiplier(self):
+        """accuracy=0.5, corr=0.5 → multiplier = 1.0 (no change)."""
+        effectiveness = {"stock": {"accuracy_rate": 0.5, "sample_size": 50}}
+        adjs = _compute_per_stream_adjustments(effectiveness, 0.5, 1.0)
+        # (0.5/0.5) * (0.5*2.0) = 1.0 * 1.0 = 1.0
+        assert abs(adjs["stock_news"] - 1.0) < 1e-6
+
+    def test_all_three_news_keys_present(self):
+        """Result always contains all 3 NEWS_STREAM_KEYS."""
+        adjs = _compute_per_stream_adjustments({}, 0.5, 1.0)
+        for sk in NEWS_STREAM_KEYS:
+            assert sk in adjs
+
+
+# ============================================================================
+# 3. calculate_adaptive_weights
 # ============================================================================
 
 
@@ -196,18 +360,13 @@ class TestCalculateAdaptiveWeights:
         """Normalization must produce weights that sum to exactly 1.0."""
         backtest = _make_backtest_results()
         weights = calculate_adaptive_weights(backtest)
-        total = (
-            weights["technical_weight"]
-            + weights["stock_news_weight"]
-            + weights["market_news_weight"]
-            + weights["related_news_weight"]
-        )
+        total = sum(weights[wk] for _, wk in STREAM_KEYS)
         assert abs(total - 1.0) < 0.001
 
     def test_higher_accuracy_gets_higher_weight(self):
         """Higher accuracy stream gets proportionally higher weight."""
         backtest = _make_backtest_results(
-            stock_full=0.80, stock_recent=0.85,    # clearly best
+            stock_full=0.80, stock_recent=0.85,   # clearly best
             tech_full=0.50,  tech_recent=0.50,    # worst
         )
         weights = calculate_adaptive_weights(backtest)
@@ -216,31 +375,32 @@ class TestCalculateAdaptiveWeights:
     def test_all_equal_accuracy_produces_equal_weights(self):
         """All streams equally accurate → each gets 25%."""
         backtest = _make_backtest_results(
-            tech_full=0.60,   tech_recent=0.60,
-            stock_full=0.60,  stock_recent=0.60,
-            market_full=0.60, market_recent=0.60,
+            tech_full=0.60,    tech_recent=0.60,
+            stock_full=0.60,   stock_recent=0.60,
+            market_full=0.60,  market_recent=0.60,
             related_full=0.60, related_recent=0.60,
         )
         weights = calculate_adaptive_weights(backtest)
         for _, wk in STREAM_KEYS:
             assert abs(weights[wk] - 0.25) < 0.001
 
-    def test_neutral_stream_gets_fair_share(self):
-        """A neutral stream shares fairly with other neutral streams."""
+    def test_all_neutral_streams_fallback_to_equal_weights(self):
+        """All neutral streams → total==0 → zero-total guard → equal weights 0.25."""
         backtest = {
             "hold_threshold_pct": 2.0,
             "sample_period_days": 180,
-            "technical":   _make_stream_metrics(is_sufficient=False),
-            "stock_news":  _make_stream_metrics(is_sufficient=False),
-            "market_news": _make_stream_metrics(is_sufficient=False),
+            "technical":    _make_stream_metrics(is_sufficient=False),
+            "stock_news":   _make_stream_metrics(is_sufficient=False),
+            "market_news":  _make_stream_metrics(is_sufficient=False),
             "related_news": _make_stream_metrics(is_sufficient=False),
         }
         weights = calculate_adaptive_weights(backtest)
         for _, wk in STREAM_KEYS:
             assert abs(weights[wk] - 0.25) < 0.001
+        assert weights["fallback_equal_weights"] is True
 
-    def test_one_neutral_stream_among_three_calculated(self):
-        """One insufficient stream lowers its weight relative to the 3 good ones."""
+    def test_neutral_stream_zero_weight_among_calculated(self):
+        """Neutral stream (0.0) gets zero weight — not diluting the 3 reliable streams."""
         backtest = _make_backtest_results(
             tech_full=0.65, tech_recent=0.65,
             stock_full=0.65, stock_recent=0.65,
@@ -248,21 +408,21 @@ class TestCalculateAdaptiveWeights:
         )
         backtest["related_news"] = _make_stream_metrics(is_sufficient=False)
         weights = calculate_adaptive_weights(backtest)
-        # Neutral accuracy = 0.5, calculated = 0.65 → related gets less
-        assert weights["related_news_weight"] < weights["technical_weight"]
+        # Neutral stream gets 0.0 weight — not a small weight, exactly 0
+        assert weights["related_news_weight"] == 0.0
+        # The 3 reliable streams share the full weight
+        assert abs(weights["related_news_weight"] - 0.0) < 1e-9
         # Weights still sum to 1
         total = sum(weights[wk] for _, wk in STREAM_KEYS)
         assert abs(total - 1.0) < 0.001
 
-    def test_all_none_streams_equal_weights(self):
-        """When all streams are None, every weight should be 0.25."""
+    def test_all_none_streams_fallback_to_equal_weights(self):
+        """When all streams are None, fallback to equal weights 0.25."""
         backtest = {
             "hold_threshold_pct": 2.0,
             "sample_period_days": 180,
-            "technical":    None,
-            "stock_news":   None,
-            "market_news":  None,
-            "related_news": None,
+            "technical": None, "stock_news": None,
+            "market_news": None, "related_news": None,
         }
         weights = calculate_adaptive_weights(backtest)
         for _, wk in STREAM_KEYS:
@@ -280,7 +440,7 @@ class TestCalculateAdaptiveWeights:
         weights = calculate_adaptive_weights(backtest)
         assert weights["sample_period_days"] == 180
 
-    def test_weighted_accuracies_present(self):
+    def test_weighted_accuracies_present_for_all_streams(self):
         """weighted_accuracies must include all 4 stream keys."""
         backtest = _make_backtest_results()
         weights = calculate_adaptive_weights(backtest)
@@ -297,7 +457,6 @@ class TestCalculateAdaptiveWeights:
     def test_streams_reliable_count_correct(self):
         """streams_reliable counts 'calculated' and 'full_accuracy_only' sources."""
         backtest = _make_backtest_results()
-        # Make one stream insufficient
         backtest["related_news"]["is_sufficient"] = False
         weights = calculate_adaptive_weights(backtest)
         assert weights["streams_reliable"] == 3
@@ -315,23 +474,27 @@ class TestCalculateAdaptiveWeights:
         backtest["stock_news"]["recent_accuracy"] = None
         weights = calculate_adaptive_weights(backtest)
         assert weights["weight_sources"]["stock_news"] == "full_accuracy_only"
-        assert weights["streams_reliable"] == 4  # all 4 still reliable
+        assert weights["streams_reliable"] == 4
 
-    def test_recency_weighting_applied_here_not_in_input(self):
-        """Verify 70/30 is applied by Node 11, not pre-applied in the input."""
-        # If the input already had weighted accuracy, this test would look different.
-        # We confirm the node receives RAW full/recent and applies the math.
+    def test_per_stream_adjustments_in_output(self):
+        """per_stream_adjustments key is present in output."""
+        backtest = _make_backtest_results()
+        weights = calculate_adaptive_weights(backtest)
+        assert "per_stream_adjustments" in weights
+
+    def test_recency_weighting_applied_with_smoothing(self):
+        """70/30 is applied by Node 11 on smoothed values from raw full/recent input."""
         backtest = _make_backtest_results(
-            tech_full=0.50, tech_recent=1.00  # extreme so result is clearly 70/30
+            tech_full=0.50, tech_recent=1.00  # extreme for clear signal
         )
         weights = calculate_adaptive_weights(backtest)
         tech_wa = weights["weighted_accuracies"]["technical"]
-        expected = 0.7 * 1.00 + 0.3 * 0.50
+        expected = _expected_wa(0.50, 1.00)
         assert abs(tech_wa - expected) < 1e-4
 
 
 # ============================================================================
-# 3. adaptive_weights_node — main node function
+# 4. adaptive_weights_node — main node function
 # ============================================================================
 
 
@@ -343,10 +506,8 @@ class TestAdaptiveWeightsNode:
         result = adaptive_weights_node(state)
         assert "adaptive_weights" in result
         aw = result["adaptive_weights"]
-        assert "technical_weight" in aw
-        assert "stock_news_weight" in aw
-        assert "market_news_weight" in aw
-        assert "related_news_weight" in aw
+        for _, wk in STREAM_KEYS:
+            assert wk in aw
 
     def test_weights_sum_to_one_in_node(self):
         """Weights from the node function always sum to 1.0."""
@@ -386,7 +547,11 @@ class TestAdaptiveWeightsNode:
 
     def test_missing_ticker_does_not_crash(self):
         """Missing ticker field is handled gracefully."""
-        state = {"backtest_results": _make_backtest_results(), "errors": [], "node_execution_times": {}}
+        state = {
+            "backtest_results": _make_backtest_results(),
+            "errors": [],
+            "node_execution_times": {},
+        }
         result = adaptive_weights_node(state)
         assert "adaptive_weights" in result
 
@@ -402,7 +567,7 @@ class TestAdaptiveWeightsNode:
     def test_higher_accuracy_stock_news_gets_highest_weight(self):
         """Stock news boosted by Node 8 learning gets the highest weight."""
         backtest = _make_backtest_results(
-            stock_full=0.73, stock_recent=0.75,   # Node 8 improved
+            stock_full=0.73, stock_recent=0.75,
             tech_full=0.55,  tech_recent=0.57,
             market_full=0.58, market_recent=0.60,
             related_full=0.60, related_recent=0.62,
@@ -419,7 +584,6 @@ class TestAdaptiveWeightsNode:
         state = _make_base_state(backtest_results="not_a_dict")
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
-        # Should fall back to equal weights
         for _, wk in STREAM_KEYS:
             assert abs(aw[wk] - EQUAL_WEIGHT) < 0.001
         assert aw["fallback_equal_weights"] is True
@@ -427,19 +591,42 @@ class TestAdaptiveWeightsNode:
 
     def test_error_message_added_on_exception(self):
         """When an exception is raised, error is appended to state['errors']."""
-        state = _make_base_state(backtest_results={"bad_key": 999})
-        # This won't crash since calculate_adaptive_weights handles missing streams as None
-        # Let's force a crash by passing a non-dict for a stream
-        state["backtest_results"]["technical"] = "invalid"
-        # calculate_adaptive_weights calls _compute_weighted_accuracy which checks for None
-        # "invalid" string is truthy, so it will try .get() on a string → AttributeError
+        state = _make_base_state(backtest_results="garbage")
         result = adaptive_weights_node(state)
-        # Should still return valid state (fallback)
         assert "adaptive_weights" in result
+
+    def test_historical_correlation_in_output(self):
+        """historical_correlation from Node 8 is recorded in adaptive_weights."""
+        niv = {"learning_adjustment": 1.0, "historical_correlation": 0.72}
+        state = _make_base_state(_make_backtest_results(), niv)
+        result = adaptive_weights_node(state)
+        assert "historical_correlation" in result["adaptive_weights"]
+        assert abs(result["adaptive_weights"]["historical_correlation"] - 0.72) < 1e-4
+
+    def test_historical_correlation_defaults_to_half_without_node8(self):
+        """Missing news_impact_verification → historical_correlation defaults to 0.5."""
+        state = _make_base_state(_make_backtest_results())
+        result = adaptive_weights_node(state)
+        assert abs(result["adaptive_weights"]["historical_correlation"] - 0.5) < 1e-6
+
+    def test_per_stream_adjustments_in_output(self):
+        """per_stream_adjustments is present in adaptive_weights output."""
+        niv = {
+            "learning_adjustment": 1.2,
+            "historical_correlation": 0.6,
+            "news_type_effectiveness": {
+                "stock":   {"accuracy_rate": 0.65, "sample_size": 30},
+                "market":  {"accuracy_rate": 0.55, "sample_size": 30},
+                "related": {"accuracy_rate": 0.58, "sample_size": 30},
+            },
+        }
+        state = _make_base_state(_make_backtest_results(), niv)
+        result = adaptive_weights_node(state)
+        assert "per_stream_adjustments" in result["adaptive_weights"]
 
 
 # ============================================================================
-# 4. Design Contract Verification
+# 5. Design Contract Verification
 # ============================================================================
 
 
@@ -447,30 +634,23 @@ class TestDesignContract:
 
     def test_node_11_is_sole_applier_of_recency_weighting(self):
         """
-        The 70/30 recency weighting must NOT appear in backtest_results.
-        It is applied ONLY here in Node 11.
+        The 70/30 recency weighting + smoothing is applied ONLY in Node 11.
+        Input has raw full/recent; output has smoothed weighted value.
         """
-        backtest = _make_backtest_results(
-            tech_full=0.50, tech_recent=0.80
-        )
-        # Verify the input has raw full/recent, not pre-weighted
+        backtest = _make_backtest_results(tech_full=0.50, tech_recent=0.80)
         assert "full_accuracy" in backtest["technical"]
         assert "recent_accuracy" in backtest["technical"]
         assert "weighted_accuracy" not in backtest["technical"]
 
-        # After Node 11, the weighted value is in weighted_accuracies
         state = _make_base_state(backtest)
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
-        expected_wa = 0.7 * 0.80 + 0.3 * 0.50
+        expected_wa = _expected_wa(0.50, 0.80)
         actual_wa = aw["weighted_accuracies"]["technical"]
         assert abs(actual_wa - expected_wa) < 1e-4
 
     def test_weights_always_provided_even_on_failure(self):
-        """
-        adaptive_weights is ALWAYS written to state — Node 12 must always
-        find it, even when Node 11 encounters errors.
-        """
+        """adaptive_weights is ALWAYS written to state — Node 12 must always find it."""
         state = _make_base_state(backtest_results="garbage")
         result = adaptive_weights_node(state)
         assert "adaptive_weights" in result
@@ -478,22 +658,18 @@ class TestDesignContract:
             assert wk in result["adaptive_weights"]
 
     def test_equal_weights_when_no_reliable_data(self):
-        """
-        When no reliable historical data exists (new stock), equal weights
-        provide a fair starting point — not biased toward any stream.
-        """
+        """When no reliable historical data exists, equal weights are fair starting point."""
         state = _make_base_state(backtest_results=None)
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
         weights = [aw[wk] for _, wk in STREAM_KEYS]
         assert all(abs(w - 0.25) < 0.001 for w in weights)
-        # Sum still 1.0
         assert abs(sum(weights) - 1.0) < 0.001
 
-    def test_neutral_streams_get_smaller_weight_than_reliable(self):
+    def test_neutral_streams_get_zero_weight(self):
         """
-        Neutral (0.5) stream must get a smaller weight than a calculated (0.65+) stream.
-        This ensures unreliable streams are penalized.
+        Neutral (0.0) stream must get ZERO weight — it drops out of normalization.
+        This concentrates weight on reliable streams exclusively.
         """
         backtest = _make_backtest_results(
             tech_full=0.65, tech_recent=0.65,
@@ -504,8 +680,8 @@ class TestDesignContract:
         state = _make_base_state(backtest)
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
+        assert aw["related_news_weight"] == 0.0
         assert aw["related_news_weight"] < aw["technical_weight"]
-        assert aw["related_news_weight"] < aw["stock_news_weight"]
 
     def test_weights_bounded_between_0_and_1(self):
         """Every weight must be in [0, 1]."""
@@ -517,28 +693,38 @@ class TestDesignContract:
             assert 0.0 <= w <= 1.0
 
     def test_recency_weight_constant_is_70_pct(self):
-        """RECENCY_WEIGHT must be 0.7 — sanity check for constant."""
         assert abs(RECENCY_WEIGHT - 0.7) < 1e-9
 
     def test_full_weight_constant_is_30_pct(self):
-        """FULL_WEIGHT must be 0.3 — sanity check for constant."""
         assert abs(FULL_WEIGHT - 0.3) < 1e-9
 
     def test_recency_and_full_weights_sum_to_one(self):
-        """RECENCY_WEIGHT + FULL_WEIGHT == 1.0."""
         assert abs(RECENCY_WEIGHT + FULL_WEIGHT - 1.0) < 1e-9
 
-    def test_neutral_accuracy_is_coin_flip(self):
-        """NEUTRAL_ACCURACY == 0.5 (random baseline)."""
-        assert abs(NEUTRAL_ACCURACY - 0.5) < 1e-9
+    def test_neutral_accuracy_is_zero(self):
+        """NEUTRAL_ACCURACY == 0.0: unreliable streams drop out of normalization."""
+        assert NEUTRAL_ACCURACY == 0.0
 
     def test_equal_weight_is_one_quarter(self):
         """EQUAL_WEIGHT == 0.25 for 4 streams."""
         assert abs(EQUAL_WEIGHT - 0.25) < 1e-9
 
+    def test_all_neutral_triggers_zero_total_fallback(self):
+        """With NEUTRAL_ACCURACY=0.0, all neutral → total=0 → equal-weight fallback."""
+        backtest = {
+            "hold_threshold_pct": 2.0,
+            "sample_period_days": 180,
+            "technical": None, "stock_news": None,
+            "market_news": None, "related_news": None,
+        }
+        weights = calculate_adaptive_weights(backtest)
+        assert weights["fallback_equal_weights"] is True
+        for _, wk in STREAM_KEYS:
+            assert abs(weights[wk] - EQUAL_WEIGHT) < 0.001
+
 
 # ============================================================================
-# 5. Integration / Thesis Validation
+# 6. Integration / Thesis Validation
 # ============================================================================
 
 
@@ -551,7 +737,6 @@ class TestIntegration:
         This is a KEY thesis demonstration.
         """
         backtest = _make_backtest_results(
-            # Node 8 boosted stock_news significantly
             stock_full=0.73,  stock_recent=0.75,
             tech_full=0.55,   tech_recent=0.57,
             market_full=0.58, market_recent=0.60,
@@ -560,34 +745,24 @@ class TestIntegration:
         state = _make_base_state(backtest)
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
-
-        # Stock news should have the highest weight
-        assert aw["stock_news_weight"] == max(
-            aw["technical_weight"],
-            aw["stock_news_weight"],
-            aw["market_news_weight"],
-            aw["related_news_weight"],
-        )
+        assert aw["stock_news_weight"] == max(aw[wk] for _, wk in STREAM_KEYS)
 
     def test_weight_improves_with_node8_vs_without(self):
-        """
-        Stock news weight should be higher AFTER Node 8 learning
-        compared to a baseline without learning.
-        """
-        backtest_without_node8 = _make_backtest_results(
-            stock_full=0.62, stock_recent=0.62,  # baseline
+        """Stock news weight should be higher AFTER Node 8 learning."""
+        backtest_without = _make_backtest_results(
+            stock_full=0.62, stock_recent=0.62,
             tech_full=0.60,  tech_recent=0.60,
             market_full=0.60, market_recent=0.60,
             related_full=0.60, related_recent=0.60,
         )
-        backtest_with_node8 = _make_backtest_results(
-            stock_full=0.73, stock_recent=0.75,  # boosted by Node 8
+        backtest_with = _make_backtest_results(
+            stock_full=0.73, stock_recent=0.75,
             tech_full=0.60,  tech_recent=0.60,
             market_full=0.60, market_recent=0.60,
             related_full=0.60, related_recent=0.60,
         )
-        result_without = adaptive_weights_node(_make_base_state(backtest_without_node8))
-        result_with = adaptive_weights_node(_make_base_state(backtest_with_node8))
+        result_without = adaptive_weights_node(_make_base_state(backtest_without))
+        result_with = adaptive_weights_node(_make_base_state(backtest_with))
 
         w_without = result_without["adaptive_weights"]["stock_news_weight"]
         w_with = result_with["adaptive_weights"]["stock_news_weight"]
@@ -595,20 +770,14 @@ class TestIntegration:
 
     def test_volatile_stock_recency_matters_more(self):
         """
-        For volatile stocks, recent performance differs from full-period —
-        confirming the 70/30 split does something meaningful.
+        For a stream improving recently, the 70/30 split yields higher weighted
+        accuracy than a stable stream — confirming recency weighting is meaningful.
         """
-        backtest_stable = _make_backtest_results(
-            tech_full=0.65, tech_recent=0.65,  # same
-        )
-        backtest_improving = _make_backtest_results(
-            tech_full=0.55, tech_recent=0.75,  # recent much better
-        )
+        backtest_stable = _make_backtest_results(tech_full=0.65, tech_recent=0.65)
+        backtest_improving = _make_backtest_results(tech_full=0.55, tech_recent=0.75)
 
         wa_stable = calculate_adaptive_weights(backtest_stable)["weighted_accuracies"]["technical"]
         wa_improving = calculate_adaptive_weights(backtest_improving)["weighted_accuracies"]["technical"]
-
-        # Improving recent should yield higher weighted accuracy
         assert wa_improving > wa_stable
 
     def test_all_four_weight_keys_present(self):
@@ -616,23 +785,19 @@ class TestIntegration:
         state = _make_base_state(_make_backtest_results())
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
-        required_keys = [
-            "technical_weight",
-            "stock_news_weight",
-            "market_news_weight",
-            "related_news_weight",
+        required = [
+            "technical_weight", "stock_news_weight",
+            "market_news_weight", "related_news_weight",
         ]
-        for key in required_keys:
+        for key in required:
             assert key in aw, f"Missing key: {key}"
 
     def test_streams_reliable_reflects_actual_data_quality(self):
         """streams_reliable gives Node 12 a data quality indicator."""
-        # All 4 reliable
         backtest_good = _make_backtest_results()
         result_good = adaptive_weights_node(_make_base_state(backtest_good))
         assert result_good["adaptive_weights"]["streams_reliable"] == 4
 
-        # Only 2 reliable
         backtest_partial = _make_backtest_results()
         backtest_partial["market_news"]["is_sufficient"] = False
         backtest_partial["related_news"]["is_significant"] = False
@@ -641,15 +806,14 @@ class TestIntegration:
 
 
 # ============================================================================
-# 6. Learning Adjustment (Node 8 integration)
+# 7. Learning Adjustment (Node 8 integration)
 # ============================================================================
 
 
 class TestLearningAdjustment:
     """
-    Option B: Node 8's learning_adjustment is a capped multiplier applied to
-    the 3 news stream weighted-accuracies before normalization.
-    Technical stream is NOT affected.
+    Node 8's learning_adjustment is a capped multiplier applied to the 3 news
+    stream weighted-accuracies before normalization. Technical stream is NOT affected.
     """
 
     def _niv(self, adjustment: float) -> dict:
@@ -665,11 +829,7 @@ class TestLearningAdjustment:
         )
 
         def avg_news(aw):
-            return (
-                aw["stock_news_weight"]
-                + aw["market_news_weight"]
-                + aw["related_news_weight"]
-            ) / 3
+            return (aw["stock_news_weight"] + aw["market_news_weight"] + aw["related_news_weight"]) / 3
 
         assert avg_news(result_adj["adaptive_weights"]) > avg_news(result_no["adaptive_weights"])
 
@@ -682,15 +842,11 @@ class TestLearningAdjustment:
         )
 
         def avg_news(aw):
-            return (
-                aw["stock_news_weight"]
-                + aw["market_news_weight"]
-                + aw["related_news_weight"]
-            ) / 3
+            return (aw["stock_news_weight"] + aw["market_news_weight"] + aw["related_news_weight"]) / 3
 
         assert avg_news(result_adj["adaptive_weights"]) < avg_news(result_no["adaptive_weights"])
 
-    def test_technical_stream_unaffected(self):
+    def test_technical_stream_unaffected_by_adjustment(self):
         """weighted_accuracies['technical'] must be identical with and without adjustment."""
         backtest = _make_backtest_results()
         result_no = adaptive_weights_node(_make_base_state(deepcopy(backtest)))
@@ -745,10 +901,36 @@ class TestLearningAdjustment:
         assert abs(result["adaptive_weights"]["learning_adjustment_applied"] - 1.3) < 1e-4
 
     def test_neutral_streams_not_adjusted(self):
-        """Insufficient streams (neutral 0.5) stay at NEUTRAL_ACCURACY regardless of boost."""
+        """Neutral (0.0) streams are skipped — boost cannot re-introduce them."""
         backtest = _make_backtest_results()
         backtest["stock_news"] = _make_stream_metrics(is_sufficient=False)
         state = _make_base_state(backtest, self._niv(2.0))
         result = adaptive_weights_node(state)
         wa = result["adaptive_weights"]["weighted_accuracies"]["stock_news"]
-        assert abs(wa - NEUTRAL_ACCURACY) < 1e-6
+        assert abs(wa - NEUTRAL_ACCURACY) < 1e-6  # NEUTRAL_ACCURACY == 0.0
+        assert wa == 0.0
+
+    def test_per_stream_adjustments_differ_with_news_type_effectiveness(self):
+        """
+        Different news types get different multipliers when Node 8 provides
+        per-type effectiveness data. Stock news with higher accuracy gets a
+        larger multiplier than market news with lower accuracy.
+        """
+        niv = {
+            "learning_adjustment": 1.0,
+            "historical_correlation": 0.7,
+            "news_type_effectiveness": {
+                "stock":   {"accuracy_rate": 0.75, "sample_size": 50},
+                "market":  {"accuracy_rate": 0.45, "sample_size": 50},
+                "related": {"accuracy_rate": 0.60, "sample_size": 50},
+            },
+        }
+        backtest = _make_backtest_results(
+            stock_full=0.60, stock_recent=0.60,
+            market_full=0.60, market_recent=0.60,
+        )
+        state = _make_base_state(backtest, niv)
+        result = adaptive_weights_node(state)
+        aw = result["adaptive_weights"]
+        # Stock has higher per-type accuracy → more boosted → higher weight than market
+        assert aw["stock_news_weight"] > aw["market_news_weight"]
