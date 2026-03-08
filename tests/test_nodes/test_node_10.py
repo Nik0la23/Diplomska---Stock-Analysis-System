@@ -305,60 +305,56 @@ class TestReconstructTechnicalSignal:
 
 
 class TestAggregateDailySentiment:
-    """Per-stream daily aggregation — no 50/25/25 cross-stream weighting here."""
+    """Per-stream daily aggregation — returns a continuous score, no BUY/SELL/HOLD."""
 
-    def test_all_positive_returns_buy(self):
+    def test_all_positive_score_is_positive(self):
         articles = [
             {"sentiment_label": "positive", "sentiment_score": 0.8},
             {"sentiment_label": "positive", "sentiment_score": 0.7},
         ]
-        score, signal = aggregate_daily_sentiment(articles)
-        assert signal == "BUY"
+        score = aggregate_daily_sentiment(articles)
         assert score > 0
 
-    def test_all_negative_returns_sell(self):
+    def test_all_negative_score_is_negative(self):
         articles = [
             {"sentiment_label": "negative", "sentiment_score": 0.8},
             {"sentiment_label": "negative", "sentiment_score": 0.7},
         ]
-        score, signal = aggregate_daily_sentiment(articles)
-        assert signal == "SELL"
+        score = aggregate_daily_sentiment(articles)
         assert score < 0
 
-    def test_all_neutral_returns_hold(self):
+    def test_all_neutral_score_is_zero(self):
         articles = [
             {"sentiment_label": "neutral", "sentiment_score": 0.5},
             {"sentiment_label": "neutral", "sentiment_score": 0.6},
         ]
-        score, signal = aggregate_daily_sentiment(articles)
-        assert signal == "HOLD"
+        score = aggregate_daily_sentiment(articles)
+        assert score == 0.0
 
     def test_mixed_signals_averages_correctly(self):
-        """One strong positive + one strong negative = near zero = HOLD."""
+        """One strong positive + one strong negative = near zero."""
         articles = [
             {"sentiment_label": "positive", "sentiment_score": 0.8},
             {"sentiment_label": "negative", "sentiment_score": 0.8},
         ]
-        score, signal = aggregate_daily_sentiment(articles)
-        # scores: +0.8 + (-0.8) = 0.0 average → HOLD
-        assert signal == "HOLD"
+        score = aggregate_daily_sentiment(articles)
+        # scores: +0.8 + (-0.8) = 0.0 average
         assert abs(score) < 0.01
 
-    def test_empty_list_returns_hold(self):
-        score, signal = aggregate_daily_sentiment([])
-        assert signal == "HOLD"
+    def test_empty_list_returns_zero(self):
+        score = aggregate_daily_sentiment([])
         assert score == 0.0
 
     def test_missing_sentiment_fields_uses_defaults(self):
         articles = [{"title": "Article with no sentiment fields"}]
-        score, signal = aggregate_daily_sentiment(articles)
-        assert signal in ("BUY", "SELL", "HOLD")
+        score = aggregate_daily_sentiment(articles)
+        assert isinstance(score, float)
 
     def test_score_range(self):
         articles = [
             {"sentiment_label": "positive", "sentiment_score": 1.0},
         ]
-        score, _ = aggregate_daily_sentiment(articles)
+        score = aggregate_daily_sentiment(articles)
         assert -1.0 <= score <= 1.0
 
 

@@ -41,7 +41,6 @@ from src.langgraph_nodes.node_04_technical_analysis import (
     generate_technical_signal,
 )
 from src.utils.logger import get_node_logger
-from src.utils.sentiment_config import BUY_THRESHOLD, SELL_THRESHOLD
 
 logger = get_node_logger("node_10")
 
@@ -281,35 +280,35 @@ def backtest_technical_stream(
 # HELPER 5: DAILY SENTIMENT AGGREGATION
 # ============================================================================
 
-def aggregate_daily_sentiment(articles: List[Dict[str, Any]]) -> Tuple[float, str]:
+def aggregate_daily_sentiment(articles: List[Dict[str, Any]]) -> float:
     """
     Aggregate stored sentiment scores from multiple articles into a single
-    daily score and signal.
+    directional score in [-1.0, +1.0].
 
-    Mirrors Node 5's per-stream aggregation logic:
-    - 'positive' label → +sentiment_score (0 to +1)
-    - 'negative' label → -sentiment_score (-1 to 0)
-    - 'neutral' label → 0
-    Then average across all articles.
+    - 'positive' label → +sentiment_score
+    - 'negative' label → -sentiment_score
+    - 'neutral'  label → 0.0
+    - Missing sentiment_score → 0.0 (absence of data is neutral, not weak positive)
 
     NOTE: This operates on ONE stream at a time (stock / market / related).
-    The 50/25/25 cross-stream weighting is NOT applied here — that is
-    Node 11's responsibility after it receives per-stream accuracy.
+    BUY/SELL/HOLD conversion is NOT done here — that belongs to Node 5 (live
+    signals) and is inappropriate for backtesting, where the ±0.2 live-trading
+    threshold would incorrectly dominate results with HOLD on volatile stocks.
 
     Args:
         articles: List of article dicts with 'sentiment_label' and 'sentiment_score'
 
     Returns:
-        Tuple (combined_score [-1,+1], signal ['BUY'/'SELL'/'HOLD'])
+        Combined directional score in [-1.0, +1.0]. 0.0 if no articles.
     """
     if not articles:
-        return 0.0, "HOLD"
+        return 0.0
 
     signed_scores: List[float] = []
     for article in articles:
         label = article.get("sentiment_label", "neutral") or "neutral"
         raw_score = article.get("sentiment_score")
-        score = float(raw_score) if raw_score is not None else 0.5
+        score = float(raw_score) if raw_score is not None else 0.0
 
         if label == "positive":
             signed_scores.append(score)
@@ -318,19 +317,7 @@ def aggregate_daily_sentiment(articles: List[Dict[str, Any]]) -> Tuple[float, st
         else:
             signed_scores.append(0.0)
 
-    if not signed_scores:
-        return 0.0, "HOLD"
-
-    combined = float(np.mean(signed_scores))
-
-    if combined > BUY_THRESHOLD:
-        signal = "BUY"
-    elif combined < SELL_THRESHOLD:
-        signal = "SELL"
-    else:
-        signal = "HOLD"
-
-    return combined, signal
+    return float(np.mean(signed_scores)) if signed_scores else 0.0
 
 
 # ============================================================================
@@ -346,12 +333,17 @@ def backtest_sentiment_stream(
     Backtest a single sentiment stream (stock, market, or related) over 180 days.
 
     For each day D that has cached articles of the given news_type:
-        1. Aggregate stored AV sentiment scores → daily signal
+        1. Aggregate stored AV sentiment scores → directional score in [-1, +1]
         2. Read actual 7-calendar-day price change from news_outcomes.price_change_7day
            (pre-computed by the background script — no additional price lookups needed)
-        3. Evaluate correctness using our volatility-adaptive hold_threshold
-           (NOT the pre-stored prediction_was_accurate_7day boolean, which uses
-           a fixed threshold and may differ from our stock-specific one)
+        3. Evaluate directional agreement: did the sentiment sign match the price direction?
+           - score > 0 and price up   → correct
+           - score < 0 and price down → correct
+           - score == 0.0             → skipped (no directional information)
+
+    Correctness is evaluated as directional agreement, NOT as BUY/SELL/HOLD signal
+    accuracy. Using the live-trading ±0.2 threshold here would produce mostly HOLD
+    signals for volatile stocks and systematically understate sentiment accuracy.
 
     Uses median of price_change_7day across same-day articles to be robust
     to outliers (e.g. one article with a bad price lookup).
@@ -359,11 +351,12 @@ def backtest_sentiment_stream(
     Args:
         news_events: Output of get_news_with_outcomes() converted to list of dicts
         news_type: 'stock', 'market', or 'related'
-        hold_threshold: Stock-specific HOLD zone width in percent
+        hold_threshold: Stock-specific HOLD zone width in percent (unused for correctness
+                        evaluation here; kept for API consistency with technical stream)
 
     Returns:
         List of dicts, one per evaluated day:
-        {date, signal, sentiment_score, article_count, actual_change_7d, correct, days_ago}
+        {date, signal ('BUY'/'SELL'), sentiment_score, article_count, actual_change_7d, correct, days_ago}
     """
     results: List[Dict[str, Any]] = []
 
@@ -398,10 +391,22 @@ def backtest_sentiment_stream(
 
             actual_change = float(np.median(price_changes))
 
-            # Aggregate sentiment for this day's articles
-            daily_score, signal = aggregate_daily_sentiment(day_articles)
+            # Aggregate sentiment for this day's articles — returns score only
+            daily_score = aggregate_daily_sentiment(day_articles)
 
-            correct = evaluate_outcome(signal, actual_change, hold_threshold)
+            # Skip days with no directional information (pure neutral)
+            if daily_score == 0.0:
+                continue
+
+            # Directional agreement: did sentiment sign match price direction?
+            # Avoids stacking the live-trading ±0.2 threshold on top of hold zone.
+            sentiment_bullish = daily_score > 0.0
+            price_up = actual_change > 0.0
+            correct = (sentiment_bullish and price_up) or (not sentiment_bullish and not price_up)
+
+            # Display label derived from score sign — "HOLD" never produced here
+            signal = "BUY" if sentiment_bullish else "SELL"
+
             days_ago = int((today - pd.to_datetime(date_str)).days)
 
             results.append(
