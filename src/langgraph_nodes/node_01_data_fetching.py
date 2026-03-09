@@ -290,28 +290,60 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 days_to_fetch = 180
                 logger.warning(f"Node 1: DB data insufficient for {ticker} (< 50 rows), forcing full 6-month refetch")
         
+        # For incremental fetches (days_to_fetch < 180) the API slice will be
+        # small by design — validate only columns/non-empty, NOT row count.
+        # The 50-row minimum is applied to the final merged DB series below.
+        is_incremental = latest_date is not None and days_to_fetch < 180
+
+        def _slice_ok(df: Optional[pd.DataFrame]) -> bool:
+            """Check the freshly-fetched slice is usable (ignores row count for incremental)."""
+            if df is None or df.empty:
+                return False
+            required = ['date', 'open', 'high', 'low', 'close', 'volume']
+            if not all(c in df.columns for c in required):
+                return False
+            if not is_incremental:
+                return validate_price_data(df, ticker)   # full fetch — 50-row check applies
+            return True  # incremental slice — row count checked after DB merge
+
         df = fetch_from_yfinance(ticker, days=days_to_fetch)
-        if df is None or not validate_price_data(df, ticker):
+        if not _slice_ok(df):
             logger.warning(f"Node 1: yfinance failed for {ticker}, falling back to Polygon.io")
             df = fetch_from_polygon(ticker, days=days_to_fetch)
-        
-        if df is None or not validate_price_data(df, ticker):
+
+        if not _slice_ok(df):
+            if is_incremental:
+                # API is throttling but we have existing DB data — load it and continue
+                logger.warning(
+                    f"Node 1: Cannot fetch recent gap for {ticker} (API throttled), "
+                    f"using existing DB data (latest={latest_date})"
+                )
+                full_df = get_price_data_for_ticker(ticker, days=180)
+                if full_df is not None and validate_price_data(full_df, ticker):
+                    state['raw_price_data'] = full_df
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    state['node_execution_times']['node_1'] = elapsed
+                    logger.info(
+                        f"Node 1: Loaded {len(full_df)} rows from DB for {ticker} "
+                        f"(data may be {days_to_fetch} days stale)"
+                    )
+                    return state
             logger.error(f"Node 1: All price sources failed for {ticker}")
             state['errors'].append(f"Node 1: Failed to fetch price data for {ticker}")
             state['raw_price_data'] = None
             elapsed = (datetime.now() - start_time).total_seconds()
             state['node_execution_times']['node_1'] = elapsed
             return state
-        
+
         # INSERT OR REPLACE so overlap updates corrected closes
         try:
             cache_price_data(ticker, df)
             logger.info(f"Node 1: Cached {len(df)} rows for {ticker}")
         except Exception as e:
             logger.warning(f"Node 1: Failed to cache data for {ticker}: {str(e)}")
-        
+
         # After incremental write, use full series from DB so state has 6 months
-        if latest_date is not None and days_to_fetch < 180:
+        if is_incremental:
             full_df = get_price_data_for_ticker(ticker, days=180)
             if full_df is not None and validate_price_data(full_df, ticker):
                 state['raw_price_data'] = full_df
