@@ -93,7 +93,9 @@ def calculate_hold_threshold(price_data: pd.DataFrame) -> float:
             )
             return HOLD_THRESHOLD_FALLBACK_PCT
 
-        df = price_data.copy().sort_values("date").reset_index(drop=True)
+        df = price_data.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+        df = df.sort_values("date").reset_index(drop=True)
         returns_7d = df["close"].pct_change(7).abs() * 100
         returns_7d = returns_7d.dropna()
 
@@ -228,6 +230,9 @@ def backtest_technical_stream(
 
     try:
         df = price_data.copy().sort_values("date").reset_index(drop=True)
+        # Normalize all dates to YYYY-MM-DD strings so that string vs Timestamp
+        # comparison ('>=' not supported between Timestamp and str) never occurs.
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
         date_to_close: Dict[str, float] = dict(zip(df["date"], df["close"]))
         sorted_dates = sorted(df["date"].tolist())
         today = pd.Timestamp.now().normalize()
