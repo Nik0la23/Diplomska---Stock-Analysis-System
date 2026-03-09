@@ -1,0 +1,563 @@
+"""
+Node 14: Technical Explanation (LLM)
+
+Generates a structured markdown research report for a sophisticated investor.
+Calls the Groq LLM with a hardcoded system prompt and a dynamically assembled
+user prompt built entirely from state data — no external knowledge is used.
+
+Reads from state (all tiers):
+  TIER 1  — signal_components       (Node 12: full signal breakdown, risk, pattern, blending)
+  TIER 2  — technical_indicators    (Node 4: RSI, MACD, Bollinger, SMA, volume, ATR)
+  TIER 3  — adaptive_weights        (Node 11: per-stream weights and reliability)
+  TIER 4  — sentiment_breakdown     (Node 5: per-stream scores, top articles, credibility)
+            sentiment_analysis      (Node 8 adjusted: per-stream sentiment values)
+  TIER 5  — news_impact_verification(Node 8: source reliability, learning adjustment)
+  TIER 6  — market_context          (Node 6: sector, correlation, market trend)
+  TIER 7  — monte_carlo_results     (Node 7: probability_up, CI, simulation params)
+  TIER 8  — behavioral_anomaly_detection (Node 9B: full detection_breakdown)
+  TIER 9  — content_analysis_summary    (Node 9A: anomaly flags)
+  TIER 10 — ticker, technical_signal, technical_confidence (direct fields)
+
+Writes to state:
+  technical_explanation    — markdown string, 600-900 words
+  node_execution_times     — records "node_14" duration
+
+Runs AFTER:  Node 13 (beginner_explanation)
+Runs BEFORE: Node 15 (dashboard)
+"""
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from groq import Groq
+
+from src.utils.config import GROQ_API_KEY
+from src.utils.logger import get_node_logger
+
+logger = get_node_logger("node_14")
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+GROQ_MODEL: str = "llama-3.3-70b-versatile"
+MAX_TOKENS: int = 1400  # ~900 words with headroom
+
+
+# ============================================================================
+# SYSTEM PROMPT (hardcoded — never changes between runs)
+# ============================================================================
+
+SYSTEM_PROMPT: str = """You are a quantitative analyst generating a technical research \
+report on a stock trading signal for a sophisticated investor or portfolio manager.
+
+Rules you must follow:
+- Use ONLY the data provided in the user message. Do not supplement with any external \
+knowledge about the company, sector, or market from your training data.
+- Report exact numbers as given. Do not round unless the number is already rounded.
+- If a data field is None or marked UNAVAILABLE, explicitly note the gap in the \
+relevant section — do not skip silently and do not invent values.
+- When Job 1 and Job 2 disagree (agreement_with_job1 = "disagree"), this MUST be \
+the most prominent finding in the report — lead the Executive Summary with it.
+- If weights_are_fallback is True, state this explicitly in the Adaptive Weighting \
+section and note it limits interpretation of stream contributions.
+- Keep the response between 600 and 900 words.
+- Use markdown headers (##) for each section. Follow the section order provided exactly.
+- Do not add conclusions or recommendations beyond what the signal data states.
+- Do not add sections not listed in the prompt."""
+
+
+# ============================================================================
+# USER PROMPT BUILDER
+# ============================================================================
+
+def _build_user_prompt(
+    ticker: str,
+    sc: Dict[str, Any],
+    ti: Dict[str, Any],
+    aw: Dict[str, Any],
+    sb: Dict[str, Any],
+    sa: Dict[str, Any],
+    niv: Dict[str, Any],
+    mc_ctx: Dict[str, Any],
+    mc: Dict[str, Any],
+    ba: Dict[str, Any],
+    ca: Dict[str, Any],
+    technical_signal: Optional[str],
+    technical_confidence: Optional[float],
+) -> str:
+    """
+    Assemble the full data block from pre-extracted state dicts.
+
+    Every argument is already guarded to be a dict (possibly empty) or a
+    scalar. The prompt builder never accesses state directly.
+
+    Args:
+        ticker:               Stock ticker symbol.
+        sc:                   signal_components (Node 12).
+        ti:                   technical_indicators (Node 4).
+        aw:                   adaptive_weights (Node 11).
+        sb:                   sentiment_breakdown (Node 5).
+        sa:                   sentiment_analysis (Node 8 adjusted).
+        niv:                  news_impact_verification (Node 8).
+        mc_ctx:               market_context (Node 6).
+        mc:                   monte_carlo_results (Node 7).
+        ba:                   behavioral_anomaly_detection (Node 9B).
+        ca:                   content_analysis_summary (Node 9A).
+        technical_signal:     direct state field from Node 4.
+        technical_confidence: direct state field from Node 4.
+
+    Returns:
+        Formatted user prompt string.
+    """
+    pp: Dict[str, Any] = sc.get("pattern_prediction") or {}
+    pt: Dict[str, Any] = sc.get("price_targets") or {}
+    rs: Dict[str, Any] = sc.get("risk_summary") or {}
+    pg: Dict[str, Any] = sc.get("prediction_graph_data") or {}
+    bc: Dict[str, Any] = sc.get("backtest_context") or {}
+    ss: Dict[str, Any] = sc.get("stream_scores") or {}
+
+    # -------------------------------------------------------------------------
+    # STREAM SCORES TABLE
+    # -------------------------------------------------------------------------
+    stream_rows: List[str] = []
+    for stream in ("technical", "sentiment", "market", "monte_carlo"):
+        d = ss.get(stream) or {}
+        stream_rows.append(
+            f"  {stream:<12} | raw={d.get('raw_score')}  "
+            f"weight={d.get('weight')}  contribution={d.get('contribution')}"
+        )
+    stream_table = "\n".join(stream_rows)
+
+    # -------------------------------------------------------------------------
+    # TECHNICAL INDICATORS BLOCK
+    # -------------------------------------------------------------------------
+    if ti:
+        ti_lines = [f"  {k}: {v}" for k, v in ti.items()]
+        ti_block = "\n".join(ti_lines)
+        ti_block += (
+            f"\n  technical_signal: {technical_signal}"
+            f"\n  technical_confidence: {technical_confidence}"
+        )
+    else:
+        ti_block = "UNAVAILABLE — Node 4 did not produce data"
+
+    # -------------------------------------------------------------------------
+    # SENTIMENT BLOCK
+    # -------------------------------------------------------------------------
+    if sb:
+        stream_breakdown = sb.get("stream_breakdown") or {}
+        sn = stream_breakdown.get("stock_news") or {}
+        mn = stream_breakdown.get("market_news") or {}
+        rn = stream_breakdown.get("related_company_news") or {}
+
+        articles = sb.get("top_articles") or []
+        article_lines = [
+            f'  - "{a.get("title")}" | source={a.get("source")} '
+            f'| sentiment={a.get("sentiment_score")} | credibility={a.get("credibility")}'
+            for a in articles
+        ]
+        credibility = sb.get("credibility_scores") or {}
+
+        sb_block = (
+            f"  stock_news     score={sn.get('sentiment_score')} "
+            f"articles={sn.get('article_count')}\n"
+            f"  market_news    score={mn.get('sentiment_score')} "
+            f"articles={mn.get('article_count')}\n"
+            f"  related_news   score={rn.get('sentiment_score')} "
+            f"articles={rn.get('article_count')}\n"
+            f"  top_articles:\n" + "\n".join(article_lines) + "\n"
+            f"  credibility_scores: {credibility}"
+        )
+    else:
+        sb_block = "UNAVAILABLE"
+
+    # Node 8 adjusted per-stream values
+    if sa:
+        sa_block = (
+            f"  aggregated_sentiment: {sa.get('aggregated_sentiment')}\n"
+            f"  stock_news_sentiment: {sa.get('stock_news_sentiment')}\n"
+            f"  market_news_sentiment: {sa.get('market_news_sentiment')}\n"
+            f"  related_news_sentiment: {sa.get('related_news_sentiment')}"
+        )
+    else:
+        sa_block = "UNAVAILABLE — Node 8 did not adjust sentiment"
+
+    # News impact verification
+    if niv:
+        src_rel = niv.get("source_reliability") or {}
+        src_lines = [
+            f"    {src}: accuracy={v.get('accuracy_rate')} "
+            f"articles={v.get('total_articles')} multiplier={v.get('confidence_multiplier')}"
+            for src, v in src_rel.items()
+        ]
+        niv_block = (
+            f"  historical_correlation: {niv.get('historical_correlation')}\n"
+            f"  news_accuracy_score: {niv.get('news_accuracy_score')}\n"
+            f"  learning_adjustment: {niv.get('learning_adjustment')}\n"
+            f"  source_reliability:\n" + "\n".join(src_lines)
+        )
+    else:
+        niv_block = "UNAVAILABLE — Node 8 learning data not present"
+
+    # -------------------------------------------------------------------------
+    # MARKET CONTEXT BLOCK (specific fields only — never dump raw dict)
+    # -------------------------------------------------------------------------
+    if mc_ctx:
+        rel_perf = mc_ctx.get("related_companies_performance") or {}
+        rel_lines = [f"    {t}: {v:+.2f}%" for t, v in list(rel_perf.items())[:5]] if rel_perf else ["    none"]
+        mc_ctx_block = (
+            f"  context_signal: {mc_ctx.get('context_signal')}\n"
+            f"  market_correlation: {mc_ctx.get('market_correlation')}\n"
+            f"  sector_performance: {mc_ctx.get('sector_performance')}\n"
+            f"  market_trend: {mc_ctx.get('market_trend')}\n"
+            f"  spy_5day_change: {mc_ctx.get('spy_5day_change')}\n"
+            f"  beta: {mc_ctx.get('beta')}\n"
+            f"  sector: {mc_ctx.get('sector')}\n"
+            f"  related_companies_performance (top 5):\n" + "\n".join(rel_lines)
+        )
+    else:
+        mc_ctx_block = "UNAVAILABLE"
+
+    # -------------------------------------------------------------------------
+    # MONTE CARLO BLOCK (specific fields only — exclude simulation_paths arrays)
+    # -------------------------------------------------------------------------
+    if mc:
+        ci95 = mc.get("confidence_95") or {}
+        mc_block = (
+            f"  current_price: {mc.get('current_price')}\n"
+            f"  probability_up: {mc.get('probability_up')}\n"
+            f"  expected_return: {mc.get('expected_return')}\n"
+            f"  mean_forecast: {mc.get('mean_forecast')}\n"
+            f"  confidence_95_lower: {ci95.get('lower')}\n"
+            f"  confidence_95_upper: {ci95.get('upper')}\n"
+            f"  simulation_count: {mc.get('simulation_count')}\n"
+            f"  time_horizon_days: {mc.get('time_horizon_days')}\n"
+            f"  volatility: {mc.get('volatility')}"
+        )
+    else:
+        mc_block = "UNAVAILABLE"
+
+    # -------------------------------------------------------------------------
+    # PATTERN PREDICTION BLOCK (full detail)
+    # -------------------------------------------------------------------------
+    if pp.get("sufficient_data"):
+        detail = pp.get("similar_days_detail") or []
+        detail_rows = "\n".join(
+            f"  {d.get('date')} | sim={d.get('similarity_score'):.3f} "
+            f"| change={d.get('actual_change_7d'):+.2f}% | {d.get('direction')}"
+            for d in detail
+            if d.get("actual_change_7d") is not None
+        )
+        pattern_block = (
+            f"  sufficient_data: True\n"
+            f"  similar_days_found: {pp.get('similar_days_found')} "
+            f"(threshold: {pp.get('similarity_threshold_used')})\n"
+            f"  prob_up: {pp.get('prob_up'):.4f} | prob_down: {pp.get('prob_down'):.4f}\n"
+            f"  expected_return_7d: {pp.get('expected_return_7d'):+.4f}%\n"
+            f"  worst_case_7d (10th pct): {pp.get('worst_case_7d'):+.4f}%\n"
+            f"  best_case_7d (90th pct): {pp.get('best_case_7d'):+.4f}%\n"
+            f"  median_return_7d: {pp.get('median_return_7d'):+.4f}%\n"
+            f"  agreement_with_job1: {pp.get('agreement_with_job1')} "
+            f"(confidence_multiplier: {pp.get('confidence_multiplier'):.4f})\n"
+            f"  similar_days_detail:\n{detail_rows}"
+        )
+    else:
+        pattern_block = (
+            f"  sufficient_data: False\n"
+            f"  reason: {pp.get('reason', 'unknown')}"
+        )
+
+    # -------------------------------------------------------------------------
+    # BLENDING BLOCK
+    # -------------------------------------------------------------------------
+    if pg:
+        blend_lower = pg.get("gbm_spread_lower")
+        blend_upper = pg.get("gbm_spread_upper")
+        blend_block = (
+            f"  data_source: {pg.get('data_source')}\n"
+            f"  blended_expected_return: {pg.get('blended_expected_return'):+.4f}%\n"
+            f"  gbm_expected_return: {pg.get('gbm_expected_return'):+.4f}%\n"
+            f"  empirical_expected_return: {pg.get('empirical_expected_return')}\n"
+            f"  gbm_spread: {blend_lower:+.4f}% to {blend_upper:+.4f}%\n"
+            f"  empirical_spread: {pg.get('empirical_lower')} to {pg.get('empirical_upper')}\n"
+            f"  formula (blended): 60% empirical + 40% GBM"
+        )
+    else:
+        blend_block = "UNAVAILABLE"
+
+    # -------------------------------------------------------------------------
+    # ANOMALY BLOCKS (specific fields only)
+    # -------------------------------------------------------------------------
+    if ba:
+        dd = ba.get("detection_breakdown") or {}
+        ba_block = (
+            f"  risk_level: {ba.get('risk_level')}\n"
+            f"  pump_and_dump_score: {ba.get('pump_and_dump_score')}\n"
+            f"  trading_recommendation: {ba.get('trading_recommendation')}\n"
+            f"  behavioral_summary: {ba.get('behavioral_summary')}\n"
+            f"  primary_risk_factors: {ba.get('primary_risk_factors')}\n"
+            f"  alerts: {ba.get('alerts')}\n"
+            f"  detection_breakdown: { {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in dd.items()} }"
+        )
+    else:
+        ba_block = "UNAVAILABLE"
+
+    if ca:
+        ca_block = (
+            f"  early_risk_level: {ca.get('early_risk_level')}\n"
+            f"  anomaly_flags: {ca.get('anomaly_flags')}\n"
+            f"  suspicious_patterns: {ca.get('suspicious_patterns')}"
+        )
+    else:
+        ca_block = "UNAVAILABLE"
+
+    # -------------------------------------------------------------------------
+    # ASSEMBLE
+    # -------------------------------------------------------------------------
+    return f"""Generate a technical research report for the following stock analysis.
+Use markdown (##) headers. Follow this section order exactly — do not skip, merge, or add sections:
+1. Executive Summary
+2. Signal Decomposition
+3. Technical Analysis
+4. Sentiment Analysis
+5. Market Context
+6. Monte Carlo / Probabilistic Forecast
+7. Historical Pattern Matching (Job 2)
+8. Adaptive Weighting (Node 11)
+9. Anomaly Detection
+10. Risk Quantification
+11. Methodology Notes
+
+TICKER: {ticker}
+
+--- SIGNAL ---
+  final_signal: {sc.get('final_signal')}
+  final_confidence: {sc.get('final_confidence')}
+  final_score: {sc.get('final_score')}
+  signal_agreement: {sc.get('signal_agreement')}/4
+  streams_missing: {sc.get('streams_missing') or 'none'}
+
+--- STREAM SCORES ---
+{stream_table}
+
+--- TECHNICAL INDICATORS (Node 4) ---
+{ti_block}
+
+--- ADAPTIVE WEIGHTS (Node 11) ---
+  technical_weight: {aw.get('technical_weight')}
+  stock_news_weight: {aw.get('stock_news_weight')}
+  market_news_weight: {aw.get('market_news_weight')}
+  related_news_weight: {aw.get('related_news_weight')}
+  hold_threshold_pct: {aw.get('hold_threshold_pct')}
+  streams_reliable: {aw.get('streams_reliable')}
+  weights_are_fallback: {bc.get('weights_are_fallback')}
+
+--- SENTIMENT BREAKDOWN (Node 5) ---
+{sb_block}
+
+--- SENTIMENT ADJUSTMENT (Node 8) ---
+{sa_block}
+
+--- NEWS IMPACT VERIFICATION (Node 8 learning) ---
+{niv_block}
+
+--- MARKET CONTEXT (Node 6) ---
+{mc_ctx_block}
+
+--- MONTE CARLO (Node 7) ---
+{mc_block}
+
+--- PRICE TARGETS ---
+  current_price: {pt.get('current_price')}
+  forecasted_price: {pt.get('forecasted_price')}
+  price_range_lower: {pt.get('price_range_lower')}
+  price_range_upper: {pt.get('price_range_upper')}
+  expected_return_pct: {pt.get('expected_return_pct')}
+
+--- HISTORICAL PATTERN MATCHING (Job 2) ---
+{pattern_block}
+
+--- PREDICTION BLENDING ---
+{blend_block}
+
+--- RISK SUMMARY ---
+  overall_risk_level: {rs.get('overall_risk_level')}
+  pump_and_dump_score: {rs.get('pump_and_dump_score')}
+  trading_safe: {rs.get('trading_safe')}
+  trading_recommendation: {rs.get('trading_recommendation')}
+  primary_risk_factors: {rs.get('primary_risk_factors')}
+  alerts: {rs.get('alerts')}
+  detection_breakdown: {rs.get('detection_breakdown')}
+  behavioral_summary: {rs.get('behavioral_summary')}
+
+--- CONTENT ANOMALY (Node 9A) ---
+{ca_block}
+
+--- BEHAVIORAL ANOMALY (Node 9B) ---
+{ba_block}
+"""
+
+
+# ============================================================================
+# FALLBACK REPORT (used when LLM call fails)
+# ============================================================================
+
+def _build_fallback_report(
+    sc: Optional[Dict[str, Any]],
+    ticker: str,
+) -> str:
+    """
+    Produce a minimal templated technical report without an LLM call.
+
+    Args:
+        sc:     signal_components dict (may be None).
+        ticker: Stock ticker symbol.
+
+    Returns:
+        A markdown string suitable for technical_explanation.
+    """
+    if sc is None:
+        return (
+            f"## {ticker} — Technical Report Unavailable\n\n"
+            "The analysis pipeline did not complete successfully. "
+            "`signal_components` was not produced by Node 12.\n\n"
+            "**Action:** Check Node 12 logs for errors."
+        )
+
+    signal     = sc.get("final_signal", "HOLD")
+    confidence = float(sc.get("final_confidence") or 0.0)
+    score      = float(sc.get("final_score") or 0.0)
+    rs         = sc.get("risk_summary") or {}
+
+    return (
+        f"## {ticker} — Technical Report (LLM Unavailable)\n\n"
+        f"**Signal:** {signal} | **Confidence:** {confidence:.4f} | "
+        f"**Score:** {score:+.4f}\n\n"
+        f"**Risk Level:** {rs.get('overall_risk_level', 'UNKNOWN')} | "
+        f"**Trading Safe:** {rs.get('trading_safe', True)}\n\n"
+        "_LLM call failed — full narrative report could not be generated. "
+        "Raw signal data above is accurate._"
+    )
+
+
+# ============================================================================
+# MAIN NODE FUNCTION
+# ============================================================================
+
+def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Node 14: Generate detailed technical research report via Groq LLM.
+
+    Extracts all tier data from state (all fields guarded with .get()),
+    assembles a structured prompt, calls the LLM, and writes the markdown
+    report to state["technical_explanation"]. Falls back to a templated
+    string on any failure — never raises.
+
+    Args:
+        state: LangGraph state dict.
+
+    Returns:
+        Updated state with technical_explanation populated.
+    """
+    start_time = datetime.now()
+    ticker: str = state.get("ticker", "UNKNOWN")
+
+    logger.info(f"Node 14: Generating technical explanation for {ticker}")
+
+    # =========================================================================
+    # STEP 1: Extract all state fields — guarded, never raw state to LLM
+    # =========================================================================
+    sc:  Optional[Dict[str, Any]] = state.get("signal_components")
+    ti:  Dict[str, Any]           = state.get("technical_indicators") or {}
+    aw:  Dict[str, Any]           = state.get("adaptive_weights") or {}
+    sb:  Dict[str, Any]           = state.get("sentiment_breakdown") or {}
+    sa:  Dict[str, Any]           = state.get("sentiment_analysis") or {}
+    niv: Dict[str, Any]           = state.get("news_impact_verification") or {}
+    mc_ctx: Dict[str, Any]        = state.get("market_context") or {}
+    mc:  Dict[str, Any]           = state.get("monte_carlo_results") or {}
+    ba:  Dict[str, Any]           = state.get("behavioral_anomaly_detection") or {}
+    ca:  Dict[str, Any]           = state.get("content_analysis_summary") or {}
+
+    technical_signal:     Optional[str]   = state.get("technical_signal")
+    technical_confidence: Optional[float] = state.get("technical_confidence")
+
+    # =========================================================================
+    # STEP 2: Guard — signal_components is required
+    # =========================================================================
+    if sc is None:
+        logger.error("Node 14: signal_components is None — using fallback report")
+        state.setdefault("errors", []).append(
+            "Node 14: signal_components missing, used fallback report"
+        )
+        state["technical_explanation"] = _build_fallback_report(None, ticker)
+        state.setdefault("node_execution_times", {})["node_14"] = (
+            datetime.now() - start_time
+        ).total_seconds()
+        return state
+
+    # =========================================================================
+    # STEP 3: Build prompt
+    # =========================================================================
+    user_prompt = _build_user_prompt(
+        ticker=ticker,
+        sc=sc,
+        ti=ti,
+        aw=aw,
+        sb=sb,
+        sa=sa,
+        niv=niv,
+        mc_ctx=mc_ctx,
+        mc=mc,
+        ba=ba,
+        ca=ca,
+        technical_signal=technical_signal,
+        technical_confidence=technical_confidence,
+    )
+
+    logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Groq...")
+
+    # =========================================================================
+    # STEP 4: LLM call
+    # =========================================================================
+    try:
+        if not GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is not set in environment")
+
+        llm_start = datetime.now()
+        client = Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=MAX_TOKENS,
+            temperature=0.2,   # very low → consistent, factual, precise
+        )
+        llm_elapsed = (datetime.now() - llm_start).total_seconds()
+
+        report: str = response.choices[0].message.content.strip()
+        logger.info(
+            f"  Groq call succeeded in {llm_elapsed:.2f}s "
+            f"({len(report.split())} words)"
+        )
+
+    except Exception as exc:
+        logger.error(f"  Groq call failed for {ticker}: {exc}")
+        state.setdefault("errors", []).append(
+            f"Node 14 (technical explanation) LLM failed: {exc}"
+        )
+        report = _build_fallback_report(sc, ticker)
+
+    # =========================================================================
+    # STEP 5: Write to state
+    # =========================================================================
+    state["technical_explanation"] = report
+    state.setdefault("node_execution_times", {})["node_14"] = (
+        datetime.now() - start_time
+    ).total_seconds()
+
+    logger.info(f"Node 14 completed in {state['node_execution_times']['node_14']:.3f}s")
+    return state

@@ -39,6 +39,8 @@ from src.langgraph_nodes.node_09b_behavioral_anomaly import (
 from src.langgraph_nodes.node_10_backtesting import backtesting_node
 from src.langgraph_nodes.node_11_adaptive_weights import adaptive_weights_node
 from src.langgraph_nodes.node_12_signal_generation import signal_generation_node
+from src.langgraph_nodes.node_13_beginner_explanation import beginner_explanation_node
+from src.langgraph_nodes.node_14_technical_explanation import technical_explanation_node
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +174,12 @@ def create_stock_analysis_workflow() -> StateGraph:
 
     # Phase 6: Final Signal Generation (Node 12)
     workflow.add_node("signal_generation", signal_generation_node)
+
+    # Phase 7: Beginner Explanation (Node 13)
+    workflow.add_node("beginner_explanation", beginner_explanation_node)
+
+    # Phase 8: Technical Explanation (Node 14)
+    workflow.add_node("technical_explanation", technical_explanation_node)
     
     # ========================================================================
     # DEFINE EDGES (Sequential Flow)
@@ -228,9 +236,11 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_edge("behavioral_anomaly_detection", "backtesting")
     workflow.add_edge("backtesting", "adaptive_weights")
     workflow.add_edge("adaptive_weights", "signal_generation")
-    workflow.add_edge("signal_generation", END)  # temporary until Node 13
-    
-    logger.info("Workflow built successfully (parallel → background outcomes → Node 8 → Node 9B → Node 10 → Node 11 → Node 12)")
+    workflow.add_edge("signal_generation", "beginner_explanation")
+    workflow.add_edge("beginner_explanation", "technical_explanation")
+    workflow.add_edge("technical_explanation", END)  # temporary until Node 15
+
+    logger.info("Workflow built successfully (parallel → background outcomes → Node 8 → Node 9B → Node 10 → Node 11 → Node 12 → Node 13 → Node 14)")
     
     # Compile and return
     return workflow.compile()

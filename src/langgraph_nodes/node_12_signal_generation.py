@@ -51,6 +51,7 @@ Runs AFTER: Node 11 (adaptive_weights)
 Runs BEFORE: Node 13 (LLM beginner explanation)
 """
 
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -183,9 +184,11 @@ def _score_market(state: Dict[str, Any]) -> Tuple[float, bool]:
     """
     Convert Node 6's market context to a continuous score on [-1, +1].
 
-    Score = context_direction × market_correlation.
-    A perfectly correlated market with a BUY signal gives +1.0; a completely
-    uncorrelated market (correlation=0) contributes nothing.
+    Prefers market_headwind_score (new Node 6 composite) when available.
+    Falls back to context_signal BUY/SELL/HOLD for backward compatibility.
+
+    In both cases the score is multiplied by market_correlation so that a
+    low-correlation stock is less affected by market headwinds.
 
     Args:
         state: LangGraph state dict.
@@ -198,13 +201,24 @@ def _score_market(state: Dict[str, Any]) -> Tuple[float, bool]:
         logger.warning("  Market stream: no market_context → score=0.0")
         return 0.0, True
 
-    context_signal: str = market_context.get("context_signal", "HOLD")
     market_corr: Optional[float] = market_context.get("market_correlation")
-    if market_corr is None:
-        market_corr = 1.0  # treat as fully correlated when unknown
+    if market_corr is None or (isinstance(market_corr, float) and math.isnan(market_corr)):
+        market_corr = 1.0  # treat as fully correlated when unknown or NaN
+    market_corr = float(market_corr)
 
+    # Prefer the new continuous headwind score from the rewritten Node 6
+    headwind_score: Optional[float] = market_context.get("market_headwind_score")
+    if headwind_score is not None and math.isfinite(float(headwind_score)):
+        score = float(headwind_score) * min(market_corr, 1.0)
+        logger.debug(
+            f"  Market: headwind={headwind_score:+.3f} × correlation={market_corr:.3f} = {score:+.3f}"
+        )
+        return score, False
+
+    # Fallback: old BUY/SELL/HOLD signal
+    context_signal: str = market_context.get("context_signal", "HOLD")
     context_score = SIGNAL_TO_SCORE.get(context_signal.upper(), 0.0)
-    score = context_score * float(market_corr)
+    score = context_score * min(market_corr, 1.0)
     logger.debug(
         f"  Market: {context_signal} × correlation={market_corr:.3f} = {score:+.3f}"
     )
