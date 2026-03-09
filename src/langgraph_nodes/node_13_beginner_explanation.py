@@ -22,9 +22,9 @@ Runs BEFORE: Node 14 (technical_explanation) / Node 15 (dashboard)
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from groq import Groq
+import anthropic
 
-from src.utils.config import GROQ_API_KEY
+from src.utils.config import ANTHROPIC_API_KEY
 from src.utils.logger import get_node_logger
 
 logger = get_node_logger("node_13")
@@ -34,7 +34,7 @@ logger = get_node_logger("node_13")
 # CONSTANTS
 # ============================================================================
 
-GROQ_MODEL: str = "llama-3.3-70b-versatile"
+CLAUDE_MODEL: str = "claude-sonnet-4-5"
 MAX_TOKENS: int = 700   # ~400 words with headroom
 
 # Score thresholds for translating raw_score to plain English
@@ -170,12 +170,25 @@ def _build_user_prompt(
     streams_block = "\n".join(stream_lines)
 
     # --- TOP ARTICLES ---
+    # sentiment_breakdown keys are 'stock'/'market'/'related' — no top-level 'top_articles'.
+    # Node 05 already pre-selected top 3 per stream; collect the most credible ones across
+    # all streams and take the top 3 by credibility_weight for the beginner explanation.
     top_articles_block = ""
-    if sb and sb.get("top_articles"):
-        articles = sb["top_articles"][:3]
+    if sb:
+        all_stream_articles = (
+            (sb.get("stock")   or {}).get("top_articles", []) +
+            (sb.get("market")  or {}).get("top_articles", []) +
+            (sb.get("related") or {}).get("top_articles", [])
+        )
+        # Sort by credibility_weight descending so the most reliable headlines come first
+        all_stream_articles = sorted(
+            all_stream_articles,
+            key=lambda a: float(a.get("credibility_weight") or 0.0),
+            reverse=True,
+        )
         lines = [
             f'- "{a.get("title", "")}" ({a.get("source", "unknown source")})'
-            for a in articles
+            for a in all_stream_articles[:3]
             if a.get("title")
         ]
         if lines:
@@ -222,7 +235,10 @@ def _build_user_prompt(
     trading_safe = rs.get("trading_safe", True)
     pump_score   = int(rs.get("pump_and_dump_score") or 0)
     alerts       = rs.get("alerts") or []
-    beh_summary  = rs.get("behavioral_summary") or ""
+    # Truncate to 200 chars — this is a free-form Node 9B narrative; the full version
+    # is for Node 14. Beginners only need the gist.
+    raw_summary  = rs.get("behavioral_summary") or ""
+    beh_summary  = (raw_summary[:200] + "…") if len(raw_summary) > 200 else raw_summary
 
     risk_note = ""
     if not trading_safe:
@@ -377,23 +393,21 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # STEP 4: LLM call
     # =========================================================================
     try:
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY is not set in environment")
+        if not ANTHROPIC_API_KEY:
+            raise ValueError("ANTHROPIC_API_KEY is not set in environment")
 
         llm_start = datetime.now()
-        client = Groq(api_key=GROQ_API_KEY)
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_prompt},
-            ],
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
             max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
             temperature=0.3,   # low temperature → consistent, factual output
         )
         llm_elapsed = (datetime.now() - llm_start).total_seconds()
 
-        explanation: str = response.choices[0].message.content.strip()
+        explanation: str = response.content[0].text.strip()
         logger.info(
             f"  Groq call succeeded in {llm_elapsed:.2f}s "
             f"({len(explanation.split())} words)"

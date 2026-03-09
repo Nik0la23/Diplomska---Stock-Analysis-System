@@ -32,7 +32,8 @@ FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY')              # Peers, market news
 ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY')  # Primary news + sentiment (Node 2)
 
 # LLM for explanations
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')                    # Explanations (Nodes 13, 14)
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')                    # Kept for reference (no longer used by nodes)
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')          # Claude — Explanations (Nodes 13, 14)
 
 
 # ============================================================================
@@ -72,8 +73,8 @@ def validate_config() -> None:
     if not ALPHA_VANTAGE_API_KEY:
         missing_keys.append('ALPHA_VANTAGE_API_KEY')
     
-    if not GROQ_API_KEY:
-        missing_keys.append('GROQ_API_KEY')
+    if not ANTHROPIC_API_KEY:
+        missing_keys.append('ANTHROPIC_API_KEY')
     
     if missing_keys:
         raise ValueError(
@@ -96,6 +97,7 @@ def get_config_summary() -> dict:
         'finnhub_key_present': bool(FINNHUB_API_KEY),
         'alpha_vantage_key_present': bool(ALPHA_VANTAGE_API_KEY),
         'groq_key_present': bool(GROQ_API_KEY),
+        'anthropic_key_present': bool(ANTHROPIC_API_KEY),
         'database_path': DATABASE_PATH,
         'cache_hours': CACHE_HOURS,
         'log_level': LOG_LEVEL

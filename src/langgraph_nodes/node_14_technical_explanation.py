@@ -29,9 +29,9 @@ Runs BEFORE: Node 15 (dashboard)
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from groq import Groq
+import anthropic
 
-from src.utils.config import GROQ_API_KEY
+from src.utils.config import ANTHROPIC_API_KEY
 from src.utils.logger import get_node_logger
 
 logger = get_node_logger("node_14")
@@ -41,8 +41,18 @@ logger = get_node_logger("node_14")
 # CONSTANTS
 # ============================================================================
 
-GROQ_MODEL: str = "llama-3.3-70b-versatile"
+CLAUDE_MODEL: str = "claude-sonnet-4-5"
 MAX_TOKENS: int = 1400  # ~900 words with headroom
+
+
+def _fmt(value: Any, fmt: str = "+.4f", fallback: str = "N/A") -> str:
+    """Safe number formatter — returns fallback string if value is None or unformattable."""
+    if value is None:
+        return fallback
+    try:
+        return format(value, fmt)
+    except (TypeError, ValueError):
+        return fallback
 
 
 # ============================================================================
@@ -147,28 +157,47 @@ def _build_user_prompt(
     # SENTIMENT BLOCK
     # -------------------------------------------------------------------------
     if sb:
-        stream_breakdown = sb.get("stream_breakdown") or {}
-        sn = stream_breakdown.get("stock_news") or {}
-        mn = stream_breakdown.get("market_news") or {}
-        rn = stream_breakdown.get("related_company_news") or {}
+        # Correct keys: sentiment_breakdown uses 'stock'/'market'/'related'/'overall'
+        sn = sb.get("stock")  or {}
+        mn = sb.get("market") or {}
+        rn = sb.get("related") or {}
+        overall = sb.get("overall") or {}
 
-        articles = sb.get("top_articles") or []
+        # Collect top articles from all three streams.
+        # Node 05 already caps each stream to top 3, so max 9 articles total here.
+        all_top_articles = (
+            sn.get("top_articles", []) +
+            mn.get("top_articles", []) +
+            rn.get("top_articles", [])
+        )
         article_lines = [
-            f'  - "{a.get("title")}" | source={a.get("source")} '
-            f'| sentiment={a.get("sentiment_score")} | credibility={a.get("credibility")}'
+            f'  - [{stream}] "{a.get("title")}" | source={a.get("source")} '
+            f'| sentiment={a.get("sentiment_score")} | credibility={a.get("credibility_weight")}'
+            for stream, articles in [
+                ("stock",   sn.get("top_articles", [])),
+                ("market",  mn.get("top_articles", [])),
+                ("related", rn.get("top_articles", [])),
+            ]
             for a in articles
         ]
-        credibility = sb.get("credibility_scores") or {}
+
+        # Credibility aggregate — from the correct key sb['overall']['credibility']
+        cred = overall.get("credibility") or {}
+        cred_block = (
+            f"  avg_source_credibility: {cred.get('avg_source_credibility')}\n"
+            f"  high_credibility_articles: {cred.get('high_credibility_articles')}\n"
+            f"  medium_credibility_articles: {cred.get('medium_credibility_articles')}\n"
+            f"  low_credibility_articles: {cred.get('low_credibility_articles')}\n"
+            f"  avg_composite_anomaly: {cred.get('avg_composite_anomaly')}"
+        )
 
         sb_block = (
-            f"  stock_news     score={sn.get('sentiment_score')} "
-            f"articles={sn.get('article_count')}\n"
-            f"  market_news    score={mn.get('sentiment_score')} "
-            f"articles={mn.get('article_count')}\n"
-            f"  related_news   score={rn.get('sentiment_score')} "
-            f"articles={rn.get('article_count')}\n"
-            f"  top_articles:\n" + "\n".join(article_lines) + "\n"
-            f"  credibility_scores: {credibility}"
+            f"  stock   score={sn.get('weighted_sentiment')} articles={sn.get('article_count')} dominant={sn.get('dominant_label')}\n"
+            f"  market  score={mn.get('weighted_sentiment')} articles={mn.get('article_count')} dominant={mn.get('dominant_label')}\n"
+            f"  related score={rn.get('weighted_sentiment')} articles={rn.get('article_count')} dominant={rn.get('dominant_label')}\n"
+            f"  overall combined_sentiment={overall.get('combined_sentiment')} confidence={overall.get('confidence')}\n"
+            f"  credibility:\n{cred_block}\n"
+            f"  top_articles (top 3 per stream, already pre-selected by Node 5):\n" + "\n".join(article_lines)
         )
     else:
         sb_block = "UNAVAILABLE"
@@ -187,16 +216,17 @@ def _build_user_prompt(
     # News impact verification
     if niv:
         src_rel = niv.get("source_reliability") or {}
+        # Cap at 10 most-tracked sources to prevent unbounded growth over many runs
         src_lines = [
             f"    {src}: accuracy={v.get('accuracy_rate')} "
             f"articles={v.get('total_articles')} multiplier={v.get('confidence_multiplier')}"
-            for src, v in src_rel.items()
+            for src, v in list(src_rel.items())[:10]
         ]
         niv_block = (
             f"  historical_correlation: {niv.get('historical_correlation')}\n"
             f"  news_accuracy_score: {niv.get('news_accuracy_score')}\n"
             f"  learning_adjustment: {niv.get('learning_adjustment')}\n"
-            f"  source_reliability:\n" + "\n".join(src_lines)
+            f"  source_reliability (top 10):\n" + "\n".join(src_lines)
         )
     else:
         niv_block = "UNAVAILABLE — Node 8 learning data not present"
@@ -244,9 +274,10 @@ def _build_user_prompt(
     # -------------------------------------------------------------------------
     if pp.get("sufficient_data"):
         detail = pp.get("similar_days_detail") or []
+        # Node 12 already caps this to top 5 — iterate all
         detail_rows = "\n".join(
-            f"  {d.get('date')} | sim={d.get('similarity_score'):.3f} "
-            f"| change={d.get('actual_change_7d'):+.2f}% | {d.get('direction')}"
+            f"  {d.get('date')} | sim={_fmt(d.get('similarity_score'), '.3f')} "
+            f"| change={_fmt(d.get('actual_change_7d'), '+.2f')}% | {d.get('direction')}"
             for d in detail
             if d.get("actual_change_7d") is not None
         )
@@ -254,13 +285,13 @@ def _build_user_prompt(
             f"  sufficient_data: True\n"
             f"  similar_days_found: {pp.get('similar_days_found')} "
             f"(threshold: {pp.get('similarity_threshold_used')})\n"
-            f"  prob_up: {pp.get('prob_up'):.4f} | prob_down: {pp.get('prob_down'):.4f}\n"
-            f"  expected_return_7d: {pp.get('expected_return_7d'):+.4f}%\n"
-            f"  worst_case_7d (10th pct): {pp.get('worst_case_7d'):+.4f}%\n"
-            f"  best_case_7d (90th pct): {pp.get('best_case_7d'):+.4f}%\n"
-            f"  median_return_7d: {pp.get('median_return_7d'):+.4f}%\n"
+            f"  prob_up: {_fmt(pp.get('prob_up'), '.4f')} | prob_down: {_fmt(pp.get('prob_down'), '.4f')}\n"
+            f"  expected_return_7d: {_fmt(pp.get('expected_return_7d'))}%\n"
+            f"  worst_case_7d (10th pct): {_fmt(pp.get('worst_case_7d'))}%\n"
+            f"  best_case_7d (90th pct): {_fmt(pp.get('best_case_7d'))}%\n"
+            f"  median_return_7d: {_fmt(pp.get('median_return_7d'))}%\n"
             f"  agreement_with_job1: {pp.get('agreement_with_job1')} "
-            f"(confidence_multiplier: {pp.get('confidence_multiplier'):.4f})\n"
+            f"(confidence_multiplier: {_fmt(pp.get('confidence_multiplier'), '.4f')})\n"
             f"  similar_days_detail:\n{detail_rows}"
         )
     else:
@@ -277,10 +308,10 @@ def _build_user_prompt(
         blend_upper = pg.get("gbm_spread_upper")
         blend_block = (
             f"  data_source: {pg.get('data_source')}\n"
-            f"  blended_expected_return: {pg.get('blended_expected_return'):+.4f}%\n"
-            f"  gbm_expected_return: {pg.get('gbm_expected_return'):+.4f}%\n"
+            f"  blended_expected_return: {_fmt(pg.get('blended_expected_return'))}%\n"
+            f"  gbm_expected_return: {_fmt(pg.get('gbm_expected_return'))}%\n"
             f"  empirical_expected_return: {pg.get('empirical_expected_return')}\n"
-            f"  gbm_spread: {blend_lower:+.4f}% to {blend_upper:+.4f}%\n"
+            f"  gbm_spread: {_fmt(blend_lower)}% to {_fmt(blend_upper)}%\n"
             f"  empirical_spread: {pg.get('empirical_lower')} to {pg.get('empirical_upper')}\n"
             f"  formula (blended): 60% empirical + 40% GBM"
         )
@@ -292,6 +323,11 @@ def _build_user_prompt(
     # -------------------------------------------------------------------------
     if ba:
         dd = ba.get("detection_breakdown") or {}
+        _NUMERIC_DD_KEYS = {"price_velocity", "volume_anomaly", "news_divergence", "momentum_score"}
+        dd_clean = {
+            k: round(float(v), 4) if k in _NUMERIC_DD_KEYS and isinstance(v, (int, float)) else str(v)[:80]
+            for k, v in dd.items()
+        }
         ba_block = (
             f"  risk_level: {ba.get('risk_level')}\n"
             f"  pump_and_dump_score: {ba.get('pump_and_dump_score')}\n"
@@ -299,7 +335,7 @@ def _build_user_prompt(
             f"  behavioral_summary: {ba.get('behavioral_summary')}\n"
             f"  primary_risk_factors: {ba.get('primary_risk_factors')}\n"
             f"  alerts: {ba.get('alerts')}\n"
-            f"  detection_breakdown: { {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in dd.items()} }"
+            f"  detection_breakdown: {dd_clean}"
         )
     else:
         ba_block = "UNAVAILABLE"
@@ -384,13 +420,9 @@ TICKER: {ticker}
 
 --- RISK SUMMARY ---
   overall_risk_level: {rs.get('overall_risk_level')}
-  pump_and_dump_score: {rs.get('pump_and_dump_score')}
   trading_safe: {rs.get('trading_safe')}
   trading_recommendation: {rs.get('trading_recommendation')}
-  primary_risk_factors: {rs.get('primary_risk_factors')}
-  alerts: {rs.get('alerts')}
-  detection_breakdown: {rs.get('detection_breakdown')}
-  behavioral_summary: {rs.get('behavioral_summary')}
+  (full detail — pump_and_dump_score, behavioral_summary, primary_risk_factors, alerts, detection_breakdown — is in the BEHAVIORAL ANOMALY section below)
 
 --- CONTENT ANOMALY (Node 9A) ---
 {ca_block}
@@ -522,23 +554,21 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # STEP 4: LLM call
     # =========================================================================
     try:
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY is not set in environment")
+        if not ANTHROPIC_API_KEY:
+            raise ValueError("ANTHROPIC_API_KEY is not set in environment")
 
         llm_start = datetime.now()
-        client = Groq(api_key=GROQ_API_KEY)
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_prompt},
-            ],
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
             max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
             temperature=0.2,   # very low → consistent, factual, precise
         )
         llm_elapsed = (datetime.now() - llm_start).total_seconds()
 
-        report: str = response.choices[0].message.content.strip()
+        report: str = response.content[0].text.strip()
         logger.info(
             f"  Groq call succeeded in {llm_elapsed:.2f}s "
             f"({len(report.split())} words)"
