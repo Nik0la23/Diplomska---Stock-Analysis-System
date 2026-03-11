@@ -52,6 +52,7 @@ Runs BEFORE: Node 13 (LLM beginner explanation)
 """
 
 import math
+import numpy as np
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -114,28 +115,59 @@ DISAGREEMENT_PENALTY: float = 0.80
 
 def _score_technical(state: Dict[str, Any]) -> Tuple[float, bool]:
     """
-    Convert Node 4's technical signal to a continuous score on [-1, +1].
+    Convert Node 4's continuous normalised score to a stream score on [-1, +1].
 
-    Uses the signal direction (BUY=+1, SELL=-1, HOLD=0) scaled by the
-    reported confidence, so a high-confidence SELL scores more negative
-    than a low-confidence one.
+    Node 4 no longer emits a discrete BUY/SELL/HOLD string. Instead it writes
+    ``normalized_score`` (0–100) into ``technical_indicators``. This function
+    maps that value linearly:
+
+        tech_score = (normalized_score - 50) / 50
+
+    So score=100 → +1.0 (strong buy), score=0 → -1.0 (strong sell),
+    score=50 → 0.0 (perfectly neutral).
+
+    This is strictly more informative than the old BUY/SELL/HOLD × confidence
+    approach — a mild but consistent bearish score of 44 now yields -0.12
+    instead of 0.0 (HOLD).
+
+    Also logs hold_low / hold_high and market_regime from Node 4 for debugging.
 
     Args:
         state: LangGraph state dict.
 
     Returns:
-        (score, is_missing) — is_missing=True when either field is absent.
+        (score, is_missing) — is_missing=True when normalized_score is absent.
     """
-    signal: Optional[str] = state.get("technical_signal")
-    confidence: Optional[float] = state.get("technical_confidence")
+    ti: Optional[Dict[str, Any]] = state.get("technical_indicators")
 
-    if signal is None or confidence is None:
-        logger.warning("  Technical stream: missing signal or confidence → score=0.0")
+    if ti is None:
+        logger.warning("  Technical stream: technical_indicators missing → score=0.0")
         return 0.0, True
 
-    sign = SIGNAL_TO_SCORE.get(signal.upper(), 0.0)
-    score = sign * float(confidence)
-    logger.debug(f"  Technical: {signal} × {confidence:.3f} = {score:+.3f}")
+    # Prefer technical_alpha (regression output) — fall back to normalized_score
+    alpha: Optional[float] = ti.get("technical_alpha")
+    if alpha is not None:
+        score = float(np.clip(float(alpha), -1.0, 1.0))
+        source = "alpha"
+    else:
+        normalized_score: Optional[float] = ti.get("normalized_score")
+        if normalized_score is None:
+            logger.warning("  Technical stream: neither technical_alpha nor normalized_score found → score=0.0")
+            return 0.0, True
+        score = (float(normalized_score) - 50.0) / 50.0
+        source = "normalized_score"
+
+    hold_low: Optional[float] = ti.get("hold_low")
+    hold_high: Optional[float] = ti.get("hold_high")
+    market_regime: Optional[str] = ti.get("market_regime")
+    ic_score: Optional[float] = ti.get("ic_score")
+    regression_valid: Optional[bool] = ti.get("regression_valid")
+
+    logger.debug(
+        f"  Technical ({source}): score={score:+.3f} "
+        f"(band=[{hold_low},{hold_high}] regime={market_regime} "
+        f"regression={regression_valid} IC={ic_score})"
+    )
     return score, False
 
 

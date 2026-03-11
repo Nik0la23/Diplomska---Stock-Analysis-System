@@ -452,30 +452,40 @@ def calculate_correlation(
             logger.warning(f"  Correlation: insufficient price data ({len(price_data) if price_data is not None else 0} rows)")
             return _default
 
-        # --- stock returns (last 30 rows) ---
-        stock_close   = price_data["close"].dropna()
-        stock_returns = stock_close.pct_change().dropna().tail(30)
+        # --- Stock returns — build a date-indexed Series from Node 1's DataFrame.
+        #     Node 1 stores dates in a 'date' column (integer-indexed after reset_index).
+        #     We normalise to timezone-naive date for joining with SPY data.
+        stock_df = price_data[["date", "close"]].copy().dropna()
+        stock_df["date"] = pd.to_datetime(stock_df["date"]).dt.normalize().dt.tz_localize(None)
+        stock_df = stock_df.set_index("date").sort_index()
+        stock_returns = stock_df["close"].pct_change().dropna().tail(60)
 
         if len(stock_returns) < 10:
             logger.warning("  Correlation: too few stock return points")
             return _default
 
-        # --- SPY returns ---
-        spy_hist    = yf.Ticker("SPY").history(period="35d")
+        # --- SPY returns — fetch 90 calendar days to guarantee overlap with Node 1 window.
+        spy_hist = yf.Ticker("SPY").history(period="90d")
         if spy_hist.empty or len(spy_hist) < 10:
             logger.warning("  Correlation: insufficient SPY data")
             return _default
 
-        spy_returns = spy_hist["Close"].pct_change().dropna().tail(30)
+        spy_returns = spy_hist["Close"].pct_change().dropna()
+        spy_returns.index = pd.to_datetime(spy_returns.index).normalize().tz_localize(None)
 
-        # --- align by length using numpy (avoids DatetimeIndex timezone issues) ---
-        min_len = min(len(stock_returns), len(spy_returns))
-        s_arr   = stock_returns.values[-min_len:]
-        m_arr   = spy_returns.values[-min_len:]
+        # --- Align on matching trading dates (inner join by date index) ---
+        aligned = pd.concat(
+            [stock_returns.rename("stock"), spy_returns.rename("spy")],
+            axis=1,
+            join="inner",
+        ).dropna()
 
-        if min_len < 10:
-            logger.warning("  Correlation: too few aligned points")
+        if len(aligned) < 10:
+            logger.warning(f"  Correlation: only {len(aligned)} aligned trading days — using default")
             return _default
+
+        s_arr = aligned["stock"].values
+        m_arr = aligned["spy"].values
 
         corr_matrix = np.corrcoef(s_arr, m_arr)
         correlation = float(corr_matrix[0, 1])
@@ -493,6 +503,7 @@ def calculate_correlation(
 
         logger.info(
             f"  Correlation: {ticker}↔SPY = {correlation:.3f} ({strength}), beta={beta:.2f}"
+            f"  [{len(aligned)} aligned days]"
         )
         return {
             "market_correlation":   correlation,

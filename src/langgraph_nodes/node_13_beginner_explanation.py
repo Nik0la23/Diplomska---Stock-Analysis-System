@@ -2,9 +2,9 @@
 Node 13: Beginner Explanation (LLM)
 
 Generates a plain-English explanation of the final trading signal for a
-non-expert retail investor. Calls the Groq LLM with a hardcoded system
-prompt and a dynamically assembled user prompt built entirely from state
-data — no external knowledge is used.
+non-expert retail investor. Calls the Anthropic Claude LLM with a hardcoded
+system prompt and a dynamically assembled user prompt built entirely from
+state data — no external knowledge is used.
 
 Reads from state:
   PRIMARY   — signal_components  (Node 12 output: signal, streams, risk, pattern, prices)
@@ -309,7 +309,7 @@ def _build_fallback_explanation(
     """
     Produce a minimal templated explanation without an LLM call.
 
-    Used when signal_components is None or the Groq call raises an exception.
+    Used when signal_components is None or the Anthropic call raises an exception.
 
     Args:
         sc:     signal_components dict (may be None).
@@ -345,7 +345,7 @@ def _build_fallback_explanation(
 
 def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Node 13: Generate plain-English beginner explanation via Groq LLM.
+    Node 13: Generate plain-English beginner explanation via Anthropic Claude.
 
     Orchestrates data extraction from state, builds a structured prompt,
     calls the LLM, and writes the result to state["beginner_explanation"].
@@ -387,7 +387,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # =========================================================================
     user_prompt = _build_user_prompt(sc, sb, ticker)
 
-    logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Groq...")
+    logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")
 
     # =========================================================================
     # STEP 4: LLM call
@@ -409,12 +409,12 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         explanation: str = response.content[0].text.strip()
         logger.info(
-            f"  Groq call succeeded in {llm_elapsed:.2f}s "
+            f"  Anthropic call succeeded in {llm_elapsed:.2f}s "
             f"({len(explanation.split())} words)"
         )
 
     except Exception as exc:
-        logger.error(f"  Groq call failed for {ticker}: {exc}")
+        logger.error(f"  Anthropic call failed for {ticker}: {exc}")
         state.setdefault("errors", []).append(
             f"Node 13 (beginner explanation) LLM failed: {exc}"
         )

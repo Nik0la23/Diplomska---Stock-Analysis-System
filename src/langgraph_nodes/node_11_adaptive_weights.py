@@ -24,8 +24,14 @@ Responsibilities deliberately NOT done by Node 10:
 
 Neutral weight (0.0) is used when:
 - Stream data is None (Node 10 failed for that stream)
-- is_sufficient is False  (fewer than MIN_SIGNALS_FOR_SUFFICIENCY directional signals)
-- is_significant is False (p-value >= 0.05 in binomial test against 0.5 baseline)
+- is_sufficient is False    (fewer than MIN_SIGNALS_FOR_SUFFICIENCY directional signals)
+- is_anti_predictive is True (p_value_less < 0.05: stream is reliably WORSE than random)
+
+Near-random streams (not significant AND not anti-predictive) still participate
+in weight normalization at their measured Bayesian-smoothed accuracy. This allows
+the system to weight streams relative to each other even when none passes the
+strict p < 0.05 significance threshold — common for volatile or regime-changing
+stocks over a 180-day lookback.
 
 Equal-weight fallback (0.25 each) is used when:
 - backtest_results is entirely None (Node 10 itself failed)
@@ -56,7 +62,7 @@ logger = get_node_logger("node_11")
 
 RECENCY_WEIGHT: float = 0.7       # proportion given to recent_accuracy (last 60 days)
 FULL_WEIGHT: float = 0.3          # proportion given to full_accuracy (all 180 days)
-NEUTRAL_ACCURACY: float = 0.0     # unreliable streams contribute nothing to normalization
+NEUTRAL_ACCURACY: float = 0.0     # anti-predictive streams contribute nothing to normalization
 EQUAL_WEIGHT: float = 0.25        # equal weight across 4 streams when backtest failed
 
 # Bayesian smoothing: pull accuracy toward 0.5 when sample is small.
@@ -142,8 +148,14 @@ def _compute_weighted_accuracy(
        using total_days_evaluated and recent_days_evaluated from Node 10.
     3. Recency weighting: 70% recent + 30% full (or full-only when recent is None).
 
-    Returns NEUTRAL_ACCURACY (0.0) when the stream cannot be trusted — it will
+        Returns NEUTRAL_ACCURACY (0.0) when the stream cannot be trusted — it will
     contribute nothing to the normalization and receive zero weight.
+
+    Near-random streams (p_value >= 0.05 but p_value_less >= 0.05) are NOT zeroed
+    out. They still participate in normalization at their measured accuracy, which
+    naturally gives them proportional weight relative to better-performing streams.
+    Bayesian smoothing pulls their accuracy toward 0.5, so they have little
+    influence when competing against a clearly better stream.
 
     Args:
         stream_metrics: Metrics dict produced by Node 10's calculate_stream_metrics(),
@@ -152,11 +164,11 @@ def _compute_weighted_accuracy(
 
     Returns:
         Tuple (weighted_accuracy, source_label) where source_label is one of:
-            'calculated'            — full 70/30 recency weighting applied
-            'full_accuracy_only'    — recent_accuracy was None; used full_accuracy only
-            'neutral_no_data'       — stream_metrics is None
-            'neutral_insufficient'  — is_sufficient is False (< 20 directional signals)
-            'neutral_insignificant' — is_significant is False (p-value >= 0.05)
+            'calculated'              — full 70/30 recency weighting applied
+            'full_accuracy_only'      — recent_accuracy was None; used full_accuracy only
+            'neutral_no_data'         — stream_metrics is None
+            'neutral_insufficient'    — is_sufficient is False (< 20 directional signals)
+            'neutral_anti_predictive' — is_anti_predictive is True (p_value_less < 0.05)
     """
     if stream_metrics is None:
         logger.warning(f"  {stream_name}: No data → neutral weight ({NEUTRAL_ACCURACY:.0%})")
@@ -169,12 +181,22 @@ def _compute_weighted_accuracy(
         )
         return NEUTRAL_ACCURACY, "neutral_insufficient"
 
-    if not stream_metrics.get("is_significant", False):
-        p = stream_metrics.get("p_value", 1.0)
+    if stream_metrics.get("is_anti_predictive", False):
+        p_less = stream_metrics.get("p_value_less", 1.0)
         logger.warning(
-            f"  {stream_name}: Not significant (p={p:.3f}) → neutral weight ({NEUTRAL_ACCURACY:.0%})"
+            f"  {stream_name}: Anti-predictive (p_less={p_less:.3f}) "
+            f"→ neutral weight ({NEUTRAL_ACCURACY:.0%})"
         )
-        return NEUTRAL_ACCURACY, "neutral_insignificant"
+        return NEUTRAL_ACCURACY, "neutral_anti_predictive"
+
+    # Log whether the stream is statistically significant or just near-random
+    is_sig = stream_metrics.get("is_significant", False)
+    p_val  = stream_metrics.get("p_value", 1.0)
+    if not is_sig:
+        logger.info(
+            f"  {stream_name}: Near-random (p={p_val:.3f}) but not anti-predictive "
+            f"— contributing at measured accuracy"
+        )
 
     raw_full: float = float(stream_metrics.get("full_accuracy", NEUTRAL_ACCURACY))
     total_days: int = int(stream_metrics.get("total_days_evaluated", 0))
@@ -361,17 +383,6 @@ def calculate_adaptive_weights(
             f"Weights do not sum to 1.0 (got {weight_sum:.6f}) — falling back to equal weights"
         )
         weights = {wk: EQUAL_WEIGHT for _, wk in STREAM_KEYS}
-
-    streams_reliable = sum(
-        1 for src in weight_sources.values() if src in ("calculated", "full_accuracy_only")
-    )
-
-    return {
-        **weights,
-        "weighted_accuracies": {k: round(v, 4) for k, v in weighted_accuracies.items()},
-        "weight_sources": weight_sources,
-        "streams_reliable": streams_reliable,
-        "hold_threshold_pct": backtest_results.get("hold_threshold_pct"),
         "sample_period_days": backtest_results.get("sample_period_days", 180),
         "per_stream_adjustments": {k: round(v, 4) for k, v in applied_adjustments.items()},
         "fallback_equal_weights": False,

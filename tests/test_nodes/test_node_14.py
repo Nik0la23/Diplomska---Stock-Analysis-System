@@ -157,16 +157,38 @@ def _make_aw() -> dict:
 
 def _make_sb() -> dict:
     return {
-        "stream_breakdown": {
-            "stock_news": {"sentiment_score": 0.45, "article_count": 8, "label": "positive"},
-            "market_news": {"sentiment_score": 0.22, "article_count": 5, "label": "neutral"},
-            "related_company_news": {"sentiment_score": 0.18, "article_count": 3, "label": "neutral"},
+        "stock": {
+            "weighted_sentiment": 0.45,
+            "article_count": 8,
+            "dominant_label": "positive",
+            "top_articles": [
+                {"title": "AAPL beats earnings", "source": "Reuters",
+                 "sentiment_score": 0.72, "credibility_weight": 0.85},
+            ],
         },
-        "top_articles": [
-            {"title": "AAPL beats earnings", "source": "Reuters",
-             "sentiment_score": 0.72, "credibility": 0.85},
-        ],
-        "credibility_scores": {"Reuters": 0.85, "Bloomberg": 0.90},
+        "market": {
+            "weighted_sentiment": 0.22,
+            "article_count": 5,
+            "dominant_label": "neutral",
+            "top_articles": [],
+        },
+        "related": {
+            "weighted_sentiment": 0.18,
+            "article_count": 3,
+            "dominant_label": "neutral",
+            "top_articles": [],
+        },
+        "overall": {
+            "combined_sentiment": 0.35,
+            "confidence": 0.7,
+            "credibility": {
+                "avg_source_credibility": 0.85,
+                "high_credibility_articles": 3,
+                "medium_credibility_articles": 2,
+                "low_credibility_articles": 0,
+                "avg_composite_anomaly": 0.1,
+            },
+        },
     }
 
 
@@ -253,13 +275,11 @@ def _make_state(**overrides) -> dict:
     return state
 
 
-def _mock_groq_response(text: str = "## Report\n\nMocked technical report.") -> MagicMock:
-    msg = MagicMock()
-    msg.content = text
-    choice = MagicMock()
-    choice.message = msg
+def _mock_anthropic_response(text: str = "## Report\n\nMocked technical report.") -> MagicMock:
+    content_block = MagicMock()
+    content_block.text = text
     response = MagicMock()
-    response.choices = [choice]
+    response.content = [content_block]
     return response
 
 
@@ -283,8 +303,6 @@ class TestBuildUserPrompt:
             mc=mc if mc is not None else _make_mc(),
             ba=ba if ba is not None else _make_ba(),
             ca=ca if ca is not None else _make_ca(),
-            technical_signal=tech_sig,
-            technical_confidence=tech_conf,
         )
 
     def test_all_11_sections_listed(self):
@@ -422,20 +440,22 @@ class TestBuildFallbackReport:
 
 class TestTechnicalExplanationNode:
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_happy_path_writes_report(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("## Report\nDetailed analysis.")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_happy_path_writes_report(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("## Report\nDetailed analysis.")
         )
         state = _make_state()
         result = technical_explanation_node(state)
         assert result["technical_explanation"] == "## Report\nDetailed analysis."
         assert result["errors"] == []
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_execution_time_recorded(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response()
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_execution_time_recorded(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response()
         )
         state = _make_state()
         result = technical_explanation_node(state)
@@ -449,37 +469,41 @@ class TestTechnicalExplanationNode:
         assert len(result["technical_explanation"]) > 0
         assert any("signal_components" in e for e in result["errors"])
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_llm_failure_returns_fallback_no_crash(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.side_effect = RuntimeError("Timeout")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_llm_failure_returns_fallback_no_crash(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.side_effect = RuntimeError("Timeout")
         state = _make_state()
         result = technical_explanation_node(state)
         assert "technical_explanation" in result
         assert len(result["technical_explanation"]) > 0
         assert any("LLM failed" in e for e in result["errors"])
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_technical_indicators_none_no_crash(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("OK")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_technical_indicators_none_no_crash(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("OK")
         )
         state = _make_state(technical_indicators=None)
         result = technical_explanation_node(state)
         assert result["technical_explanation"] == "OK"
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_adaptive_weights_none_no_crash(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("OK")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_adaptive_weights_none_no_crash(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("OK")
         )
         state = _make_state(adaptive_weights=None)
         result = technical_explanation_node(state)
         assert result["technical_explanation"] == "OK"
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_all_optional_dicts_none_no_crash(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("OK")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_all_optional_dicts_none_no_crash(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("OK")
         )
         state = _make_state(
             technical_indicators=None,
@@ -496,60 +520,64 @@ class TestTechnicalExplanationNode:
         assert result["technical_explanation"] == "OK"
         assert result["errors"] == []
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_returns_state_dict(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response()
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_returns_state_dict(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response()
         )
         state = _make_state()
         result = technical_explanation_node(state)
         assert isinstance(result, dict)
         assert "ticker" in result
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_strips_whitespace_from_llm_output(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("  \n  ## Report\n  \n  ")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_strips_whitespace_from_llm_output(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("  \n  ## Report\n  \n  ")
         )
         state = _make_state()
         result = technical_explanation_node(state)
         assert result["technical_explanation"] == "## Report"
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_system_prompt_passed_correctly(self, mock_groq_cls):
-        mock_instance = mock_groq_cls.return_value
-        mock_instance.chat.completions.create.return_value = _mock_groq_response()
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_system_prompt_passed_correctly(self, mock_anthropic_cls):
+        mock_instance = mock_anthropic_cls.return_value
+        mock_instance.messages.create.return_value = _mock_anthropic_response()
         state = _make_state()
         technical_explanation_node(state)
-        call_kwargs = mock_instance.chat.completions.create.call_args
-        messages = call_kwargs[1]["messages"] if call_kwargs[1] else call_kwargs[0][0]
-        system_msgs = [m for m in messages if m["role"] == "system"]
-        assert len(system_msgs) == 1
-        assert system_msgs[0]["content"] == SYSTEM_PROMPT
+        call_kwargs = mock_instance.messages.create.call_args
+        kwargs = call_kwargs[1] if call_kwargs[1] else {}
+        assert kwargs.get("system") == SYSTEM_PROMPT
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_existing_errors_preserved(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response()
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_existing_errors_preserved(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response()
         )
         state = _make_state()
         state["errors"] = ["pre-existing error"]
         result = technical_explanation_node(state)
         assert "pre-existing error" in result["errors"]
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_disagree_state_no_crash(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("OK")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_disagree_state_no_crash(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("OK")
         )
         state = _make_state(signal_components=_make_sc(job2_agreement="disagree"))
         result = technical_explanation_node(state)
         assert result["technical_explanation"] == "OK"
 
-    @patch("src.langgraph_nodes.node_14_technical_explanation.Groq")
-    def test_sell_signal_no_crash(self, mock_groq_cls):
-        mock_groq_cls.return_value.chat.completions.create.return_value = (
-            _mock_groq_response("OK")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.ANTHROPIC_API_KEY", "fake-key")
+    @patch("src.langgraph_nodes.node_14_technical_explanation.anthropic.Anthropic")
+    def test_sell_signal_no_crash(self, mock_anthropic_cls):
+        mock_anthropic_cls.return_value.messages.create.return_value = (
+            _mock_anthropic_response("OK")
         )
         state = _make_state(signal_components=_make_sc(signal="SELL", confidence=0.30))
         result = technical_explanation_node(state)

@@ -34,11 +34,12 @@ from scipy.stats import binomtest
 from src.database.db_manager import get_news_with_outcomes
 from src.langgraph_nodes.node_04_technical_analysis import (
     analyze_volume,
+    calculate_adx,
     calculate_bollinger_bands,
     calculate_macd,
     calculate_moving_averages,
     calculate_rsi,
-    generate_technical_signal,
+    calculate_technical_score,
 )
 from src.utils.logger import get_node_logger
 
@@ -55,6 +56,7 @@ HOLD_THRESHOLD_MIN_PCT: float = 0.5       # sanity floor
 HOLD_THRESHOLD_MAX_PCT: float = 8.0       # sanity ceiling
 
 MIN_PRICE_ROWS_FOR_TECHNICAL: int = 50    # Node 4 requires ≥50 rows for moving averages
+ALPHA_SIGNAL_THRESHOLD: float = 0.10     # |alpha| < this → HOLD in technical reconstruction
 MIN_SIGNALS_FOR_SUFFICIENCY: int = 20     # minimum BUY+SELL signals for meaningful accuracy
 RECENT_PERIOD_DAYS: int = 60             # "recent" window in days (provided raw to Node 11)
 MIN_RECENT_DAYS_FOR_ACCURACY: int = 5    # minimum recent days before reporting recent_accuracy
@@ -134,18 +136,25 @@ def evaluate_outcome(signal: str, actual_change: float, hold_threshold: float) -
     Single definition used by ALL streams — ensures correctness is evaluated
     consistently across technical and all sentiment streams.
 
+    BUY/SELL use DIRECTIONAL agreement (any positive/negative move is correct).
+    This is consistent with how sentiment streams are evaluated and avoids
+    penalising correct directional calls that don't meet a magnitude threshold.
+
+    HOLD uses the stock-specific threshold: the signal is correct only if the
+    price stays within the expected "noise" band (±hold_threshold).
+
     Args:
         signal: 'BUY', 'SELL', or 'HOLD'
         actual_change: Actual 7-calendar-day price change in percent
-        hold_threshold: Stock-specific HOLD zone width in percent
+        hold_threshold: Stock-specific HOLD zone width in percent (used for HOLD only)
 
     Returns:
         True if the signal matched the actual outcome
     """
     if signal == "BUY":
-        return actual_change > hold_threshold
+        return actual_change > 0.0
     elif signal == "SELL":
-        return actual_change < -hold_threshold
+        return actual_change < 0.0
     elif signal == "HOLD":
         return abs(actual_change) <= hold_threshold
     return False
@@ -162,7 +171,15 @@ def reconstruct_technical_signal(
     Reconstruct the technical signal for the last day of a historical price slice.
 
     Reuses Node 4's helper functions directly — Node 4 itself is not called.
-    This gives us exactly what Node 4 would have produced on that historical day.
+    This gives us exactly what Node 4 would have produced on that historical day,
+    including the persistent-pressure adjustment and dynamic hold band introduced
+    in the HOLD-bias fix.
+
+    The discrete signal is derived from the continuous normalized_score returned
+    by calculate_technical_score() using its own hold_low / hold_high thresholds:
+    - score >= hold_high → BUY
+    - score <= hold_low  → SELL
+    - else               → HOLD
 
     Args:
         price_slice: DataFrame with all price data up to and including the target date
@@ -176,13 +193,31 @@ def reconstruct_technical_signal(
         return None, None
 
     try:
-        rsi = calculate_rsi(price_slice)
-        macd = calculate_macd(price_slice)
-        bollinger = calculate_bollinger_bands(price_slice)
+        rsi        = calculate_rsi(price_slice)
+        macd       = calculate_macd(price_slice)
+        bollinger  = calculate_bollinger_bands(price_slice)
         moving_avg = calculate_moving_averages(price_slice)
-        volume = analyze_volume(price_slice)
+        volume     = analyze_volume(price_slice)
+        adx        = calculate_adx(price_slice)
 
-        signal, confidence = generate_technical_signal(rsi, macd, bollinger, moving_avg, volume)
+        score_result = calculate_technical_score(
+            rsi, macd, bollinger, moving_avg, volume,
+            price_data=price_slice,
+            adx=adx,
+        )
+
+        alpha = score_result['technical_alpha']
+
+        if alpha >= ALPHA_SIGNAL_THRESHOLD:
+            signal     = 'BUY'
+            confidence = float(min(alpha, 1.0))
+        elif alpha <= -ALPHA_SIGNAL_THRESHOLD:
+            signal     = 'SELL'
+            confidence = float(min(-alpha, 1.0))
+        else:
+            signal     = 'HOLD'
+            confidence = float(1.0 - abs(alpha) / ALPHA_SIGNAL_THRESHOLD)
+
         return signal, float(confidence)
 
     except Exception as e:
@@ -290,10 +325,16 @@ def aggregate_daily_sentiment(articles: List[Dict[str, Any]]) -> float:
     Aggregate stored sentiment scores from multiple articles into a single
     directional score in [-1.0, +1.0].
 
-    - 'positive' label → +sentiment_score
-    - 'negative' label → -sentiment_score
+    The DB stores sentiment_score as a SIGNED value: positive articles have a
+    positive score (e.g. +0.44) and negative articles have a negative score
+    (e.g. -0.44).  The label is used to determine the sign of the contribution
+    via abs(), so this function handles both signed and unsigned score storage
+    correctly:
+
+    - 'positive' label → +abs(sentiment_score)
+    - 'negative' label → -abs(sentiment_score)
     - 'neutral'  label → 0.0
-    - Missing sentiment_score → 0.0 (absence of data is neutral, not weak positive)
+    - Missing sentiment_score → 0.0
 
     NOTE: This operates on ONE stream at a time (stock / market / related).
     BUY/SELL/HOLD conversion is NOT done here — that belongs to Node 5 (live
@@ -316,9 +357,9 @@ def aggregate_daily_sentiment(articles: List[Dict[str, Any]]) -> float:
         score = float(raw_score) if raw_score is not None else 0.0
 
         if label == "positive":
-            signed_scores.append(score)
+            signed_scores.append(abs(score))
         elif label == "negative":
-            signed_scores.append(-score)
+            signed_scores.append(-abs(score))
         else:
             signed_scores.append(0.0)
 
@@ -435,7 +476,145 @@ def backtest_sentiment_stream(
 
 
 # ============================================================================
-# HELPER 7: STREAM METRICS
+# HELPER 7: COMBINED STREAM BACKTEST
+# ============================================================================
+
+def backtest_combined_stream(
+    price_data: pd.DataFrame,
+    news_events: List[Dict[str, Any]],
+    hold_threshold: float,
+) -> List[Dict[str, Any]]:
+    """
+    Backtest all 4 streams combined with equal weights over the full price history.
+
+    For each day D (from row 50 onward):
+    1. Reconstruct technical signal → convert to score in [-1, +1]
+    2. Aggregate stock / market / related sentiment for the same date
+    3. Combine available stream scores with equal weight (mean)
+    4. Threshold: combined_score > 0.05 → BUY, < -0.05 → SELL, else HOLD
+    5. Find actual 7-calendar-day price change
+    6. Evaluate correctness
+
+    Equal weights avoid the chicken-and-egg problem (weights require accuracy,
+    accuracy requires weights). This gives an honest end-to-end baseline for
+    the combined system before adaptive weighting is applied.
+
+    Args:
+        price_data:    Full OHLCV DataFrame from state (sorted ascending).
+        news_events:   Output of get_news_with_outcomes() as list of dicts.
+        hold_threshold: Stock-specific HOLD zone width in percent.
+
+    Returns:
+        List of dicts per evaluated day:
+        {date, signal, combined_score, streams_used, actual_change_7d, correct, days_ago}
+    """
+    COMBINED_HOLD_THRESHOLD = 0.05
+
+    results: List[Dict[str, Any]] = []
+
+    if price_data is None or len(price_data) < MIN_PRICE_ROWS_FOR_TECHNICAL + 7:
+        logger.warning("Combined backtest: insufficient price data")
+        return results
+
+    try:
+        df = price_data.copy().sort_values("date").reset_index(drop=True)
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+        date_to_close: Dict[str, float] = dict(zip(df["date"], df["close"]))
+        sorted_dates = sorted(df["date"].tolist())
+        today = pd.Timestamp.now().normalize()
+
+        # Pre-index sentiment events by date and type for O(1) lookups
+        by_date_stock: Dict[str, List[Dict]] = {}
+        by_date_market: Dict[str, List[Dict]] = {}
+        by_date_related: Dict[str, List[Dict]] = {}
+        for event in news_events:
+            pub = event.get("published_at", "")
+            if not pub:
+                continue
+            date_str = str(pub)[:10]
+            ntype = event.get("news_type", "")
+            if ntype == "stock":
+                by_date_stock.setdefault(date_str, []).append(event)
+            elif ntype == "market":
+                by_date_market.setdefault(date_str, []).append(event)
+            elif ntype == "related":
+                by_date_related.setdefault(date_str, []).append(event)
+
+        for i in range(MIN_PRICE_ROWS_FOR_TECHNICAL, len(df)):
+            date_str = str(df.iloc[i]["date"])
+
+            # Future price
+            target_future = (
+                pd.to_datetime(date_str) + pd.Timedelta(days=7)
+            ).strftime("%Y-%m-%d")
+            future_dates = [d for d in sorted_dates if d >= target_future]
+            if not future_dates:
+                continue
+
+            price_today = float(df.iloc[i]["close"])
+            price_future = float(date_to_close[future_dates[0]])
+            actual_change = ((price_future - price_today) / price_today) * 100
+
+            # Technical stream score
+            price_slice = df.iloc[: i + 1].copy()
+            tech_signal, tech_conf = reconstruct_technical_signal(price_slice)
+            if tech_signal is None:
+                continue
+            if tech_signal == 'BUY':
+                tech_score = tech_conf if tech_conf is not None else 0.0
+            elif tech_signal == 'SELL':
+                tech_score = -(tech_conf if tech_conf is not None else 0.0)
+            else:
+                tech_score = 0.0
+
+            # Sentiment stream scores
+            stream_scores: List[float] = [tech_score]
+            streams_used = ['technical']
+
+            for stype, smap in [
+                ('stock', by_date_stock),
+                ('market', by_date_market),
+                ('related', by_date_related),
+            ]:
+                articles = smap.get(date_str)
+                if articles:
+                    s = aggregate_daily_sentiment(articles)
+                    stream_scores.append(s)
+                    streams_used.append(stype)
+
+            combined_score = float(np.mean(stream_scores))
+
+            # Threshold
+            if combined_score > COMBINED_HOLD_THRESHOLD:
+                signal = 'BUY'
+            elif combined_score < -COMBINED_HOLD_THRESHOLD:
+                signal = 'SELL'
+            else:
+                signal = 'HOLD'
+
+            correct = evaluate_outcome(signal, actual_change, hold_threshold)
+            days_ago = int((today - pd.to_datetime(date_str)).days)
+
+            results.append({
+                "date":             date_str,
+                "signal":           signal,
+                "combined_score":   round(combined_score, 4),
+                "streams_used":     streams_used,
+                "actual_change_7d": round(actual_change, 4),
+                "correct":          correct,
+                "days_ago":         days_ago,
+            })
+
+        logger.info(f"Combined stream backtest: {len(results)} days evaluated")
+        return results
+
+    except Exception as e:
+        logger.error(f"Combined stream backtest failed: {e}")
+        return []
+
+
+# ============================================================================
+# HELPER 8: STREAM METRICS
 # ============================================================================
 
 def calculate_stream_metrics(
@@ -505,16 +684,29 @@ def calculate_stream_metrics(
     avg_change_on_correct = float(np.mean(correct_changes)) if correct_changes else 0.0
     avg_change_on_wrong = float(np.mean(wrong_changes)) if wrong_changes else 0.0
 
-    # --- Statistical significance: binomial test against p=0.5 baseline ---
-    # Only directional signals (BUY/SELL) are tested — HOLD is excluded
+    # --- Statistical significance tests against p=0.5 baseline ---
+    # Only directional signals (BUY/SELL) are tested — HOLD is excluded.
+    # Two one-tailed tests are run:
+    #   p_value         (alternative="greater"): is accuracy significantly BETTER than random?
+    #   p_value_less    (alternative="less"):    is accuracy significantly WORSE  than random?
+    # is_significant    = stream is reliably better  than random (p_value      < 0.05)
+    # is_anti_predictive = stream is reliably worse  than random (p_value_less < 0.05)
+    # A stream that is not significant but also not anti_predictive is near-random:
+    # it may still receive proportional weight in Node 11 rather than being dropped.
     p_value = 1.0
+    p_value_less = 1.0
     is_significant = False
+    is_anti_predictive = False
     if signal_count >= min_signals:
         directional_correct = sum(1 for r in directional if r["correct"])
         try:
-            test_result = binomtest(directional_correct, signal_count, p=0.5, alternative="greater")
-            p_value = float(test_result.pvalue)
+            test_greater = binomtest(directional_correct, signal_count, p=0.5, alternative="greater")
+            p_value = float(test_greater.pvalue)
             is_significant = p_value < 0.05
+
+            test_less = binomtest(directional_correct, signal_count, p=0.5, alternative="less")
+            p_value_less = float(test_less.pvalue)
+            is_anti_predictive = p_value_less < 0.05
         except Exception as e:
             logger.warning(f"Binomial test failed: {e}")
 
@@ -532,7 +724,9 @@ def calculate_stream_metrics(
         "avg_change_on_wrong": round(avg_change_on_wrong, 4),
         "is_sufficient": is_sufficient,
         "is_significant": is_significant,
+        "is_anti_predictive": is_anti_predictive,
         "p_value": round(p_value, 6),
+        "p_value_less": round(p_value_less, 6),
         "daily_results": daily_results,  # Full list preserved for dashboard
     }
 
@@ -661,6 +855,14 @@ def backtesting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             logger.error(f"Related news stream backtest failed: {e}")
 
+        # Combined stream (all 4 streams, equal weights)
+        combined_daily: List[Dict] = []
+        try:
+            logger.info("Backtesting combined stream (equal weights)...")
+            combined_daily = backtest_combined_stream(price_data, news_events, hold_threshold)
+        except Exception as e:
+            logger.error(f"Combined stream backtest failed: {e}")
+
         # ====================================================================
         # STEP 5: Compute metrics for each stream
         # ====================================================================
@@ -669,6 +871,7 @@ def backtesting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         stock_metrics = calculate_stream_metrics(stock_news_daily) if stock_news_daily else None
         market_metrics = calculate_stream_metrics(market_news_daily) if market_news_daily else None
         related_metrics = calculate_stream_metrics(related_news_daily) if related_news_daily else None
+        combined_metrics = calculate_stream_metrics(combined_daily) if combined_daily else None
 
         # ====================================================================
         # STEP 6: Build and store results
@@ -677,10 +880,11 @@ def backtesting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         backtest_results: Dict[str, Any] = {
             "hold_threshold_pct": round(hold_threshold, 4),
             "sample_period_days": 180,
-            "technical": technical_metrics,
-            "stock_news": stock_metrics,
-            "market_news": market_metrics,
-            "related_news": related_metrics,
+            "technical":     technical_metrics,
+            "stock_news":    stock_metrics,
+            "market_news":   market_metrics,
+            "related_news":  related_metrics,
+            "combined_stream": combined_metrics,
         }
 
         state["backtest_results"] = backtest_results
@@ -696,10 +900,11 @@ def backtesting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"  HOLD threshold: {hold_threshold:.2f}%")
 
         for stream_name, metrics in [
-            ("Technical", technical_metrics),
-            ("Stock News", stock_metrics),
-            ("Market News", market_metrics),
-            ("Related News", related_metrics),
+            ("Technical",     technical_metrics),
+            ("Stock News",    stock_metrics),
+            ("Market News",   market_metrics),
+            ("Related News",  related_metrics),
+            ("Combined",      combined_metrics),
         ]:
             if metrics:
                 recent = metrics.get("recent_accuracy")

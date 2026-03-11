@@ -222,17 +222,22 @@ class TestEvaluateOutcome:
     def test_buy_correct_when_price_rises_above_threshold(self):
         assert evaluate_outcome("BUY", 3.0, 2.0) is True
 
-    def test_buy_incorrect_when_price_rises_below_threshold(self):
-        assert evaluate_outcome("BUY", 1.5, 2.0) is False
+    def test_buy_correct_when_price_rises_any_amount(self):
+        # BUY uses directional agreement: any positive move is correct
+        assert evaluate_outcome("BUY", 1.5, 2.0) is True
+        assert evaluate_outcome("BUY", 0.1, 2.0) is True
 
     def test_buy_incorrect_when_price_falls(self):
         assert evaluate_outcome("BUY", -2.0, 2.0) is False
 
-    def test_sell_correct_when_price_falls_below_threshold(self):
+    def test_sell_correct_when_price_falls_any_amount(self):
+        # SELL uses directional agreement: any negative move is correct
         assert evaluate_outcome("SELL", -3.0, 2.0) is True
+        assert evaluate_outcome("SELL", -0.5, 2.0) is True
 
-    def test_sell_incorrect_when_price_falls_less_than_threshold(self):
-        assert evaluate_outcome("SELL", -1.0, 2.0) is False
+    def test_sell_correct_when_price_falls_small(self):
+        # Even a small fall is correct for SELL
+        assert evaluate_outcome("SELL", -1.0, 2.0) is True
 
     def test_sell_incorrect_when_price_rises(self):
         assert evaluate_outcome("SELL", 2.0, 2.0) is False
@@ -246,11 +251,11 @@ class TestEvaluateOutcome:
         assert evaluate_outcome("HOLD", -3.0, 2.0) is False
 
     def test_boundary_exactly_at_threshold(self):
-        """Boundary value: exactly at threshold is NOT sufficient for BUY/SELL."""
-        # BUY requires strictly greater than threshold
-        assert evaluate_outcome("BUY", 2.0, 2.0) is False
-        # SELL requires strictly less than -threshold
-        assert evaluate_outcome("SELL", -2.0, 2.0) is False
+        """Boundary: BUY/SELL use directional agreement; HOLD uses magnitude threshold."""
+        # BUY: price > 0 → correct (any positive move)
+        assert evaluate_outcome("BUY", 2.0, 2.0) is True
+        # SELL: price < 0 → correct (any negative move)
+        assert evaluate_outcome("SELL", -2.0, 2.0) is True
         # HOLD: equal to threshold is within zone
         assert evaluate_outcome("HOLD", 2.0, 2.0) is True
 

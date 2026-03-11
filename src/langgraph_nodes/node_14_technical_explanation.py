@@ -2,8 +2,8 @@
 Node 14: Technical Explanation (LLM)
 
 Generates a structured markdown research report for a sophisticated investor.
-Calls the Groq LLM with a hardcoded system prompt and a dynamically assembled
-user prompt built entirely from state data — no external knowledge is used.
+Calls the Anthropic Claude LLM with a hardcoded system prompt and a dynamically
+assembled user prompt built entirely from state data — no external knowledge is used.
 
 Reads from state (all tiers):
   TIER 1  — signal_components       (Node 12: full signal breakdown, risk, pattern, blending)
@@ -16,7 +16,7 @@ Reads from state (all tiers):
   TIER 7  — monte_carlo_results     (Node 7: probability_up, CI, simulation params)
   TIER 8  — behavioral_anomaly_detection (Node 9B: full detection_breakdown)
   TIER 9  — content_analysis_summary    (Node 9A: anomaly flags)
-  TIER 10 — ticker, technical_signal, technical_confidence (direct fields)
+  TIER 10 — ticker (direct field; technical_signal/confidence removed — see ti dict)
 
 Writes to state:
   technical_explanation    — markdown string, 600-900 words
@@ -42,7 +42,7 @@ logger = get_node_logger("node_14")
 # ============================================================================
 
 CLAUDE_MODEL: str = "claude-sonnet-4-5"
-MAX_TOKENS: int = 1400  # ~900 words with headroom
+MAX_TOKENS: int = 2000  # ~900 words with headroom
 
 
 def _fmt(value: Any, fmt: str = "+.4f", fallback: str = "N/A") -> str:
@@ -94,8 +94,6 @@ def _build_user_prompt(
     mc: Dict[str, Any],
     ba: Dict[str, Any],
     ca: Dict[str, Any],
-    technical_signal: Optional[str],
-    technical_confidence: Optional[float],
 ) -> str:
     """
     Assemble the full data block from pre-extracted state dicts.
@@ -103,20 +101,25 @@ def _build_user_prompt(
     Every argument is already guarded to be a dict (possibly empty) or a
     scalar. The prompt builder never accesses state directly.
 
+    Node 4 no longer emits discrete technical_signal / technical_confidence
+    fields. All technical context (normalized_score, hold_low, hold_high,
+    market_regime, persistent_pressure, technical_summary) is carried inside
+    the ``ti`` dict and rendered automatically in the TECHNICAL INDICATORS
+    block below. The final trading signal is sourced exclusively from Node 12
+    via ``sc`` (signal_components).
+
     Args:
-        ticker:               Stock ticker symbol.
-        sc:                   signal_components (Node 12).
-        ti:                   technical_indicators (Node 4).
-        aw:                   adaptive_weights (Node 11).
-        sb:                   sentiment_breakdown (Node 5).
-        sa:                   sentiment_analysis (Node 8 adjusted).
-        niv:                  news_impact_verification (Node 8).
-        mc_ctx:               market_context (Node 6).
-        mc:                   monte_carlo_results (Node 7).
-        ba:                   behavioral_anomaly_detection (Node 9B).
-        ca:                   content_analysis_summary (Node 9A).
-        technical_signal:     direct state field from Node 4.
-        technical_confidence: direct state field from Node 4.
+        ticker:  Stock ticker symbol.
+        sc:      signal_components (Node 12) — authoritative final signal.
+        ti:      technical_indicators (Node 4) — full numeric context.
+        aw:      adaptive_weights (Node 11).
+        sb:      sentiment_breakdown (Node 5).
+        sa:      sentiment_analysis (Node 8 adjusted).
+        niv:     news_impact_verification (Node 8).
+        mc_ctx:  market_context (Node 6).
+        mc:      monte_carlo_results (Node 7).
+        ba:      behavioral_anomaly_detection (Node 9B).
+        ca:      content_analysis_summary (Node 9A).
 
     Returns:
         Formatted user prompt string.
@@ -146,10 +149,6 @@ def _build_user_prompt(
     if ti:
         ti_lines = [f"  {k}: {v}" for k, v in ti.items()]
         ti_block = "\n".join(ti_lines)
-        ti_block += (
-            f"\n  technical_signal: {technical_signal}"
-            f"\n  technical_confidence: {technical_confidence}"
-        )
     else:
         ti_block = "UNAVAILABLE — Node 4 did not produce data"
 
@@ -480,7 +479,7 @@ def _build_fallback_report(
 
 def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Node 14: Generate detailed technical research report via Groq LLM.
+    Node 14: Generate detailed technical research report via Anthropic Claude.
 
     Extracts all tier data from state (all fields guarded with .get()),
     assembles a structured prompt, calls the LLM, and writes the markdown
@@ -512,9 +511,6 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     ba:  Dict[str, Any]           = state.get("behavioral_anomaly_detection") or {}
     ca:  Dict[str, Any]           = state.get("content_analysis_summary") or {}
 
-    technical_signal:     Optional[str]   = state.get("technical_signal")
-    technical_confidence: Optional[float] = state.get("technical_confidence")
-
     # =========================================================================
     # STEP 2: Guard — signal_components is required
     # =========================================================================
@@ -544,11 +540,9 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         mc=mc,
         ba=ba,
         ca=ca,
-        technical_signal=technical_signal,
-        technical_confidence=technical_confidence,
     )
 
-    logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Groq...")
+    logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")
 
     # =========================================================================
     # STEP 4: LLM call
@@ -570,12 +564,12 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         report: str = response.content[0].text.strip()
         logger.info(
-            f"  Groq call succeeded in {llm_elapsed:.2f}s "
+            f"  Anthropic call succeeded in {llm_elapsed:.2f}s "
             f"({len(report.split())} words)"
         )
 
     except Exception as exc:
-        logger.error(f"  Groq call failed for {ticker}: {exc}")
+        logger.error(f"  Anthropic call failed for {ticker}: {exc}")
         state.setdefault("errors", []).append(
             f"Node 14 (technical explanation) LLM failed: {exc}"
         )

@@ -233,13 +233,13 @@ class TestComputeWeightedAccuracy:
         assert result == 0.0
         assert source == "neutral_insufficient"
 
-    def test_insignificant_returns_neutral(self):
-        """is_significant=False → neutral weight (0.0)."""
+    def test_insignificant_returns_measured_accuracy(self):
+        """is_significant=False but not anti-predictive → contributes at measured accuracy (not zeroed)."""
         metrics = _make_stream_metrics(is_significant=False, p_value=0.30)
         result, source = _compute_weighted_accuracy(metrics, "test")
-        assert result == NEUTRAL_ACCURACY
-        assert result == 0.0
-        assert source == "neutral_insignificant"
+        # Near-random streams still participate in weight normalization at measured accuracy
+        assert result > 0.0
+        assert source == "calculated"
 
     def test_none_recent_accuracy_uses_smoothed_full_only(self):
         """recent_accuracy=None → falls back to smoothed full_accuracy only."""
@@ -668,15 +668,16 @@ class TestDesignContract:
 
     def test_neutral_streams_get_zero_weight(self):
         """
-        Neutral (0.0) stream must get ZERO weight — it drops out of normalization.
-        This concentrates weight on reliable streams exclusively.
+        Anti-predictive stream must get ZERO weight — it drops out of normalization.
+        Near-random streams (is_significant=False but not anti-predictive) still participate.
         """
         backtest = _make_backtest_results(
             tech_full=0.65, tech_recent=0.65,
             stock_full=0.65, stock_recent=0.65,
             market_full=0.65, market_recent=0.65,
         )
-        backtest["related_news"] = _make_stream_metrics(is_significant=False)
+        # is_anti_predictive=True (p_value_less < 0.05) → zero weight
+        backtest["related_news"] = {**_make_stream_metrics(), "is_anti_predictive": True, "p_value_less": 0.02}
         state = _make_base_state(backtest)
         result = adaptive_weights_node(state)
         aw = result["adaptive_weights"]
@@ -800,9 +801,11 @@ class TestIntegration:
 
         backtest_partial = _make_backtest_results()
         backtest_partial["market_news"]["is_sufficient"] = False
+        # is_significant=False but not anti-predictive → still reliable (contributes at measured accuracy)
         backtest_partial["related_news"]["is_significant"] = False
         result_partial = adaptive_weights_node(_make_base_state(backtest_partial))
-        assert result_partial["adaptive_weights"]["streams_reliable"] == 2
+        # Only market_news (insufficient) is unreliable; related_news (near-random) still counts
+        assert result_partial["adaptive_weights"]["streams_reliable"] == 3
 
 
 # ============================================================================

@@ -42,8 +42,21 @@ from src.langgraph_nodes.node_12_signal_generation import (
 # ============================================================================
 
 
-def _make_technical(signal: str = "BUY", confidence: float = 0.72) -> dict:
-    return {"technical_signal": signal, "technical_confidence": confidence}
+def _make_technical(alpha: float = 0.72) -> dict:
+    """Build a state fragment with technical_indicators containing technical_alpha."""
+    return {
+        "technical_indicators": {
+            "technical_alpha":      alpha,
+            "normalized_score":     float((alpha + 1.0) * 50.0),
+            "ic_score":             0.35,
+            "regression_valid":     True,
+            "n_training_samples":   90,
+            "predicted_return_pct": float(alpha * 5.0),
+            "market_regime":        "trending_up" if alpha > 0 else "trending_down",
+            "hold_low":             45.0,
+            "hold_high":            55.0,
+        }
+    }
 
 
 def _make_sentiment(
@@ -146,14 +159,55 @@ def _make_content(early_risk: str = "LOW") -> dict:
 def _make_full_state(**overrides) -> dict:
     """
     Build a complete realistic state with all 4 streams populated.
+
     Keyword arguments override individual top-level state keys.
+    Special handling:
+      - technical_alpha: sets the technical_indicators.technical_alpha
+        (old-style technical_signal / technical_confidence kwargs are
+        translated for backward compat, or ignored when technical_alpha
+        is given explicitly)
+      - aggregated_sentiment: sets state['aggregated_sentiment']
     """
+    # Translate old-style signal/confidence kwargs to technical_alpha
+    _sentinel = object()
+    signal = overrides.pop("technical_signal", _sentinel)
+    confidence = overrides.pop("technical_confidence", _sentinel)
+    tech_alpha_override = overrides.pop("technical_alpha", _sentinel)
+
+    # Determine if technical stream should be absent (missing)
+    _signal_explicitly_set = signal is not _sentinel
+    _alpha_explicitly_set = tech_alpha_override is not _sentinel
+
+    _signal_val = None if signal is _sentinel else signal
+    _conf_val = None if confidence is _sentinel else confidence
+    _alpha_val = None if tech_alpha_override is _sentinel else tech_alpha_override
+
+    # When signal or alpha is explicitly None → remove technical_indicators (missing stream)
+    _tech_missing = (_signal_explicitly_set and _signal_val is None) or \
+                    (_alpha_explicitly_set and _alpha_val is None)
+
+    if _tech_missing:
+        default_alpha = None  # will cause technical_indicators to be set to None
+    elif _alpha_val is not None:
+        default_alpha = float(_alpha_val)
+    elif _signal_val == "SELL":
+        default_alpha = -(_conf_val or 0.72)
+    elif _signal_val == "HOLD":
+        default_alpha = 0.0
+    elif _signal_val == "BUY":
+        default_alpha = _conf_val or 0.72
+    else:
+        default_alpha = 0.72
+
     state = {
         "ticker": "AAPL",
         "errors": [],
         "node_execution_times": {},
     }
-    state.update(_make_technical())
+    if default_alpha is None:
+        state["technical_indicators"] = None
+    else:
+        state.update(_make_technical(alpha=default_alpha))
     state.update(_make_sentiment())
     state.update(_make_market_context())
     state.update(_make_monte_carlo())
@@ -171,52 +225,64 @@ def _make_full_state(**overrides) -> dict:
 
 class TestScoreTechnical:
 
-    def test_buy_signal_positive_score(self):
-        """BUY with confidence=0.72 → +0.72."""
-        s = _make_technical(signal="BUY", confidence=0.72)
+    def test_buy_alpha_positive_score(self):
+        """technical_alpha=+0.72 → score=+0.72."""
+        s = _make_technical(alpha=0.72)
         score, missing = _score_technical(s)
         assert abs(score - 0.72) < 1e-9
         assert missing is False
 
-    def test_sell_signal_negative_score(self):
-        """SELL with confidence=0.61 → -0.61."""
-        s = _make_technical(signal="SELL", confidence=0.61)
+    def test_sell_alpha_negative_score(self):
+        """technical_alpha=-0.61 → score=-0.61."""
+        s = _make_technical(alpha=-0.61)
         score, missing = _score_technical(s)
         assert abs(score - (-0.61)) < 1e-9
         assert missing is False
 
-    def test_hold_signal_zero_score(self):
-        """HOLD regardless of confidence → 0.0 (direction is neutral)."""
-        s = _make_technical(signal="HOLD", confidence=0.55)
+    def test_neutral_alpha_near_zero(self):
+        """technical_alpha=0.0 → score=0.0."""
+        s = _make_technical(alpha=0.0)
         score, missing = _score_technical(s)
         assert score == 0.0
         assert missing is False
 
-    def test_missing_signal_returns_missing(self):
-        """technical_signal=None → (0.0, True)."""
-        s = {"technical_signal": None, "technical_confidence": 0.70}
-        score, missing = _score_technical(s)
-        assert score == 0.0
-        assert missing is True
-
-    def test_missing_confidence_returns_missing(self):
-        """technical_confidence=None → (0.0, True)."""
-        s = {"technical_signal": "BUY", "technical_confidence": None}
-        score, missing = _score_technical(s)
-        assert score == 0.0
-        assert missing is True
-
-    def test_both_fields_absent_returns_missing(self):
-        """Empty state → (0.0, True)."""
+    def test_missing_technical_indicators_returns_missing(self):
+        """No technical_indicators in state → (0.0, True)."""
         score, missing = _score_technical({})
         assert score == 0.0
         assert missing is True
 
-    def test_score_is_product_of_confidence_and_sign(self):
-        """Verify exact arithmetic: score = sign * confidence."""
-        s = _make_technical(signal="SELL", confidence=0.85)
+    def test_technical_indicators_none_returns_missing(self):
+        """technical_indicators=None → (0.0, True)."""
+        score, missing = _score_technical({"technical_indicators": None})
+        assert score == 0.0
+        assert missing is True
+
+    def test_empty_technical_indicators_returns_missing(self):
+        """technical_indicators={} (no alpha, no normalized_score) → (0.0, True)."""
+        score, missing = _score_technical({"technical_indicators": {}})
+        assert score == 0.0
+        assert missing is True
+
+    def test_score_is_exact_alpha(self):
+        """Verify exact passthrough: score == technical_alpha."""
+        s = _make_technical(alpha=-0.85)
         score, _ = _score_technical(s)
         assert abs(score - (-0.85)) < 1e-9
+
+    def test_fallback_to_normalized_score(self):
+        """When technical_alpha absent, falls back to normalized_score."""
+        s = {"technical_indicators": {"normalized_score": 85.0}}
+        score, missing = _score_technical(s)
+        # (85 - 50) / 50 = 0.70
+        assert abs(score - 0.70) < 1e-9
+        assert missing is False
+
+    def test_technical_alpha_takes_priority_over_normalized_score(self):
+        """technical_alpha wins when both keys present."""
+        s = {"technical_indicators": {"technical_alpha": 0.30, "normalized_score": 85.0}}
+        score, _ = _score_technical(s)
+        assert abs(score - 0.30) < 1e-9
 
 
 # ============================================================================

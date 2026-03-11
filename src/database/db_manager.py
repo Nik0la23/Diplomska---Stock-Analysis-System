@@ -390,27 +390,48 @@ def get_cached_news(
         with get_connection(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT title, description, url, source, published_at
+                SELECT title, description, url, source, published_at,
+                       sentiment_label, sentiment_score
                 FROM news_articles
                 WHERE ticker = ?
                 AND news_type = ?
                 AND fetched_at > datetime('now', ?)
                 ORDER BY published_at DESC
             """, (ticker, news_type, f'-{max_age_hours} hours'))
-            
+
             articles = []
             for row in cursor.fetchall():
-                articles.append({
-                    'title': row['title'],
-                    'description': row['description'],
-                    'url': row['url'],
+                pub = row['published_at']
+                try:
+                    if not pub:
+                        ts = int(datetime.now().timestamp())
+                    else:
+                        s = str(pub).replace('Z', '').strip()
+                        if 'T' in s:
+                            ts = int(datetime.strptime(s[:19], '%Y-%m-%dT%H:%M:%S').timestamp())
+                        else:
+                            ts = int(datetime.strptime(s[:10], '%Y-%m-%d').timestamp())
+                except (ValueError, TypeError):
+                    ts = int(datetime.now().timestamp())
+                article = {
+                    'headline': row['title'] or '',
+                    'title': row['title'] or '',
+                    'summary': row['description'] or '',
+                    'description': row['description'] or '',
+                    'url': row['url'] or '',
                     'source': {'name': row['source']},
-                    'publishedAt': row['published_at']
-                })
-            
+                    'publishedAt': pub,
+                    'datetime': ts,
+                }
+                # Restore stored AV sentiment (same logic as get_news_for_ticker)
+                if row['sentiment_score'] is not None:
+                    article['overall_sentiment_score'] = float(row['sentiment_score'])
+                    article['overall_sentiment_label'] = row['sentiment_label'] or 'Neutral'
+                articles.append(article)
+
             logger.info(f"Retrieved {len(articles)} cached {news_type} articles for {ticker}")
             return articles
-            
+
     except Exception as e:
         logger.error(f"Failed to retrieve cached news: {str(e)}")
         return []
@@ -477,7 +498,8 @@ def get_news_for_ticker(
         with get_connection(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT title, description, url, source, published_at
+                SELECT title, description, url, source, published_at,
+                       sentiment_label, sentiment_score
                 FROM news_articles
                 WHERE ticker = ?
                 AND news_type = ?
@@ -499,7 +521,7 @@ def get_news_for_ticker(
                 except (ValueError, TypeError):
                     ts = int(datetime.now().timestamp())
                 src_name = row['source'] if isinstance(row['source'], str) else getattr(row['source'], 'get', lambda k, d=None: d)('name', 'Unknown')
-                articles.append({
+                article = {
                     'headline': row['title'] or '',
                     'title': row['title'] or '',
                     'summary': row['description'] or '',
@@ -507,8 +529,18 @@ def get_news_for_ticker(
                     'url': row['url'] or '',
                     'source': {'name': src_name},
                     'publishedAt': pub,
-                    'datetime': ts
-                })
+                    'datetime': ts,
+                }
+                # Restore stored AV sentiment so Node 5 uses it directly
+                # instead of falling back to FinBERT for every DB-loaded article.
+                # Only add these keys when a real score exists — their presence
+                # is what Node 5's extract_alpha_vantage_sentiment() checks.
+                if row['sentiment_score'] is not None:
+                    article['overall_sentiment_score'] = float(row['sentiment_score'])
+                    # DB stores normalized labels ('positive'/'negative'/'neutral')
+                    # which is exactly the format the downstream aggregation expects.
+                    article['overall_sentiment_label'] = row['sentiment_label'] or 'Neutral'
+                articles.append(article)
             logger.info(f"Retrieved {len(articles)} {news_type} articles for {ticker} (last {days} days)")
             return articles
     except Exception as e:
