@@ -41,6 +41,7 @@ from src.langgraph_nodes.node_11_adaptive_weights import adaptive_weights_node
 from src.langgraph_nodes.node_12_signal_generation import signal_generation_node
 from src.langgraph_nodes.node_13_beginner_explanation import beginner_explanation_node
 from src.langgraph_nodes.node_14_technical_explanation import technical_explanation_node
+from src.langgraph_nodes.node_15_dashboard import dashboard_node
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,9 @@ def create_stock_analysis_workflow() -> StateGraph:
 
     # Phase 8: Technical Explanation (Node 14)
     workflow.add_node("technical_explanation", technical_explanation_node)
+
+    # Phase 9: Dashboard Data Preparation (Node 15)
+    workflow.add_node("dashboard", dashboard_node)
     
     # ========================================================================
     # DEFINE EDGES (Sequential Flow)
@@ -238,9 +242,10 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_edge("adaptive_weights", "signal_generation")
     workflow.add_edge("signal_generation", "beginner_explanation")
     workflow.add_edge("beginner_explanation", "technical_explanation")
-    workflow.add_edge("technical_explanation", END)  # temporary until Node 15
+    workflow.add_edge("technical_explanation", "dashboard")
+    workflow.add_edge("dashboard", END)
 
-    logger.info("Workflow built successfully (parallel → background outcomes → Node 8 → Node 9B → Node 10 → Node 11 → Node 12 → Node 13 → Node 14)")
+    logger.info("Workflow built successfully (parallel → background outcomes → Node 8 → Node 9B → Node 10 → Node 11 → Node 12 → Node 13 → Node 14 → Node 15)")
     
     # Compile and return
     return workflow.compile()

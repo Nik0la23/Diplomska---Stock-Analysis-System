@@ -378,14 +378,28 @@ def calculate_adaptive_weights(
 
     # Sanity check
     weight_sum = sum(weights.values())
+    used_fallback = False
     if abs(weight_sum - 1.0) > 0.001:
         logger.error(
             f"Weights do not sum to 1.0 (got {weight_sum:.6f}) — falling back to equal weights"
         )
         weights = {wk: EQUAL_WEIGHT for _, wk in STREAM_KEYS}
+        used_fallback = True
+
+    streams_reliable = sum(
+        1 for src in weight_sources.values()
+        if src in ("calculated", "full_accuracy_only")
+    )
+
+    return {
+        **weights,
+        "weighted_accuracies": {k: round(v, 6) for k, v in weighted_accuracies.items()},
+        "weight_sources": weight_sources,
+        "streams_reliable": streams_reliable,
+        "hold_threshold_pct": backtest_results.get("hold_threshold_pct"),
         "sample_period_days": backtest_results.get("sample_period_days", 180),
         "per_stream_adjustments": {k: round(v, 4) for k, v in applied_adjustments.items()},
-        "fallback_equal_weights": False,
+        "fallback_equal_weights": used_fallback,
     }
 
 
