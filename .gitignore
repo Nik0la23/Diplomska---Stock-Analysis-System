@@ -60,3 +60,6 @@ dist/
 # FinBERT model cache (large files)
 transformers_cache/
 torch_cache/
+
+# LangGraph dev runtime checkpoints (not code, can be large)
+.langgraph_api/
