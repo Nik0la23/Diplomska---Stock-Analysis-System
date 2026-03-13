@@ -1,38 +1,29 @@
 """
-Node 6: Market Context Analysis
+Node 6: Market Context Analysis (FMP MCP + structured market_context schema).
 
-Provides the macro "zoom out" view — is the whole market on fire while this
-stock looks locally fine? Combines five independent layers into a single
-continuous headwind/tailwind score on [-1, +1].
+Provides the macro "zoom out" view — what is the world around this stock doing
+right now — as a rich, structured briefing in state["market_context"].
 
-Layers (weighted composite):
-1. SPY multi-timeframe (1d / 5d / 21d) — 35 %   price trend across short, medium, long windows
-2. VIX fear gauge                        — 25 %   market-wide fear level
-3. Sector ETF performance (5-day)        — 20 %   sector health
-4. Related-company peer performance      — 10 %   peers moving together?
-5. Market news sentiment (last 14 days)  — 10 %   narrative from cleaned_market_news
-
-Key fixes vs previous version:
-- Correlation NaN bug fixed: numpy corrcoef on .values avoids timezone index mismatch
-- Sector now uses 5-day window (1-day is noise)
-- VIX added as a direct fear proxy
-- Market news from state['cleaned_market_news'] (was ignored before)
-- Output: market_headwind_score on [-1,+1]; context_signal BUY/SELL/HOLD kept for
-  Node 12 backward compatibility
-
-Runs in PARALLEL with: Nodes 4, 5, 7
-Runs AFTER:  Node 9A (cleaned_market_news available)
-Runs BEFORE: Node 8 (news verification)
+Execution context:
+- Runs AFTER: Node 1 (raw_price_data), Node 9A (cleaned_market_news)
+- Runs IN PARALLEL WITH: Nodes 4, 5, 7 (no data dependency conflicts)
+- Runs BEFORE: Node 8, Node 11, Node 12, Nodes 13 & 14
 """
 
+import json
 import math
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from langchain_core.messages import HumanMessage
+from langgraph.types import RunnableConfig
+
+from src.graph.state import StockAnalysisState
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +33,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 SECTOR_ETFS: Dict[str, str] = {
+    # GICS canonical names
     "Technology":             "XLK",
     "Healthcare":             "XLV",
     "Financials":             "XLF",
@@ -53,6 +45,63 @@ SECTOR_ETFS: Dict[str, str] = {
     "Real Estate":            "XLRE",
     "Utilities":              "XLU",
     "Communication Services": "XLC",
+    # yfinance alternate spellings (map to the same ETF)
+    "Consumer Cyclical":      "XLY",   # yfinance name for Consumer Discretionary
+    "Financial Services":     "XLF",   # yfinance name for Financials
+    "Basic Materials":        "XLB",   # yfinance name for Materials
+    "Communication":          "XLC",
+    "Health Care":            "XLV",
+}
+
+# Hardcoded sector/industry fallback for common tickers.
+# Used when yfinance .info returns an empty dict or omits sector data
+# (happens under rate-limiting or network issues during stress runs).
+SECTOR_FALLBACK: Dict[str, Tuple[str, str]] = {
+    "TSLA":  ("Consumer Cyclical",       "Auto Manufacturers"),
+    "AAPL":  ("Technology",             "Consumer Electronics"),
+    "MSFT":  ("Technology",             "Software—Infrastructure"),
+    "NVDA":  ("Technology",             "Semiconductors"),
+    "AMD":   ("Technology",             "Semiconductors"),
+    "INTC":  ("Technology",             "Semiconductors"),
+    "GOOGL": ("Communication Services", "Internet Content & Information"),
+    "GOOG":  ("Communication Services", "Internet Content & Information"),
+    "META":  ("Communication Services", "Internet Content & Information"),
+    "AMZN":  ("Consumer Cyclical",       "Internet Retail"),
+    "NFLX":  ("Communication Services", "Entertainment"),
+    "JPM":   ("Financials",             "Banks—Diversified"),
+    "BAC":   ("Financials",             "Banks—Diversified"),
+    "XOM":   ("Energy",                 "Oil & Gas Integrated"),
+    "CVX":   ("Energy",                 "Oil & Gas Integrated"),
+    "JNJ":   ("Healthcare",             "Drug Manufacturers—General"),
+    "PFE":   ("Healthcare",             "Drug Manufacturers—General"),
+    "RIVN":  ("Consumer Cyclical",       "Auto Manufacturers"),
+    "NIO":   ("Consumer Cyclical",       "Auto Manufacturers"),
+    "GM":    ("Consumer Cyclical",       "Auto Manufacturers"),
+    "F":     ("Consumer Cyclical",       "Auto Manufacturers"),
+    "LCID":  ("Consumer Cyclical",       "Auto Manufacturers"),
+    "QCOM":  ("Technology",             "Semiconductors"),
+    "TSM":   ("Technology",             "Semiconductors"),
+    "AVGO":  ("Technology",             "Semiconductors"),
+    "IONQ":  ("Technology",             "Computer Hardware"),
+}
+
+# Fallback peer tickers when Node 3 returns an empty related_companies list.
+# Keyed by ticker; values are close-sector competitors suitable for the
+# peer performance layer (Layer 5, 10 % weight).
+PEERS_FALLBACK: Dict[str, List[str]] = {
+    "TSLA":  ["RIVN", "NIO", "GM", "F", "LCID"],
+    "NVDA":  ["AMD", "INTC", "QCOM", "TSM", "AVGO"],
+    "AAPL":  ["MSFT", "GOOGL", "META", "AMZN"],
+    "MSFT":  ["AAPL", "GOOGL", "AMZN", "CRM"],
+    "GOOGL": ["META", "MSFT", "AMZN", "SNAP"],
+    "GOOG":  ["META", "MSFT", "AMZN", "SNAP"],
+    "META":  ["GOOGL", "SNAP", "PINS", "RDDT"],
+    "AMZN":  ["MSFT", "GOOGL", "SHOP", "EBAY"],
+    "AMD":   ["NVDA", "INTC", "QCOM", "TSM"],
+    "INTC":  ["AMD", "NVDA", "QCOM", "TSM"],
+    "RIVN":  ["TSLA", "LCID", "NIO", "GM"],
+    "NIO":   ["TSLA", "RIVN", "LCID", "GM"],
+    "IONQ":  ["IBM", "RGTI", "QUBT", "QMCO"],
 }
 
 MARKET_INDICES: Dict[str, str] = {
@@ -79,14 +128,281 @@ MARKET_NEWS_LOOKBACK_DAYS: int = 14
 # AV overall_sentiment_score ~ [-0.35, +0.35]; divide by this to map to [-1, +1]
 AV_SENTIMENT_NORM: float = 0.35
 
+MACRO_FACTORS_PROMPT = """
+You are a macro analyst at a major investment bank.
+
+Given:
+- Stock: {ticker} ({company_name})
+- Sector: {sector}
+- Industry: {industry}
+
+Identify the top 3-5 external macro factors that most directly affect this stock's price.
+Focus on: commodities, interest rates, currency exposure, geopolitical risks, supply chain dependencies.
+
+Return ONLY valid JSON. No preamble. No explanation outside the JSON.
+
+{{
+  "factors": [
+    {{
+      "factor_name": "string — human readable name",
+      "fmp_commodity_symbol": "string or null — FMP symbol if commodity (e.g. COPPER, SILVER, CRUDE_OIL, NATURAL_GAS), null otherwise",
+      "exposure_type": "COST_INPUT | REVENUE_DRIVER | COMPETITOR_PRESSURE | MACRO_SENSITIVITY",
+      "exposure_explanation": "one sentence explaining why this factor matters for this stock"
+    }}
+  ]
+}}
+"""
+
 
 # ============================================================================
-# HELPER 1: Get Stock Sector
+# PURE HELPERS (SPY/VIX/regime, classification)
 # ============================================================================
+
+
+def _safe_spy_returns_from_history(closes: List[float]) -> Dict[str, float]:
+    """
+    Compute SPY multi-timeframe % returns and volatility from a list of closes.
+
+    Expects prices ordered oldest→newest and at least ~25 trading days of data
+    to reliably compute 1d/5d/21d returns. Returns zeros when data is
+    insufficient.
+
+    Args:
+        closes: List of close prices ordered oldest→newest.
+
+    Returns:
+        Dict with keys: spy_return_1d, spy_return_5d, spy_return_21d,
+        market_volatility_pct.
+    """
+    if len(closes) < 5:
+        return {
+            "spy_return_1d": 0.0,
+            "spy_return_5d": 0.0,
+            "spy_return_21d": 0.0,
+            "market_volatility_pct": 0.0,
+        }
+
+    def _pct(start_idx: int) -> float:
+        if len(closes) <= abs(start_idx):
+            return 0.0
+        start = float(closes[start_idx])
+        end = float(closes[-1])
+        if start == 0:
+            return 0.0
+        return float((end - start) / start * 100.0)
+
+    ret_1d = _pct(-2)
+    ret_5d = _pct(-6) if len(closes) >= 6 else _pct(0)
+    ret_21d = _pct(-22) if len(closes) >= 22 else _pct(0)
+
+    arr = np.asarray(closes, dtype=float)
+    returns = np.diff(arr) / arr[:-1]
+    volatility = float(np.std(returns) * 100.0) if returns.size > 1 else 0.0
+
+    return {
+        "spy_return_1d": ret_1d,
+        "spy_return_5d": ret_5d,
+        "spy_return_21d": ret_21d,
+        "market_volatility_pct": volatility,
+    }
+
+
+def get_market_trend_multitimeframe_from_history(closes: List[float]) -> Dict[str, Any]:
+    """
+    Derive SPY trend and volatility from a historical closes list.
+
+    Preserves the logic of the previous implementation but takes data from
+    an FMP historical price tool instead of calling yfinance directly.
+
+    Args:
+        closes: List of SPY close prices ordered oldest→newest.
+
+    Returns:
+        {
+            'spy_return_1d': float,
+            'spy_return_5d': float,
+            'spy_return_21d': float,
+            'spy_trend_label': str,        # BULLISH | BEARISH | NEUTRAL
+            'market_volatility_pct': float
+        }
+    """
+    base = _safe_spy_returns_from_history(closes)
+
+    def _score(pct: float) -> float:
+        if pct > 1.0:
+            return 1.0
+        if pct > 0.5:
+            return 0.5
+        if pct > -0.5:
+            return 0.0
+        if pct > -1.0:
+            return -0.5
+        return -1.0
+
+    composite = (
+        0.2 * _score(base["spy_return_1d"])
+        + 0.4 * _score(base["spy_return_5d"])
+        + 0.4 * _score(base["spy_return_21d"])
+    )
+
+    if composite >= 0.3:
+        trend = "BULLISH"
+    elif composite <= -0.3:
+        trend = "BEARISH"
+    else:
+        trend = "NEUTRAL"
+
+    return {
+        "spy_return_1d": base["spy_return_1d"],
+        "spy_return_5d": base["spy_return_5d"],
+        "spy_return_21d": base["spy_return_21d"],
+        "spy_trend_label": trend,
+        "market_volatility_pct": base["market_volatility_pct"],
+    }
+
+
+def get_vix_level_from_price(vix_level: float) -> Dict[str, Any]:
+    """
+    Classify market fear from a VIX price and provide interpretation.
+
+    Categories:
+    - <15   CALM
+    - 15-20 MODERATE
+    - 20-25 ELEVATED
+    - 25-30 HIGH
+    - >30   PANIC
+    """
+    level = float(vix_level)
+    if level < 15:
+        category = "CALM"
+        interpretation = "Low implied volatility; macro fear is muted."
+    elif level < 20:
+        category = "MODERATE"
+        interpretation = "Normal market volatility; no major stress signals."
+    elif level < 25:
+        category = "ELEVATED"
+        interpretation = "Volatility is elevated; macro headlines matter more."
+    elif level < 30:
+        category = "HIGH"
+        interpretation = "High volatility; risk-off flows can dominate moves."
+    else:
+        category = "PANIC"
+        interpretation = "Extreme volatility; short‑term moves are driven by fear."
+
+    return {
+        "vix_level": level,
+        "vix_category": category,
+        "vix_interpretation": interpretation,
+    }
+
+
+def classify_market_regime(
+    spy_return_1d: float,
+    spy_return_5d: float,
+    vix_level: float,
+) -> Dict[str, str]:
+    """
+    Classify overall market regime from SPY returns and VIX level.
+
+    Implements the 8-label taxonomy from the Node 6 refactor guide.
+    """
+    vix_info = get_vix_level_from_price(vix_level)
+    vix_category = vix_info["vix_category"]
+
+    regime_label = "NEUTRAL"
+    if spy_return_5d > 1.0 and vix_level < 18:
+        regime_label = "RISK_ON_BULL"
+    elif abs(spy_return_5d) <= 0.5 and vix_level < 15:
+        regime_label = "LOW_VOL_GRIND"
+    elif spy_return_5d > 1.0 and vix_level > 22:
+        regime_label = "HIGH_VOL_BULL"
+    elif abs(spy_return_5d) <= 0.5 and vix_level > 20:
+        regime_label = "DISTRIBUTION"
+    elif spy_return_5d < -1.0 and vix_level > 22:
+        regime_label = "RISK_OFF_BEAR"
+    elif spy_return_5d < -2.0 and vix_level > 28:
+        regime_label = "PANIC_SELLOFF"
+    elif spy_return_1d > 1.0 and spy_return_5d < 0:
+        regime_label = "RECOVERY"
+
+    descriptions = {
+        "RISK_ON_BULL": "Broad market is in a risk-on, bullish phase; positive stock news is more likely to be rewarded.",
+        "LOW_VOL_GRIND": "Market is grinding higher or sideways with low volatility; individual events can drive outsized moves.",
+        "HIGH_VOL_BULL": "Market is rising but nervous; gains can be sharp but fragile.",
+        "DISTRIBUTION": "Market shows topping behaviour; rallies are being sold into.",
+        "RISK_OFF_BEAR": "Market is in risk-off mode; broad selling pressure can mute positive stock-specific catalysts.",
+        "PANIC_SELLOFF": "Market is in panic; flows dominate fundamentals in the short term.",
+        "RECOVERY": "Market is bouncing from oversold levels; follow‑through will confirm or reject the recovery.",
+        "NEUTRAL": "No dominant macro regime; price action is balanced between macro and stock-specific drivers.",
+    }
+
+    return {
+        "regime_label": regime_label,
+        "regime_description": descriptions[regime_label],
+        "vix_category": vix_category,
+    }
+
+
+def compute_relative_strength(
+    stock_return_5d: float,
+    stock_return_21d: float,
+    sector_return_5d: float,
+    sector_return_21d: float,
+) -> Dict[str, Any]:
+    """
+    Compute relative strength of the stock vs its sector over 5d and 21d.
+    """
+    stock_vs_sector_5d = stock_return_5d - sector_return_5d
+    stock_vs_sector_21d = stock_return_21d - sector_return_21d
+
+    if stock_vs_sector_5d > 0.5:
+        label = "LEADING"
+    elif stock_vs_sector_5d < -0.5:
+        label = "LAGGING"
+    else:
+        label = "IN_LINE"
+
+    return {
+        "stock_vs_sector_5d": stock_vs_sector_5d,
+        "stock_vs_sector_21d": stock_vs_sector_21d,
+        "relative_strength_label": label,
+    }
+
+
+def _derive_market_cap_tier(market_cap: Optional[float]) -> str:
+    """
+    Map numeric market cap to a tier string: mega/large/mid/small/Unknown.
+    """
+    if market_cap is None:
+        return "Unknown"
+    try:
+        cap = float(market_cap)
+    except (TypeError, ValueError):
+        return "Unknown"
+
+    if cap > 200_000_000_000:
+        return "mega"
+    if cap > 10_000_000_000:
+        return "large"
+    if cap > 2_000_000_000:
+        return "mid"
+    return "small"
+
+
+def _summarise_index_memberships(raw_indices: Optional[List[str]]) -> List[str]:
+    """
+    Normalise index membership list from company_profile into human-friendly labels.
+    """
+    if not raw_indices:
+        return []
+    return list({str(idx) for idx in raw_indices})
 
 def get_stock_sector(ticker: str) -> Tuple[str, str]:
     """
     Get the sector and industry for a stock using yfinance.
+
+    Falls back to SECTOR_FALLBACK when yfinance returns an empty info dict
+    (common under rate-limiting or during rapid stress-test runs).
 
     Args:
         ticker: Stock symbol (e.g., 'NVDA').
@@ -99,15 +415,31 @@ def get_stock_sector(ticker: str) -> Tuple[str, str]:
         >>> print(sector)
         'Technology'
     """
+    upper = ticker.upper()
     try:
         info = yf.Ticker(ticker).info
-        sector   = info.get("sector",   "Unknown")
-        industry = info.get("industry", "Unknown")
-        logger.info(f"  Sector lookup: {ticker} → {sector} / {industry}")
-        return sector, industry
+        sector   = info.get("sector")   or ""
+        industry = info.get("industry") or ""
+
+        if sector:
+            logger.info(f"  Sector lookup: {ticker} → {sector} / {industry}")
+            return sector, industry or "Unknown"
+
+        # yfinance returned an empty or incomplete info dict
+        logger.warning(
+            f"  Sector lookup: yfinance returned no sector for {ticker} — trying fallback"
+        )
     except Exception as exc:
         logger.warning(f"  Sector lookup failed for {ticker}: {exc}")
-        return "Unknown", "Unknown"
+
+    # Hardcoded fallback
+    if upper in SECTOR_FALLBACK:
+        sector, industry = SECTOR_FALLBACK[upper]
+        logger.info(f"  Sector fallback: {ticker} → {sector} / {industry}")
+        return sector, industry
+
+    logger.warning(f"  Sector: no fallback entry for {ticker}, returning Unknown")
+    return "Unknown", "Unknown"
 
 
 # ============================================================================
@@ -653,171 +985,507 @@ def compute_headwind_tailwind_score(
 # MAIN NODE FUNCTION
 # ============================================================================
 
-def market_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def _build_fallback_market_context(ticker: str, elapsed: float, error_message: str) -> Dict[str, Any]:
     """
-    Node 6: Market Context Analysis — five-layer headwind/tailwind composite.
-
-    Execution flow:
-    1. Get stock sector (yfinance)
-    2. Fetch VIX fear gauge
-    3. Fetch SPY multi-timeframe performance (1d/5d/21d)
-    4. Fetch sector ETF performance (5-day)
-    5. Fetch related-company peer performance
-    6. Calculate stock–SPY correlation (numpy, NaN-safe)
-    7. Aggregate market news sentiment from cleaned_market_news
-    8. Compute composite headwind/tailwind score
-    9. Return partial state update
-
-    Runs in PARALLEL with: Nodes 4, 5, 7
-    Runs AFTER:  Node 9A
-    Runs BEFORE: Node 8
-
-    Args:
-        state: LangGraph state dict.
-
-    Returns:
-        Partial state update with market_context populated.
+    Build the full fallback market_context dict as specified in the Node 6 refactor guide.
     """
-    start_time = datetime.now()
-    ticker: str = state["ticker"]
+    return {
+        "errors": [error_message],
+        "market_context": {
+            "stock_classification": {
+                "ticker": ticker,
+                "company_name": "Unknown",
+                "sector": "Unknown",
+                "industry": "Unknown",
+                "exchange": "Unknown",
+                "index_memberships": [],
+                "market_cap_tier": "Unknown",
+                "beta_fmp": 1.0,
+            },
+            "market_regime": {
+                "regime_label": "NEUTRAL",
+                "regime_description": "Market context unavailable.",
+                "spy_return_1d": 0.0,
+                "spy_return_5d": 0.0,
+                "spy_return_21d": 0.0,
+                "spy_trend_label": "NEUTRAL",
+                "vix_level": 20.0,
+                "vix_category": "MODERATE",
+                "vix_interpretation": "Unavailable.",
+                "market_volatility_pct": 0.0,
+            },
+            "sector_industry_context": {
+                "sector_return_5d": 0.0,
+                "sector_trend": "FLAT",
+                "industry_return_5d": 0.0,
+                "industry_trend": "FLAT",
+                "stock_vs_sector_5d": 0.0,
+                "stock_vs_sector_21d": 0.0,
+                "relative_strength_label": "IN_LINE",
+                "sector_context_note": "Unavailable.",
+            },
+            "macro_factor_exposure": {
+                "identified_factors": [],
+                "commodity_prices": {},
+                "commodity_trends": {},
+                "macro_summary": "Unavailable.",
+            },
+            "market_correlation_profile": {
+                "market_correlation": 0.5,
+                "correlation_strength": "MEDIUM",
+                "beta_calculated": 1.0,
+                "beta_interpretation": "Unavailable.",
+                "correlation_note": "Unavailable.",
+            },
+            "news_sentiment_context": {
+                "market_news_sentiment": 0.0,
+                "market_news_count": 0,
+                "sentiment_label": "NEUTRAL",
+                "sentiment_interpretation": "Unavailable.",
+            },
+        },
+        "node_execution_times": {"node_6": elapsed},
+    }
 
-    logger.info(f"Node 6: Market context analysis for {ticker}")
+
+async def market_context_node(state: StockAnalysisState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Node 6: Market Context Analysis (FMP MCP, async).
+
+    Uses FMP tools (Pattern A) and bare LLM calls (Pattern C) to construct
+    state["market_context"] with six sub-dicts:
+    - stock_classification
+    - market_regime
+    - sector_industry_context
+    - macro_factor_exposure
+    - market_correlation_profile
+    - news_sentiment_context
+    """
+    start = time.time()
+    ticker = state["ticker"]
+    logger.info(f"[Node 6] Starting for {ticker}")
+
+    configurable = config["configurable"]
+    tools_by_name = configurable["tools_by_name"]
+    llm = configurable["llm"]
+    llm_with_tools = configurable.get("llm_with_tools")  # not used in this node
+
+    # Guard: Node 6 uses Pattern A (direct tools) and Pattern C (bare LLM),
+    # but never Pattern B (agent loop). We intentionally do NOT require
+    # llm_with_tools here; only tools_by_name and llm must be present.
+    if not tools_by_name or llm is None:
+        logger.warning(f"[Node 6] FMP config incomplete — skipping FMP calls")
+        elapsed = time.time() - start
+        return _build_fallback_market_context(
+            ticker, elapsed, f"Node 6: FMP config unavailable for {ticker}"
+        )
 
     try:
-        # ====================================================================
-        # STEP 1: Sector
-        # ====================================================================
-        sector, industry = get_stock_sector(ticker)
+        # ------------------------------------------------------------------
+        # Step 1: company_profile (Pattern A)
+        # ------------------------------------------------------------------
+        company_profile_tool = tools_by_name.get("company_profile")
+        company_profile_data: Dict[str, Any] = {}
+        if company_profile_tool is not None:
+            try:
+                raw_profile = await company_profile_tool.ainvoke({"symbol": ticker})
+                parsed_profile = json.loads(raw_profile)
+                if isinstance(parsed_profile, list) and parsed_profile:
+                    company_profile_data = parsed_profile[0]
+                elif isinstance(parsed_profile, dict):
+                    company_profile_data = parsed_profile
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    f"[Node 6] Could not parse company_profile result for {ticker}: {exc}"
+                )
+                company_profile_data = {}
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] company_profile tool failed for {ticker}: {exc}"
+                )
 
-        # ====================================================================
-        # STEP 2: VIX
-        # ====================================================================
-        vix_data = get_vix_level()
+        company_name = str(company_profile_data.get("companyName") or "Unknown")
+        sector = str(company_profile_data.get("sector") or "Unknown")
+        industry = str(company_profile_data.get("industry") or "Unknown")
+        exchange = str(company_profile_data.get("exchangeShortName") or "Unknown")
+        raw_indices = company_profile_data.get("indexMemberships") or []
+        index_memberships = _summarise_index_memberships(raw_indices)
+        beta_fmp = float(company_profile_data.get("beta") or 1.0)
+        market_cap_tier = _derive_market_cap_tier(company_profile_data.get("mktCap"))
 
-        # ====================================================================
-        # STEP 3: SPY multi-timeframe
-        # ====================================================================
-        spy_data = get_market_trend_multitimeframe()
+        # ------------------------------------------------------------------
+        # Step 2: Macro factor identification (Pattern C – bare LLM)
+        # ------------------------------------------------------------------
+        macro_prompt = MACRO_FACTORS_PROMPT.format(
+            ticker=ticker,
+            company_name=company_name,
+            sector=sector,
+            industry=industry,
+        )
+        identified_factors: List[Dict[str, Any]] = []
+        commodity_symbols: List[str] = []
+        try:
+            response = await llm.ainvoke([HumanMessage(content=macro_prompt)])
+            factors_data = json.loads(response.content)  # type: ignore[arg-type]
+            if isinstance(factors_data, dict):
+                identified_factors = factors_data.get("factors", []) or []
+            commodity_symbols = [
+                f["fmp_commodity_symbol"]
+                for f in identified_factors
+                if isinstance(f, dict) and f.get("fmp_commodity_symbol")
+            ]
+        except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+            logger.warning(
+                f"[Node 6] Macro factor LLM parse failed for {ticker}: {exc}"
+            )
+            identified_factors = []
+            commodity_symbols = []
+        except Exception as exc:
+            logger.warning(
+                f"[Node 6] Macro factor LLM call failed for {ticker}: {exc}"
+            )
+            identified_factors = []
+            commodity_symbols = []
 
-        # ====================================================================
-        # STEP 4: Sector ETF (5-day)
-        # ====================================================================
-        sector_data = get_sector_performance(sector, days=5)
+        # ------------------------------------------------------------------
+        # Step 3: Sector/industry, SPY history, VIX, commodities (Pattern A)
+        # ------------------------------------------------------------------
+        sector_return_5d = 0.0
+        sector_trend = "FLAT"
+        industry_return_5d = 0.0
+        industry_trend = "FLAT"
+        spy_closes: List[float] = []
+        vix_price = 20.0
+        commodity_prices: Dict[str, float] = {}
+        commodity_trends: Dict[str, str] = {}
 
-        # ====================================================================
-        # STEP 5: Related companies
-        # ====================================================================
-        related_tickers: List[str] = state.get("related_companies") or []
-        peers_data = analyze_related_companies(related_tickers)
+        sector_tool = tools_by_name.get("sector_performance")
+        if sector_tool is not None and sector != "Unknown":
+            try:
+                raw = await sector_tool.ainvoke({"sector": sector})
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    sector_return_5d = float(data.get("return_5d") or 0.0)
+                    sector_trend = str(data.get("trend") or "FLAT")
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    f"[Node 6] sector_performance parse failed for {ticker}: {exc}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] sector_performance tool failed for {ticker}: {exc}"
+                )
 
-        # ====================================================================
-        # STEP 6: Stock–market correlation (NaN-safe)
-        # ====================================================================
-        price_data: Optional[pd.DataFrame] = state.get("raw_price_data")
-        if price_data is not None and not price_data.empty:
-            corr_data = calculate_correlation(ticker, price_data)
+        industry_tool = tools_by_name.get("industry_performance")
+        if industry_tool is not None and industry != "Unknown":
+            try:
+                raw = await industry_tool.ainvoke({"industry": industry})
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    industry_return_5d = float(data.get("return_5d") or 0.0)
+                    industry_trend = str(data.get("trend") or "FLAT")
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    f"[Node 6] industry_performance parse failed for {ticker}: {exc}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] industry_performance tool failed for {ticker}: {exc}"
+                )
+
+        # SPY historical prices – tool name must be confirmed via tools_by_name.
+        spy_history_tool = None
+        for name in tools_by_name.keys():
+            lower = name.lower()
+            if "historical" in lower or "chart" in lower:
+                spy_history_tool = tools_by_name[name]
+                break
+        if spy_history_tool is not None:
+            try:
+                # Request at least 30 calendar days to guarantee 21 trading days.
+                raw = await spy_history_tool.ainvoke({"symbol": "SPY", "days": 30})
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    spy_closes = [
+                        float(row.get("close"))
+                        for row in data
+                        if isinstance(row, dict) and row.get("close") is not None
+                    ]
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    f"[Node 6] SPY historical parse failed for {ticker}: {exc}"
+                )
+                spy_closes = []
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] SPY historical tool failed for {ticker}: {exc}"
+                )
+                spy_closes = []
+
+        vix_quote_tool = tools_by_name.get("quote")
+        if vix_quote_tool is not None:
+            try:
+                raw = await vix_quote_tool.ainvoke({"symbol": "^VIX"})
+                data = json.loads(raw)
+                if isinstance(data, list) and data:
+                    vix_price = float(data[0].get("price") or vix_price)
+                elif isinstance(data, dict):
+                    vix_price = float(data.get("price") or vix_price)
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    f"[Node 6] VIX quote parse failed for {ticker}: {exc}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] VIX quote tool failed for {ticker}: {exc}"
+                )
+
+        commodity_tool = tools_by_name.get("commodity")
+        if commodity_tool is not None and commodity_symbols:
+            for symbol in commodity_symbols:
+                try:
+                    raw = await commodity_tool.ainvoke({"symbol": symbol})
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        price = data.get("price")
+                        change_5d = data.get("change_5d", 0.0)
+                    elif isinstance(data, list) and data:
+                        price = data[0].get("price")
+                        change_5d = data[0].get("change_5d", 0.0)
+                    else:
+                        continue
+                    if price is None:
+                        continue
+                    price_f = float(price)
+                    commodity_prices[symbol] = price_f
+                    change_5d_f = float(change_5d or 0.0)
+                    if change_5d_f > 0.5:
+                        trend = "UP"
+                    elif change_5d_f < -0.5:
+                        trend = "DOWN"
+                    else:
+                        trend = "FLAT"
+                    commodity_trends[symbol] = trend
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning(
+                        f"[Node 6] commodity parse failed for {ticker}, symbol={symbol}: {exc}"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[Node 6] commodity tool failed for {ticker}, symbol={symbol}: {exc}"
+                    )
+
+        # ------------------------------------------------------------------
+        # Step 4: Pure Python layers (SPY/VIX/regime, relative strength)
+        # ------------------------------------------------------------------
+        if spy_closes:
+            spy_trend_data = get_market_trend_multitimeframe_from_history(spy_closes)
         else:
-            logger.warning("  Correlation: no price_data in state, using defaults")
-            corr_data = {"market_correlation": 0.5, "correlation_strength": "MEDIUM", "beta": 1.0}
+            spy_trend_data = {
+                "spy_return_1d": 0.0,
+                "spy_return_5d": 0.0,
+                "spy_return_21d": 0.0,
+                "spy_trend_label": "NEUTRAL",
+                "market_volatility_pct": 0.0,
+            }
 
-        # ====================================================================
-        # STEP 7: Market news sentiment
-        # ====================================================================
-        cleaned_market_news: List[Dict[str, Any]] = state.get("cleaned_market_news") or []
-        news_data = analyze_market_news_sentiment(cleaned_market_news)
-
-        # ====================================================================
-        # STEP 8: Composite headwind / tailwind score
-        # ====================================================================
-        signal_data = compute_headwind_tailwind_score(
-            spy_composite    = spy_data["spy_composite_score"],
-            vix_contribution = vix_data["vix_contribution"],
-            sector_score     = sector_data["sector_score"],
-            peers_score      = peers_data["peers_score"],
-            news_sentiment   = news_data["market_news_sentiment"],
+        vix_info = get_vix_level_from_price(vix_price)
+        regime_info = classify_market_regime(
+            spy_return_1d=spy_trend_data["spy_return_1d"],
+            spy_return_5d=spy_trend_data["spy_return_5d"],
+            vix_level=vix_info["vix_level"],
         )
 
-        # ====================================================================
-        # STEP 9: Build results dict
-        # ====================================================================
-        results: Dict[str, Any] = {
-            # Sector
-            "sector":             sector,
-            "industry":           industry,
-            "sector_performance": sector_data["performance"],
-            "sector_trend":       sector_data["trend"],
-            # SPY
-            "market_trend":       spy_data["market_trend"],
-            "market_performance": spy_data["market_performance"],
-            "spy_return_1d":      spy_data["spy_return_1d"],
-            "spy_return_5d":      spy_data["spy_return_5d"],
-            "spy_return_21d":     spy_data["spy_return_21d"],
-            "volatility":         spy_data["volatility"],
-            # VIX
-            "vix_level":          vix_data["vix_level"],
-            "vix_category":       vix_data["vix_category"],
-            # Peers
-            "related_companies_signals": peers_data["related_companies"],
-            "related_companies_avg":     peers_data["avg_performance"],
-            "related_companies_signal":  peers_data["overall_signal"],
-            # Correlation
-            "market_correlation":   corr_data["market_correlation"],
-            "correlation_strength": corr_data["correlation_strength"],
-            "beta":                 corr_data["beta"],
-            # Market news
-            "market_news_sentiment": news_data["market_news_sentiment"],
-            "market_news_count":     news_data["market_news_count"],
-            # Signal (backward compat + new headwind score)
-            "market_headwind_score": signal_data["market_headwind_score"],
-            "context_signal":        signal_data["context_signal"],
-            "confidence":            signal_data["confidence"],
+        # Stock returns from Node 1 price data.
+        stock_return_5d = 0.0
+        stock_return_21d = 0.0
+        price_data = state.get("raw_price_data")
+        if isinstance(price_data, pd.DataFrame) and not price_data.empty:
+            try:
+                closes_series = price_data["close"]
+                if len(closes_series) >= 6:
+                    stock_return_5d = float(
+                        (closes_series.iloc[-1] - closes_series.iloc[-6])
+                        / closes_series.iloc[-6]
+                        * 100.0
+                    )
+                if len(closes_series) >= 22:
+                    stock_return_21d = float(
+                        (closes_series.iloc[-1] - closes_series.iloc[-22])
+                        / closes_series.iloc[-22]
+                        * 100.0
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] stock return calculation failed for {ticker}: {exc}"
+                )
+
+        rs_info = compute_relative_strength(
+            stock_return_5d=stock_return_5d,
+            stock_return_21d=stock_return_21d,
+            sector_return_5d=sector_return_5d,
+            sector_return_21d=industry_return_5d,
+        )
+
+        # Correlation profile (existing helper with yfinance fallback).
+        if isinstance(price_data, pd.DataFrame) and not price_data.empty:
+            correlation_data = calculate_correlation(ticker, price_data)
+        else:
+            correlation_data = {
+                "market_correlation": 0.5,
+                "correlation_strength": "MEDIUM",
+                "beta": 1.0,
+            }
+
+        beta_calculated = float(correlation_data["beta"])
+        if abs(correlation_data["market_correlation"]) > 0.7:
+            corr_note = "Stock moves closely with the market; macro regime has strong influence."
+        elif abs(correlation_data["market_correlation"]) < 0.4:
+            corr_note = "Stock is relatively de‑coupled from the market; company‑specific news dominates."
+        else:
+            corr_note = "Stock has a moderate link to the market; both macro and company news matter."
+
+        beta_interpretation = (
+            f"Beta of {beta_calculated:.2f} means {ticker} tends to move about "
+            f"{abs(beta_calculated):.1f}× the market; in {regime_info['regime_label']} this amplifies "
+            f"{'upside' if beta_calculated > 1 else 'moves'}."
+        )
+
+        # News sentiment context.
+        cleaned_market_news = state.get("cleaned_market_news") or []
+        news_data = analyze_market_news_sentiment(cleaned_market_news)
+        sentiment_score = float(news_data["market_news_sentiment"])
+        if sentiment_score > 0.15:
+            sentiment_label = "POSITIVE"
+        elif sentiment_score < -0.15:
+            sentiment_label = "NEGATIVE"
+        else:
+            sentiment_label = "NEUTRAL"
+        sentiment_interpretation = (
+            "Market narrative is broadly positive."
+            if sentiment_label == "POSITIVE"
+            else "Market narrative is broadly negative."
+            if sentiment_label == "NEGATIVE"
+            else "Market narrative is mixed or neutral."
+        )
+
+        # ------------------------------------------------------------------
+        # Step 5: Macro summary (Pattern C – bare LLM, fire-and-forget)
+        # ------------------------------------------------------------------
+        macro_summary = "Unavailable."
+        try:
+            summary_prompt = (
+                "You are a macro analyst explaining how current macro and commodity "
+                "conditions affect a single stock.\n\n"
+                f"Stock: {ticker} ({company_name}), sector={sector}, industry={industry}\n"
+                f"Identified macro factors: {identified_factors}\n"
+                f"Commodity prices: {commodity_prices}\n"
+                f"Commodity trends (5d): {commodity_trends}\n\n"
+                "Write ONE short paragraph describing what this combination of macro "
+                "factors and commodity moves likely means for the stock PRICE going "
+                "forward (upside/downside risks, sensitivity). Do not repeat the raw "
+                "numbers; focus on implications for the stock."
+            )
+            summary_response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
+            content = getattr(summary_response, "content", None)
+            if isinstance(content, str) and content.strip():
+                macro_summary = content.strip()
+        except Exception as exc:
+            logger.warning(
+                f"[Node 6] Macro summary LLM call failed for {ticker}: {exc}"
+            )
+
+        # ------------------------------------------------------------------
+        # Step 6: Assemble market_context output
+        # ------------------------------------------------------------------
+        stock_classification = {
+            "ticker": ticker,
+            "company_name": company_name,
+            "sector": sector,
+            "industry": industry,
+            "exchange": exchange,
+            "index_memberships": index_memberships,
+            "market_cap_tier": market_cap_tier,
+            "beta_fmp": beta_fmp,
         }
 
-        elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(
-            f"Node 6: completed in {elapsed:.2f}s — "
-            f"headwind={signal_data['market_headwind_score']:+.3f} "
-            f"({signal_data['context_signal']}) "
-            f"VIX={vix_data['vix_level']:.1f}/{vix_data['vix_category']} "
-            f"SPY={spy_data['spy_return_5d']:+.2f}%5d "
-            f"sector={sector_data['performance']:+.2f}%5d "
-            f"news_articles={news_data['market_news_count']}"
-        )
+        market_regime = {
+            "regime_label": regime_info["regime_label"],
+            "regime_description": regime_info["regime_description"],
+            "spy_return_1d": spy_trend_data["spy_return_1d"],
+            "spy_return_5d": spy_trend_data["spy_return_5d"],
+            "spy_return_21d": spy_trend_data["spy_return_21d"],
+            "spy_trend_label": spy_trend_data["spy_trend_label"],
+            "vix_level": vix_info["vix_level"],
+            "vix_category": vix_info["vix_category"],
+            "vix_interpretation": vix_info["vix_interpretation"],
+            "market_volatility_pct": spy_trend_data["market_volatility_pct"],
+        }
 
+        sector_context_note = (
+            "Stock is showing relative strength versus its sector."
+            if rs_info["relative_strength_label"] == "LEADING"
+            else "Stock is lagging its sector; sector strength may not be flowing into this name."
+            if rs_info["relative_strength_label"] == "LAGGING"
+            else "Stock is broadly moving in line with its sector."
+        )
+        sector_industry_context = {
+            "sector_return_5d": sector_return_5d,
+            "sector_trend": sector_trend,
+            "industry_return_5d": industry_return_5d,
+            "industry_trend": industry_trend,
+            "stock_vs_sector_5d": rs_info["stock_vs_sector_5d"],
+            "stock_vs_sector_21d": rs_info["stock_vs_sector_21d"],
+            "relative_strength_label": rs_info["relative_strength_label"],
+            "sector_context_note": sector_context_note,
+        }
+
+        macro_factor_exposure = {
+            "identified_factors": identified_factors,
+            "commodity_prices": commodity_prices,
+            "commodity_trends": commodity_trends,
+            "macro_summary": macro_summary,
+        }
+
+        market_correlation_profile = {
+            "market_correlation": correlation_data["market_correlation"],
+            "correlation_strength": correlation_data["correlation_strength"],
+            "beta_calculated": beta_calculated,
+            "beta_interpretation": beta_interpretation,
+            "correlation_note": corr_note,
+        }
+
+        news_sentiment_context = {
+            "market_news_sentiment": sentiment_score,
+            "market_news_count": news_data["market_news_count"],
+            "sentiment_label": sentiment_label,
+            "sentiment_interpretation": sentiment_interpretation,
+        }
+
+        market_context = {
+            "stock_classification": stock_classification,
+            "market_regime": market_regime,
+            "sector_industry_context": sector_industry_context,
+            "macro_factor_exposure": macro_factor_exposure,
+            "market_correlation_profile": market_correlation_profile,
+            "news_sentiment_context": news_sentiment_context,
+        }
+
+        elapsed = time.time() - start
+        logger.info(
+            f"[Node 6] Completed for {ticker} in {elapsed:.2f}s — "
+            f"regime={market_regime['regime_label']} "
+            f"rel_strength={sector_industry_context['relative_strength_label']} "
+            f"news_count={news_sentiment_context['market_news_count']}"
+        )
         return {
-            "market_context":       results,
+            "market_context": market_context,
             "node_execution_times": {"node_6": elapsed},
         }
 
     except Exception as exc:
-        logger.error(f"Node 6: failed for {ticker}: {exc}")
-        elapsed = (datetime.now() - start_time).total_seconds()
-        return {
-            "errors": [f"Node 6: market context analysis failed — {exc}"],
-            "market_context": {
-                "sector":                "Unknown",
-                "industry":              "Unknown",
-                "sector_performance":    0.0,
-                "sector_trend":          "FLAT",
-                "market_trend":          "NEUTRAL",
-                "market_performance":    0.0,
-                "spy_return_1d":         0.0,
-                "spy_return_5d":         0.0,
-                "spy_return_21d":        0.0,
-                "volatility":            0.0,
-                "vix_level":             20.0,
-                "vix_category":          "MODERATE",
-                "related_companies_signals": [],
-                "related_companies_avg": 0.0,
-                "related_companies_signal": "NEUTRAL",
-                "market_correlation":    0.5,
-                "correlation_strength":  "MEDIUM",
-                "beta":                  1.0,
-                "market_news_sentiment": 0.0,
-                "market_news_count":     0,
-                "market_headwind_score": 0.0,
-                "context_signal":        "HOLD",
-                "confidence":            0.0,
-            },
-            "node_execution_times": {"node_6": elapsed},
-        }
+        elapsed = time.time() - start
+        logger.error(f"[Node 6] Failed for {ticker}: {exc}", exc_info=True)
+        return _build_fallback_market_context(
+            ticker, elapsed, f"Node 6: market context failed — {str(exc)}"
+        )

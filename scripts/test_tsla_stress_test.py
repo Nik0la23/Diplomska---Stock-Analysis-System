@@ -49,7 +49,7 @@ for noisy in ("httpx", "httpcore", "urllib3", "yfinance", "peewee",
 
 from src.graph.workflow import run_stock_analysis
 
-TICKER = "TSLA"
+TICKER = "IONQ"
 SEP  = "=" * 72
 DASH = "─" * 60
 

@@ -21,6 +21,13 @@ Future additions:
 from langgraph.graph import StateGraph, END
 from typing import Literal
 import logging
+import os
+
+from dotenv import load_dotenv
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_anthropic import ChatAnthropic
 
 from src.graph.state import StockAnalysisState, create_initial_state
 from src.database.db_manager import get_news_outcomes_pending
@@ -290,6 +297,70 @@ def run_stock_analysis(ticker: str) -> StockAnalysisState:
     logger.info(f"Stock analysis complete for {ticker}")
     
     return final_state
+
+
+async def run_stock_analysis_async(ticker: str) -> StockAnalysisState:
+    """
+    Async runner that opens one shared FMP MCP session for the entire graph run.
+
+    The MCP client is opened ONCE here (workflow level), then shared with every
+    FMP-enabled node through RunnableConfig.  No node owns the session — this
+    function does.  Nodes that don't use FMP ignore the config completely.
+
+    Config keys injected into config["configurable"]:
+        tools_by_name  : dict[str, BaseTool]  — call a specific FMP tool directly
+        llm            : ChatAnthropic         — bare LLM (no tools bound)
+        llm_with_tools : ChatAnthropic         — LLM with all FMP tools bound
+
+    Args:
+        ticker: Stock ticker symbol (e.g. 'AAPL', 'NVDA')
+
+    Returns:
+        Final StockAnalysisState after all nodes have executed.
+
+    Example:
+        >>> import asyncio
+        >>> result = asyncio.run(run_stock_analysis_async('AAPL'))
+        >>> print(result['final_signal'])
+    """
+    load_dotenv()
+    fmp_api_key = os.environ.get("FMP_API_KEY", "")
+    if not fmp_api_key:
+        logger.warning("FMP_API_KEY not set — FMP MCP tools will be unavailable")
+
+    server_params = StdioServerParameters(
+        command="fmp-mcp",
+        args=[],
+        env={"FMP_API_KEY": fmp_api_key},
+    )
+
+    logger.info(f"Opening FMP MCP session for {ticker}...")
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            tools = await load_mcp_tools(session)
+            tools_by_name = {t.name: t for t in tools}
+            logger.info(f"FMP MCP session ready — {len(tools)} tools loaded")
+
+            llm = ChatAnthropic(model="claude-sonnet-4-5")
+            llm_with_tools = llm.bind_tools(tools)
+
+            config = {
+                "configurable": {
+                    "tools_by_name": tools_by_name,
+                    "llm": llm,
+                    "llm_with_tools": llm_with_tools,
+                }
+            }
+
+            initial_state = create_initial_state(ticker)
+            workflow = create_stock_analysis_workflow()
+            result = await workflow.ainvoke(initial_state, config=config)
+
+    logger.info(f"FMP MCP session closed — analysis complete for {ticker}")
+    return result
 
 
 def print_analysis_summary(state: StockAnalysisState):
