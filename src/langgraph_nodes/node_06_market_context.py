@@ -154,6 +154,29 @@ Return ONLY valid JSON. No preamble. No explanation outside the JSON.
 """
 
 
+def _parse_tool_response(raw: Any) -> Any:
+    """
+    MCP adapter wraps all responses in:
+    [{'type': 'text', 'text': '<json string>', 'id': '...'}]
+    Extract the actual data before parsing.
+    """
+    try:
+        # Already a parsed Python object (list/dict) — return directly
+        if isinstance(raw, (dict, list)) and not (
+            isinstance(raw, list) and raw and isinstance(raw[0], dict) and "type" in raw[0]
+        ):
+            return raw
+        # MCP content block wrapper
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict) and raw[0].get("type") == "text":
+            return json.loads(raw[0]["text"])
+        # Plain string
+        if isinstance(raw, str):
+            return json.loads(raw)
+        return raw
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return {}
+
+
 # ============================================================================
 # PURE HELPERS (SPY/VIX/regime, classification)
 # ============================================================================
@@ -1084,12 +1107,12 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         # ------------------------------------------------------------------
         # Step 1: company_profile (Pattern A)
         # ------------------------------------------------------------------
-        company_profile_tool = tools_by_name.get("company_profile")
+        company_profile_tool = tools_by_name.get("profile-symbol")
         company_profile_data: Dict[str, Any] = {}
         if company_profile_tool is not None:
             try:
                 raw_profile = await company_profile_tool.ainvoke({"symbol": ticker})
-                parsed_profile = json.loads(raw_profile)
+                parsed_profile = _parse_tool_response(raw_profile)
                 if isinstance(parsed_profile, list) and parsed_profile:
                     company_profile_data = parsed_profile[0]
                 elif isinstance(parsed_profile, dict):
@@ -1107,11 +1130,11 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         company_name = str(company_profile_data.get("companyName") or "Unknown")
         sector = str(company_profile_data.get("sector") or "Unknown")
         industry = str(company_profile_data.get("industry") or "Unknown")
-        exchange = str(company_profile_data.get("exchangeShortName") or "Unknown")
+        exchange = str(company_profile_data.get("exchange") or "Unknown")
         raw_indices = company_profile_data.get("indexMemberships") or []
         index_memberships = _summarise_index_memberships(raw_indices)
         beta_fmp = float(company_profile_data.get("beta") or 1.0)
-        market_cap_tier = _derive_market_cap_tier(company_profile_data.get("mktCap"))
+        market_cap_tier = _derive_market_cap_tier(company_profile_data.get("marketCap"))
 
         # ------------------------------------------------------------------
         # Step 2: Macro factor identification (Pattern C – bare LLM)
@@ -1126,7 +1149,16 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         commodity_symbols: List[str] = []
         try:
             response = await llm.ainvoke([HumanMessage(content=macro_prompt)])
-            factors_data = json.loads(response.content)  # type: ignore[arg-type]
+            content = response.content  # type: ignore[union-attr]
+            # Strip markdown code fences if present
+            if isinstance(content, str):
+                content = content.strip()
+                if content.startswith("```"):
+                    content = content.split("```")[1]
+                    if content.startswith("json"):
+                        content = content[4:]
+                content = content.strip()
+            factors_data = json.loads(content) if isinstance(content, str) else {}
             if isinstance(factors_data, dict):
                 identified_factors = factors_data.get("factors", []) or []
             commodity_symbols = [
@@ -1159,12 +1191,24 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         commodity_prices: Dict[str, float] = {}
         commodity_trends: Dict[str, str] = {}
 
-        sector_tool = tools_by_name.get("sector_performance")
+        sector_tool = tools_by_name.get("historical-sector-performance")
         if sector_tool is not None and sector != "Unknown":
             try:
                 raw = await sector_tool.ainvoke({"sector": sector})
-                data = json.loads(raw)
-                if isinstance(data, dict):
+                logger.info(f"[Node 6] RAW sector response (first 500 chars): {str(raw)[:500]}")
+                data = _parse_tool_response(raw)
+                if isinstance(data, list) and len(data) >= 6:
+                    # data is ordered newest first
+                    latest = float(data[0].get("averageChange") or data[0].get("performance") or 0.0)
+                    older = float(data[5].get("averageChange") or data[5].get("performance") or 0.0)
+                    sector_return_5d = latest - older
+                    if sector_return_5d > 0.5:
+                        sector_trend = "UP"
+                    elif sector_return_5d < -0.5:
+                        sector_trend = "DOWN"
+                    else:
+                        sector_trend = "FLAT"
+                elif isinstance(data, dict):
                     sector_return_5d = float(data.get("return_5d") or 0.0)
                     sector_trend = str(data.get("trend") or "FLAT")
             except (json.JSONDecodeError, TypeError) as exc:
@@ -1176,12 +1220,23 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
                     f"[Node 6] sector_performance tool failed for {ticker}: {exc}"
                 )
 
-        industry_tool = tools_by_name.get("industry_performance")
+        industry_tool = tools_by_name.get("historical-industry-performance")
         if industry_tool is not None and industry != "Unknown":
             try:
                 raw = await industry_tool.ainvoke({"industry": industry})
-                data = json.loads(raw)
-                if isinstance(data, dict):
+                data = _parse_tool_response(raw)
+                if isinstance(data, list) and len(data) >= 6:
+                    # data is ordered newest first
+                    latest = float(data[0].get("averageChange") or data[0].get("performance") or 0.0)
+                    older = float(data[5].get("averageChange") or data[5].get("performance") or 0.0)
+                    industry_return_5d = latest - older
+                    if industry_return_5d > 0.5:
+                        industry_trend = "UP"
+                    elif industry_return_5d < -0.5:
+                        industry_trend = "DOWN"
+                    else:
+                        industry_trend = "FLAT"
+                elif isinstance(data, dict):
                     industry_return_5d = float(data.get("return_5d") or 0.0)
                     industry_trend = str(data.get("trend") or "FLAT")
             except (json.JSONDecodeError, TypeError) as exc:
@@ -1193,24 +1248,20 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
                     f"[Node 6] industry_performance tool failed for {ticker}: {exc}"
                 )
 
-        # SPY historical prices – tool name must be confirmed via tools_by_name.
-        spy_history_tool = None
-        for name in tools_by_name.keys():
-            lower = name.lower()
-            if "historical" in lower or "chart" in lower:
-                spy_history_tool = tools_by_name[name]
-                break
+        # SPY historical prices – use FMP historical-price-eod-light.
+        spy_history_tool = tools_by_name.get("historical-price-eod-light")
         if spy_history_tool is not None:
             try:
                 # Request at least 30 calendar days to guarantee 21 trading days.
                 raw = await spy_history_tool.ainvoke({"symbol": "SPY", "days": 30})
-                data = json.loads(raw)
+                data = _parse_tool_response(raw)
                 if isinstance(data, list):
                     spy_closes = [
-                        float(row.get("close"))
+                        float(row.get("price") or row.get("close"))
                         for row in data
-                        if isinstance(row, dict) and row.get("close") is not None
+                        if isinstance(row, dict) and (row.get("price") is not None or row.get("close") is not None)
                     ]
+                    spy_closes.reverse()  # FMP returns newest-first; helper expects oldest-first
             except (json.JSONDecodeError, TypeError) as exc:
                 logger.warning(
                     f"[Node 6] SPY historical parse failed for {ticker}: {exc}"
@@ -1226,7 +1277,7 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         if vix_quote_tool is not None:
             try:
                 raw = await vix_quote_tool.ainvoke({"symbol": "^VIX"})
-                data = json.loads(raw)
+                data = _parse_tool_response(raw)
                 if isinstance(data, list) and data:
                     vix_price = float(data[0].get("price") or vix_price)
                 elif isinstance(data, dict):
@@ -1240,40 +1291,8 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
                     f"[Node 6] VIX quote tool failed for {ticker}: {exc}"
                 )
 
-        commodity_tool = tools_by_name.get("commodity")
-        if commodity_tool is not None and commodity_symbols:
-            for symbol in commodity_symbols:
-                try:
-                    raw = await commodity_tool.ainvoke({"symbol": symbol})
-                    data = json.loads(raw)
-                    if isinstance(data, dict):
-                        price = data.get("price")
-                        change_5d = data.get("change_5d", 0.0)
-                    elif isinstance(data, list) and data:
-                        price = data[0].get("price")
-                        change_5d = data[0].get("change_5d", 0.0)
-                    else:
-                        continue
-                    if price is None:
-                        continue
-                    price_f = float(price)
-                    commodity_prices[symbol] = price_f
-                    change_5d_f = float(change_5d or 0.0)
-                    if change_5d_f > 0.5:
-                        trend = "UP"
-                    elif change_5d_f < -0.5:
-                        trend = "DOWN"
-                    else:
-                        trend = "FLAT"
-                    commodity_trends[symbol] = trend
-                except (json.JSONDecodeError, TypeError) as exc:
-                    logger.warning(
-                        f"[Node 6] commodity parse failed for {ticker}, symbol={symbol}: {exc}"
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"[Node 6] commodity tool failed for {ticker}, symbol={symbol}: {exc}"
-                    )
+        # Commodity fetching removed (402 on plan). macro_factor_exposure still has
+        # identified_factors from the LLM; commodity_prices/commodity_trends stay empty.
 
         # ------------------------------------------------------------------
         # Step 4: Pure Python layers (SPY/VIX/regime, relative strength)
@@ -1348,7 +1367,7 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         beta_interpretation = (
             f"Beta of {beta_calculated:.2f} means {ticker} tends to move about "
             f"{abs(beta_calculated):.1f}× the market; in {regime_info['regime_label']} this amplifies "
-            f"{'upside' if beta_calculated > 1 else 'moves'}."
+            f"{'upside in bull markets and downside in bear markets' if beta_calculated > 1 else 'moves'}."
         )
 
         # News sentiment context.

@@ -24,9 +24,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_anthropic import ChatAnthropic
 
 from src.graph.state import StockAnalysisState, create_initial_state
@@ -328,36 +326,31 @@ async def run_stock_analysis_async(ticker: str) -> StockAnalysisState:
     if not fmp_api_key:
         logger.warning("FMP_API_KEY not set — FMP MCP tools will be unavailable")
 
-    server_params = StdioServerParameters(
-        command="fmp-mcp",
-        args=[],
-        env={"FMP_API_KEY": fmp_api_key},
-    )
+    fmp_url = f"https://financialmodelingprep.com/mcp?apikey={fmp_api_key}"
+    client = MultiServerMCPClient({
+        "fmp": {
+            "url": fmp_url,
+            "transport": "streamable_http",
+        }
+    })
 
     logger.info(f"Opening FMP MCP session for {ticker}...")
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+    tools = await client.get_tools()
+    tools_by_name = {t.name: t for t in tools}
+    llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+    llm_with_tools = llm.bind_tools(tools)
 
-            tools = await load_mcp_tools(session)
-            tools_by_name = {t.name: t for t in tools}
-            logger.info(f"FMP MCP session ready — {len(tools)} tools loaded")
+    config = {
+        "configurable": {
+            "tools_by_name": tools_by_name,
+            "llm": llm,
+            "llm_with_tools": llm_with_tools,
+        }
+    }
 
-            llm = ChatAnthropic(model="claude-sonnet-4-5")
-            llm_with_tools = llm.bind_tools(tools)
-
-            config = {
-                "configurable": {
-                    "tools_by_name": tools_by_name,
-                    "llm": llm,
-                    "llm_with_tools": llm_with_tools,
-                }
-            }
-
-            initial_state = create_initial_state(ticker)
-            workflow = create_stock_analysis_workflow()
-            result = await workflow.ainvoke(initial_state, config=config)
+    workflow = create_stock_analysis_workflow()
+    result = await workflow.ainvoke(create_initial_state(ticker), config=config)
 
     logger.info(f"FMP MCP session closed — analysis complete for {ticker}")
     return result
