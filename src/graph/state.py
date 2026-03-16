@@ -44,7 +44,7 @@ class StockAnalysisState(TypedDict):
     # ========================================================================
     # NODE 3: Related Companies Detection
     # ========================================================================
-    related_companies: List[str]                   # Related tickers (up to 5)
+    related_companies: List[Dict[str, Any]]        # Peer tickers with relationship classification
     
     
     # ========================================================================

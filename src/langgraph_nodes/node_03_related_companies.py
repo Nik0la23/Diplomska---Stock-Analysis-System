@@ -1,330 +1,338 @@
 """
 Node 3: Related Companies Detection
-Identifies competitor and related companies using Finnhub Peers API and correlation analysis.
+
+Identifies related peer companies using the FMP MCP peers tool,
+then classifies each peer's relationship to the target via a bare LLM call.
 
 Data Sources:
-- Finnhub: peer ticker list
-- yfinance (primary) / Polygon (fallback): peer price data for correlation (180 days)
+- FMP MCP: peers  (GET /stable/peers?symbol=AAPL)
+- FMP MCP: profile-symbol (sector/industry for LLM prompt)
+- Claude LLM: relationship classification (Pattern C — bare call, no tools)
 
-Runs AFTER: Node 1 (uses target price data for correlation)
+Runs AFTER:  Node 1 (price data available in state)
 Runs BEFORE: Node 2 (news fetching needs related company list)
 Can run in PARALLEL with: Nothing
 """
 
-import time
-import pandas as pd
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+import ast
+import json
 import logging
-import finnhub
+import time
+from typing import Any, Dict, List
 
-from src.utils.config import FINNHUB_API_KEY
-from src.database.db_manager import get_cached_price_data, cache_price_data
-from src.langgraph_nodes.node_01_data_fetching import fetch_from_yfinance, fetch_from_polygon
+from langchain_core.messages import HumanMessage
+from langgraph.types import RunnableConfig
+
+from src.graph.state import StockAnalysisState
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# HELPER FUNCTION: Fetch Peers from Finnhub
+# CONSTANTS
 # ============================================================================
 
-def fetch_peers_from_finnhub(ticker: str) -> List[str]:
+MAX_PEERS = 5
+
+# Fallback tickers used when FMP returns nothing for a well-known ticker
+PEERS_FALLBACK: Dict[str, List[str]] = {
+    "TSLA":  ["RIVN", "NIO", "GM", "F", "LCID"],
+    "NVDA":  ["AMD", "INTC", "QCOM", "TSM", "AVGO"],
+    "AAPL":  ["MSFT", "GOOGL", "META", "AMZN", "DELL"],
+    "MSFT":  ["AAPL", "GOOGL", "AMZN", "ORCL", "SAP"],
+    "GOOGL": ["META", "MSFT", "SNAP", "AMZN", "NFLX"],
+    "META":  ["SNAP", "GOOGL", "PINS", "NFLX", "AMZN"],
+    "AMZN":  ["WMT", "EBAY", "SHOP", "TGT", "COST"],
+    "AMD":   ["NVDA", "INTC", "QCOM", "TSM", "AVGO"],
+}
+
+PEER_CLASSIFICATION_PROMPT = """
+You are a sell-side equity analyst at Goldman Sachs.
+
+Target stock: {ticker} ({sector}, {industry})
+
+Classify each of the following peer companies in relation to {ticker}.
+Use ONLY these four relationship types:
+- COMPETITOR  : directly competes for the same customers or market share
+- SUPPLIER    : sells components, services, or inputs TO {ticker}
+- CUSTOMER    : buys products or services FROM {ticker}
+- SAME_SECTOR : same sector/industry but no direct competitive or supply relationship
+
+Peers to classify: {peers}
+
+Return ONLY valid JSON. No preamble. No explanation outside the JSON.
+
+{{
+  "classifications": [
+    {{
+      "ticker": "string",
+      "relationship": "COMPETITOR | SUPPLIER | CUSTOMER | SAME_SECTOR",
+      "reason": "one sentence max"
+    }}
+  ]
+}}
+"""
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def _parse_tool_response(raw: str) -> Any:
     """
-    Fetch peer companies from Finnhub API.
-    
-    Args:
-        ticker: Stock ticker symbol (e.g., 'NVDA')
-        
-    Returns:
-        List of peer ticker symbols
-        Empty list if fetch fails
-        
-    Example:
-        >>> peers = fetch_peers_from_finnhub('NVDA')
-        >>> print(peers)
-        ['AMD', 'INTC', 'TSM', 'QCOM', 'AVGO', ...]
+    Parse string returned by tool.ainvoke() into a Python object.
+
+    FMP MCP tools sometimes return plain JSON strings and sometimes return
+    a Python repr of the MCP content envelope:
+        "[{'type': 'text', 'text': '[{...real json...}]'}]"
+    Both forms are handled here.
     """
+    # Fast path: raw is already valid JSON
     try:
-        if not FINNHUB_API_KEY:
-            logger.warning("Finnhub API key not configured")
-            return []
-        
-        logger.info(f"Fetching peers from Finnhub for {ticker}")
-        
-        # Initialize Finnhub client
-        finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
-        
-        # Fetch peers
-        peers = finnhub_client.company_peers(ticker)
-        
-        if not peers:
-            logger.warning(f"No peers returned from Finnhub for {ticker}")
-            return []
-        
-        # Remove the target ticker from peers list (don't include itself)
-        peers = [p for p in peers if p.upper() != ticker.upper()]
-        
-        logger.info(f"Finnhub: Found {len(peers)} peers for {ticker}")
-        return peers
-        
-    except Exception as e:
-        logger.error(f"Finnhub peers fetch failed for {ticker}: {str(e)}")
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Slow path: MCP content envelope — use ast.literal_eval then extract .text
+    try:
+        content_list = ast.literal_eval(raw) if isinstance(raw, str) else raw
+        if isinstance(content_list, list):
+            for item in content_list:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    return json.loads(item["text"])
+    except Exception:
+        pass
+
+    logger.warning(f"[Node 3] Could not parse tool result: {raw!r:.200}")
+    return []
+
+
+def _extract_tickers(parsed: Any) -> List[str]:
+    """
+    Extract ticker strings from FMP peers response.
+
+    FMP may return:
+      - ["AMD", "INTC", ...]                          (plain list of strings)
+      - [{"symbol": "AMD"}, ...]                      (list of dicts)
+      - [{"peerSymbol": "AMD"}, ...]                  (alternate key)
+    """
+    if not isinstance(parsed, list):
         return []
+    tickers: List[str] = []
+    for item in parsed:
+        if isinstance(item, str) and item.strip():
+            tickers.append(item.strip().upper())
+        elif isinstance(item, dict):
+            sym = (
+                item.get("symbol")
+                or item.get("ticker")
+                or item.get("peerSymbol")
+            )
+            if sym:
+                tickers.append(str(sym).strip().upper())
+    return tickers
 
 
-# ============================================================================
-# HELPER FUNCTION: Fetch and Cache Peer Price Data
-# ============================================================================
-
-def fetch_and_cache_peer_price_data(peer_ticker: str) -> Optional[pd.DataFrame]:
+def _parse_classifications(content: str, peers: List[str]) -> List[Dict[str, Any]]:
     """
-    Fetch 180 days of price data for a peer ticker, using cache when available.
-
-    Follows the cache-first pattern: check SQLite first, then yfinance (primary),
-    then Polygon (fallback). Caches any freshly fetched data for 24 hours.
-
-    Args:
-        peer_ticker: Peer stock ticker symbol (e.g., 'AMD')
-
-    Returns:
-        DataFrame with columns: date, open, high, low, close, volume
-        None if all sources fail
-
-    Example:
-        >>> df = fetch_and_cache_peer_price_data('AMD')
-        >>> print(len(df))
-        126
-    """
-    # 1. Check cache first (saves API calls on repeated runs)
-    cached = get_cached_price_data(peer_ticker, max_age_hours=24)
-    if cached is not None:
-        logger.info(f"Cache hit for peer price data: {peer_ticker}")
-        return cached
-
-    logger.info(f"Cache miss for {peer_ticker}, fetching from API")
-
-    # 2. Try yfinance (primary - no API key required)
-    df = fetch_from_yfinance(peer_ticker, days=180)
-
-    # 3. Fallback to Polygon
-    if df is None or df.empty:
-        logger.info(f"yfinance failed for {peer_ticker}, trying Polygon")
-        df = fetch_from_polygon(peer_ticker, days=180)
-
-    # 4. Cache and return if data was fetched
-    if df is not None and not df.empty:
-        cache_price_data(peer_ticker, df)
-        return df
-
-    logger.warning(f"All price sources failed for peer {peer_ticker}")
-    return None
-
-
-# ============================================================================
-# HELPER FUNCTION: Calculate Price Correlation
-# ============================================================================
-
-def calculate_price_correlation(
-    target_ticker: str,
-    peer_ticker: str,
-    target_df: pd.DataFrame
-) -> Optional[float]:
-    """
-    Calculate price correlation between target and peer stock.
-    
-    Args:
-        target_ticker: Target stock ticker
-        peer_ticker: Peer stock ticker
-        target_df: Price data for target stock
-        
-    Returns:
-        Correlation coefficient (0.0 to 1.0)
-        None if calculation fails
-        
-    Example:
-        >>> corr = calculate_price_correlation('NVDA', 'AMD', nvda_df)
-        >>> print(f"Correlation: {corr:.2f}")
-        Correlation: 0.85
+    Parse the LLM JSON response into a list of classification dicts.
+    Falls back to SAME_SECTOR for any peer the LLM omits or on parse error.
     """
     try:
-        # Get peer price data (cache-first, then yfinance/Polygon)
-        peer_df = fetch_and_cache_peer_price_data(peer_ticker)
+        text = content.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
+            if text.startswith("json"):
+                text = text[4:]
+        text = text.strip()
 
-        if peer_df is None or peer_df.empty:
-            logger.debug(f"No price data available for peer {peer_ticker}")
-            return None
-        
-        # Align dataframes by date
-        target_df = target_df[['date', 'close']].copy()
-        peer_df = peer_df[['date', 'close']].copy()
-        
-        # Merge on date
-        merged = pd.merge(
-            target_df,
-            peer_df,
-            on='date',
-            suffixes=('_target', '_peer')
-        )
-        
-        if len(merged) < 30:
-            logger.debug(f"Insufficient overlapping data for correlation ({len(merged)} days)")
-            return None
-        
-        # Calculate correlation
-        correlation = merged['close_target'].corr(merged['close_peer'])
-        
-        # Return absolute correlation (we care about relationship strength)
-        return abs(correlation)
-        
-    except Exception as e:
-        logger.debug(f"Correlation calculation failed for {peer_ticker}: {str(e)}")
-        return None
+        data = json.loads(text)
+        raw_list = data.get("classifications", [])
+        if not isinstance(raw_list, list):
+            raise ValueError("'classifications' is not a list")
 
-
-# ============================================================================
-# HELPER FUNCTION: Rank and Filter Peers
-# ============================================================================
-
-def rank_peers_by_correlation(
-    target_ticker: str,
-    peers: List[str],
-    target_df: Optional[pd.DataFrame],
-    max_peers: int = 5
-) -> List[str]:
-    """
-    Rank peers by correlation and return top N.
-    
-    Args:
-        target_ticker: Target stock ticker
-        peers: List of peer tickers
-        target_df: Price data for target stock (for correlation)
-        max_peers: Maximum number of peers to return
-        
-    Returns:
-        List of top N peer tickers sorted by correlation
-        
-    Example:
-        >>> ranked = rank_peers_by_correlation('NVDA', all_peers, price_df, max_peers=5)
-        >>> print(ranked)
-        ['AMD', 'INTC', 'TSM', 'QCOM', 'AVGO']
-    """
-    if target_df is None or target_df.empty or len(peers) == 0:
-        # No price data for correlation, just return first N peers
-        return peers[:max_peers]
-    
-    logger.info(f"Ranking {len(peers)} peers by correlation with {target_ticker}")
-    
-    # Calculate correlation for each peer
-    peer_correlations = []
-    for peer in peers:
-        corr = calculate_price_correlation(target_ticker, peer, target_df)
-        if corr is not None:
-            peer_correlations.append((peer, corr))
-        time.sleep(0.2)  # avoid hammering yfinance for bulk peer fetches
-    
-    if not peer_correlations:
-        # No correlations calculated, return first N peers
-        logger.info(f"No correlations calculated, returning first {max_peers} peers")
-        return peers[:max_peers]
-    
-    # Sort by correlation (highest first)
-    peer_correlations.sort(key=lambda x: x[1], reverse=True)
-    
-    # Return top N peers
-    top_peers = [peer for peer, corr in peer_correlations[:max_peers]]
-    
-    # Log correlations
-    logger.info(f"Top {len(top_peers)} peers by correlation:")
-    for peer, corr in peer_correlations[:max_peers]:
-        logger.info(f"  {peer}: {corr:.3f}")
-    
-    return top_peers
+        return [
+            {
+                "ticker": str(c.get("ticker", "")).strip().upper(),
+                "relationship": str(c.get("relationship", "SAME_SECTOR")).strip(),
+                "reason": str(c.get("reason", "")).strip(),
+            }
+            for c in raw_list
+            if isinstance(c, dict) and c.get("ticker")
+        ]
+    except Exception as exc:
+        logger.warning(f"[Node 3] LLM classification parse failed: {exc}")
+        return [
+            {"ticker": p, "relationship": "SAME_SECTOR", "reason": "Classification unavailable."}
+            for p in peers
+        ]
 
 
 # ============================================================================
 # MAIN NODE FUNCTION
 # ============================================================================
 
-def detect_related_companies_node(state: Dict[str, Any]) -> Dict[str, Any]:
+async def detect_related_companies_node(
+    state: StockAnalysisState, config: RunnableConfig
+) -> Dict[str, Any]:
     """
-    Node 3: Related Companies Detection
-    
+    Node 3: Related Companies Detection.
+
     Execution flow:
-    1. Fetch peer companies from Finnhub API
-    2. Optionally calculate price correlations
-    3. Rank peers by correlation strength
-    4. Return top 3-5 related companies
-    5. Update state with related companies list
-    
+    1. Validate FMP config from RunnableConfig
+    2. Call FMP peers tool → raw ticker list
+    3. If empty → use PEERS_FALLBACK
+    4. Call FMP profile-symbol tool → sector/industry for LLM prompt
+    5. Call bare LLM with PEER_CLASSIFICATION_PROMPT → JSON classifications
+    6. Parse and merge results → List[Dict] with ticker, relationship, reason
+    7. Return updated state keys
+
     Args:
-        state: LangGraph state containing 'ticker' and optionally 'raw_price_data'
-        
+        state:  Current LangGraph state.
+        config: RunnableConfig injected by the workflow. Must contain
+                config["configurable"]["tools_by_name"],
+                config["configurable"]["llm"], and
+                config["configurable"]["llm_with_tools"].
+
     Returns:
-        Updated state with 'related_companies' populated
+        Partial state dict with keys:
+          - related_companies: List[Dict] — each entry has ticker, relationship, reason
+          - node_execution_times: {"node_3": elapsed}
     """
-    start_time = datetime.now()
-    ticker = state['ticker']
-    
+    start = time.time()
+    ticker = state["ticker"]
+    logger.info(f"[Node 3] Starting related companies detection for {ticker}")
+
+    # ------------------------------------------------------------------
+    # 1. Extract shared resources from config
+    # ------------------------------------------------------------------
+    configurable   = config["configurable"]
+    tools_by_name  = configurable["tools_by_name"]
+    llm            = configurable["llm"]
+    llm_with_tools = configurable["llm_with_tools"]
+
+    # ------------------------------------------------------------------
+    # 2. Guard: graceful degradation when FMP session is unavailable
+    # ------------------------------------------------------------------
+    if not tools_by_name or llm is None or llm_with_tools is None:
+        logger.warning(f"[Node 3] FMP config incomplete — returning empty peers")
+        return {
+            "related_companies": [],
+            "errors": [f"Node 3: FMP config unavailable for {ticker}"],
+            "node_execution_times": {"node_3": time.time() - start},
+        }
+
     try:
-        logger.info(f"Node 3: Starting related companies detection for {ticker}")
-        
-        # ====================================================================
-        # STEP 1: Fetch Peers from Finnhub
-        # ====================================================================
-        peers = fetch_peers_from_finnhub(ticker)
-        
+        # ------------------------------------------------------------------
+        # Step 1: Fetch peers via FMP peers (Pattern A)
+        # ------------------------------------------------------------------
+        peers: List[str] = []
+        peers_tool = tools_by_name.get("peers")
+        if peers_tool is not None:
+            try:
+                raw = await peers_tool.ainvoke({"symbol": ticker})
+                parsed = _parse_tool_response(raw)
+                peers = _extract_tickers(parsed)
+                # Never include the target ticker in its own peer list
+                peers = [p for p in peers if p != ticker.upper()]
+                logger.info(f"[Node 3] FMP peers → {len(peers)} peers: {peers}")
+            except Exception as exc:
+                logger.warning(f"[Node 3] peers tool failed for {ticker}: {exc}")
+        else:
+            logger.warning("[Node 3] 'peers' tool not found in tools_by_name — check tool names")
+
+        # Fallback when FMP returned nothing
         if not peers:
-            logger.warning(f"Node 3: No peers found for {ticker}")
-            state['related_companies'] = []
-            elapsed = (datetime.now() - start_time).total_seconds()
-            state['node_execution_times']['node_3'] = elapsed
-            logger.info(f"Node 3: Completed with 0 peers in {elapsed:.2f}s")
-            return state
-        
-        logger.info(f"Node 3: Found {len(peers)} potential peers for {ticker}")
-        
-        # ====================================================================
-        # STEP 2: Get Target Stock Price Data (for correlation)
-        # ====================================================================
-        target_df = state.get('raw_price_data')
-        
-        if target_df is None:
-            logger.info(f"Node 3: No price data available for correlation analysis")
-        
-        # ====================================================================
-        # STEP 3: Rank Peers by Correlation
-        # ====================================================================
-        max_peers = 5  # Limit to 5 to avoid overwhelming news fetching
-        ranked_peers = rank_peers_by_correlation(ticker, peers, target_df, max_peers)
-        
-        # ====================================================================
-        # STEP 4: Validate Results
-        # ====================================================================
-        # Ensure target ticker is not in the list
-        ranked_peers = [p for p in ranked_peers if p.upper() != ticker.upper()]
-        
-        # Ensure we have at least some peers (but not too many)
-        if len(ranked_peers) > max_peers:
-            ranked_peers = ranked_peers[:max_peers]
-        
-        # ====================================================================
-        # STEP 5: Update State
-        # ====================================================================
-        state['related_companies'] = ranked_peers
-        elapsed = (datetime.now() - start_time).total_seconds()
-        state['node_execution_times']['node_3'] = elapsed
-        
-        logger.info(f"Node 3: Successfully found {len(ranked_peers)} related companies for {ticker} in {elapsed:.2f}s")
-        logger.info(f"Node 3: Related companies: {', '.join(ranked_peers)}")
-        
-        return state
-        
-    except Exception as e:
-        # Catch-all for any unexpected errors
-        logger.error(f"Node 3: Unexpected error for {ticker}: {str(e)}")
-        state['errors'].append(f"Node 3: Unexpected error - {str(e)}")
-        state['related_companies'] = []
-        elapsed = (datetime.now() - start_time).total_seconds()
-        state['node_execution_times']['node_3'] = elapsed
-        return state
+            peers = PEERS_FALLBACK.get(ticker.upper(), [])
+            if peers:
+                logger.info(f"[Node 3] Using PEERS_FALLBACK for {ticker}: {peers}")
+            else:
+                logger.warning(f"[Node 3] No peers found and no fallback available for {ticker}")
+                elapsed = time.time() - start
+                return {
+                    "related_companies": [],
+                    "node_execution_times": {"node_3": elapsed},
+                }
+
+        # Cap at MAX_PEERS
+        peers = peers[:MAX_PEERS]
+
+        # ------------------------------------------------------------------
+        # Step 2: Get sector/industry for the classification prompt (Pattern A)
+        # ------------------------------------------------------------------
+        sector   = "Unknown"
+        industry = "Unknown"
+        profile_tool = tools_by_name.get("profile-symbol")
+        if profile_tool is not None:
+            try:
+                raw_profile = await profile_tool.ainvoke({"symbol": ticker})
+                parsed_profile = _parse_tool_response(raw_profile)
+                if isinstance(parsed_profile, list) and parsed_profile:
+                    profile = parsed_profile[0]
+                elif isinstance(parsed_profile, dict):
+                    profile = parsed_profile
+                else:
+                    profile = {}
+                sector   = str(profile.get("sector")   or "Unknown")
+                industry = str(profile.get("industry") or "Unknown")
+                logger.info(f"[Node 3] {ticker} — sector={sector}, industry={industry}")
+            except Exception as exc:
+                logger.warning(f"[Node 3] profile-symbol tool failed for {ticker}: {exc}")
+
+        # ------------------------------------------------------------------
+        # Step 3: Classify peers via bare LLM call (Pattern C)
+        # ------------------------------------------------------------------
+        prompt = PEER_CLASSIFICATION_PROMPT.format(
+            ticker=ticker,
+            sector=sector,
+            industry=industry,
+            peers=", ".join(peers),
+        )
+        classifications: List[Dict[str, Any]] = []
+        try:
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            content = response.content
+            if isinstance(content, str):
+                classifications = _parse_classifications(content, peers)
+            else:
+                raise ValueError(f"Unexpected LLM response content type: {type(content)}")
+            logger.info(f"[Node 3] LLM classified {len(classifications)} peers")
+        except Exception as exc:
+            logger.warning(f"[Node 3] LLM classification failed for {ticker}: {exc}")
+            classifications = [
+                {"ticker": p, "relationship": "SAME_SECTOR", "reason": "Classification unavailable."}
+                for p in peers
+            ]
+
+        # ------------------------------------------------------------------
+        # Step 4: Ensure every peer from Step 1 has a classification entry
+        # ------------------------------------------------------------------
+        classified_tickers = {c["ticker"] for c in classifications}
+        for p in peers:
+            if p not in classified_tickers:
+                classifications.append(
+                    {"ticker": p, "relationship": "SAME_SECTOR", "reason": "Not returned by LLM."}
+                )
+
+        elapsed = time.time() - start
+        logger.info(
+            f"[Node 3] Completed for {ticker} in {elapsed:.2f}s — "
+            f"{len(classifications)} related companies: "
+            f"{[c['ticker'] for c in classifications]}"
+        )
+
+        return {
+            "related_companies": classifications,
+            "node_execution_times": {"node_3": elapsed},
+        }
+
+    except Exception as exc:
+        elapsed = time.time() - start
+        logger.error(f"[Node 3] Unexpected error for {ticker}: {exc}", exc_info=True)
+        return {
+            "related_companies": [],
+            "errors": [f"Node 3: Unexpected error — {str(exc)}"],
+            "node_execution_times": {"node_3": elapsed},
+        }

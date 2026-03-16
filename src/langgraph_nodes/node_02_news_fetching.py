@@ -368,7 +368,12 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     start_time = datetime.now()
     ticker = state['ticker']
-    related_companies = state.get('related_companies', []) or []
+    _related_raw = state.get('related_companies', []) or []
+    # Node 3 now returns List[Dict] with 'ticker' key; extract plain ticker strings for news fetching
+    related_companies = [
+        c['ticker'] if isinstance(c, dict) else c
+        for c in _related_raw
+    ]
     
     try:
         logger.info(f"Node 2: Starting news fetching for {ticker}")

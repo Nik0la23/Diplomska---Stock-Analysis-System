@@ -85,41 +85,11 @@ SECTOR_FALLBACK: Dict[str, Tuple[str, str]] = {
     "IONQ":  ("Technology",             "Computer Hardware"),
 }
 
-# Fallback peer tickers when Node 3 returns an empty related_companies list.
-# Keyed by ticker; values are close-sector competitors suitable for the
-# peer performance layer (Layer 5, 10 % weight).
-PEERS_FALLBACK: Dict[str, List[str]] = {
-    "TSLA":  ["RIVN", "NIO", "GM", "F", "LCID"],
-    "NVDA":  ["AMD", "INTC", "QCOM", "TSM", "AVGO"],
-    "AAPL":  ["MSFT", "GOOGL", "META", "AMZN"],
-    "MSFT":  ["AAPL", "GOOGL", "AMZN", "CRM"],
-    "GOOGL": ["META", "MSFT", "AMZN", "SNAP"],
-    "GOOG":  ["META", "MSFT", "AMZN", "SNAP"],
-    "META":  ["GOOGL", "SNAP", "PINS", "RDDT"],
-    "AMZN":  ["MSFT", "GOOGL", "SHOP", "EBAY"],
-    "AMD":   ["NVDA", "INTC", "QCOM", "TSM"],
-    "INTC":  ["AMD", "NVDA", "QCOM", "TSM"],
-    "RIVN":  ["TSLA", "LCID", "NIO", "GM"],
-    "NIO":   ["TSLA", "RIVN", "LCID", "GM"],
-    "IONQ":  ["IBM", "RGTI", "QUBT", "QMCO"],
-}
-
 MARKET_INDICES: Dict[str, str] = {
     "S&P 500": "SPY",
     "NASDAQ":  "QQQ",
     "Dow Jones": "DIA",
 }
-
-# Weights for headwind/tailwind composite (must sum to 1.0)
-W_SPY   = 0.35
-W_VIX   = 0.25
-W_SECTOR = 0.20
-W_PEERS  = 0.10
-W_NEWS   = 0.10
-
-# Thresholds for context_signal (backward compat with Node 12)
-BUY_THRESHOLD:  float =  0.30
-SELL_THRESHOLD: float = -0.30
 
 # How many days of market news to include in sentiment average
 MARKET_NEWS_LOOKBACK_DAYS: int = 14
@@ -694,89 +664,7 @@ def get_sector_performance(sector: str, days: int = 5) -> Dict[str, Any]:
 
 
 # ============================================================================
-# HELPER 5: Related Companies (peers)
-# ============================================================================
-
-def analyze_related_companies(related_tickers: List[str]) -> Dict[str, Any]:
-    """
-    Measure 1-day performance of related peers.
-
-    Args:
-        related_tickers: List of ticker symbols from Node 3.
-
-    Returns:
-        {
-            'related_companies':        list,
-            'avg_performance':          float,
-            'up_count':                 int,
-            'down_count':               int,
-            'overall_signal':           str,    # BULLISH | BEARISH | NEUTRAL
-            'peers_score':              float,  # contribution on [-1, +1]
-        }
-    """
-    _default = {
-        "related_companies": [],
-        "avg_performance":   0.0,
-        "up_count":          0,
-        "down_count":        0,
-        "overall_signal":    "NEUTRAL",
-        "peers_score":       0.0,
-    }
-
-    if not related_tickers:
-        return _default
-
-    try:
-        records: List[Dict[str, Any]] = []
-
-        for tkr in related_tickers:
-            try:
-                hist = yf.Ticker(tkr).history(period="2d")
-                if len(hist) >= 2:
-                    prev    = float(hist["Close"].iloc[-2])
-                    current = float(hist["Close"].iloc[-1])
-                    perf    = (current - prev) / prev * 100
-                    direction = "UP" if perf > 0.5 else ("DOWN" if perf < -0.5 else "FLAT")
-                    records.append({"ticker": tkr, "performance": perf, "trend": direction})
-            except Exception:
-                continue
-
-        if not records:
-            return _default
-
-        perfs       = [r["performance"] for r in records]
-        avg_perf    = sum(perfs) / len(perfs)
-        up_count    = sum(1 for r in records if r["trend"] == "UP")
-        down_count  = sum(1 for r in records if r["trend"] == "DOWN")
-
-        if avg_perf >  1.0:
-            overall, score = "BULLISH",  1.0
-        elif avg_perf > 0.0:
-            overall, score = "BULLISH",  0.5
-        elif avg_perf > -1.0:
-            overall, score = "NEUTRAL",  0.0 if avg_perf > -0.5 else -0.5
-        else:
-            overall, score = "BEARISH", -1.0
-
-        logger.info(
-            f"  Peers: {up_count} up / {down_count} down, avg={avg_perf:+.2f}% → {overall}"
-        )
-        return {
-            "related_companies": records,
-            "avg_performance":   avg_perf,
-            "up_count":          up_count,
-            "down_count":        down_count,
-            "overall_signal":    overall,
-            "peers_score":       score,
-        }
-
-    except Exception as exc:
-        logger.warning(f"  Related companies analysis failed: {exc}")
-        return _default
-
-
-# ============================================================================
-# HELPER 6: Stock–Market Correlation (NaN-safe)
+# HELPER 5: Stock–Market Correlation (NaN-safe)
 # ============================================================================
 
 def calculate_correlation(
@@ -933,74 +821,6 @@ def analyze_market_news_sentiment(
         "market_news_sentiment": normalised,
         "market_news_count":     len(scores),
         "news_sentiment_score":  normalised,
-    }
-
-
-# ============================================================================
-# HELPER 8: Composite Headwind / Tailwind Score
-# ============================================================================
-
-def compute_headwind_tailwind_score(
-    spy_composite:    float,
-    vix_contribution: float,
-    sector_score:     float,
-    peers_score:      float,
-    news_sentiment:   float,
-) -> Dict[str, Any]:
-    """
-    Combine all five layers into a single market headwind/tailwind score.
-
-    Score on [-1, +1]:
-        +1.0  strong tailwind   (everything is green)
-        +0.3  mild tailwind
-         0.0  neutral
-        -0.3  mild headwind
-        -1.0  strong headwind   (market is burning)
-
-    context_signal is BUY / SELL / HOLD (kept for Node 12 backward compat).
-    confidence is abs(score) × 100.
-
-    Args:
-        spy_composite:    Weighted SPY multi-timeframe score [-1, +1].
-        vix_contribution: VIX fear contribution [-1, +0.3].
-        sector_score:     Sector ETF 5d score [-1, +1].
-        peers_score:      Related companies score [-1, +1].
-        news_sentiment:   Market news normalised sentiment [-1, +1].
-
-    Returns:
-        {
-            'market_headwind_score': float,
-            'context_signal':        str,
-            'confidence':            float,  # 0-100
-        }
-    """
-    raw = (
-        W_SPY    * spy_composite
-        + W_VIX  * vix_contribution
-        + W_SECTOR * sector_score
-        + W_PEERS  * peers_score
-        + W_NEWS   * news_sentiment
-    )
-    score = max(-1.0, min(1.0, raw))
-
-    if score >= BUY_THRESHOLD:
-        context_signal = "BUY"
-    elif score <= SELL_THRESHOLD:
-        context_signal = "SELL"
-    else:
-        context_signal = "HOLD"
-
-    confidence = round(abs(score) * 100, 2)
-
-    logger.info(
-        f"  Headwind score: SPY={spy_composite:+.3f} VIX={vix_contribution:+.3f} "
-        f"sector={sector_score:+.3f} peers={peers_score:+.3f} news={news_sentiment:+.3f} "
-        f"→ raw={raw:+.4f} → {score:+.3f} ({context_signal})"
-    )
-    return {
-        "market_headwind_score": score,
-        "context_signal":        context_signal,
-        "confidence":            confidence,
     }
 
 
@@ -1390,20 +1210,40 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
 
         # ------------------------------------------------------------------
         # Step 5: Macro summary (Pattern C – bare LLM, fire-and-forget)
+        # Peers from Node 3 are included as qualitative context so the LLM
+        # can reason about supplier/customer/competitor amplification effects.
         # ------------------------------------------------------------------
         macro_summary = "Unavailable."
         try:
+            # Build peers context string from state["related_companies"].
+            # Handles both Dict format {"ticker":.., "relationship":.., "reason":..}
+            # and legacy str format gracefully.
+            peers_context = ""
+            related = state.get("related_companies") or []
+            if related:
+                peer_lines = []
+                for c in related:
+                    if isinstance(c, dict):
+                        peer_lines.append(
+                            f"  - {c['ticker']} ({c.get('relationship', 'SAME_SECTOR')}): {c.get('reason', '')}"
+                        )
+                    else:
+                        peer_lines.append(f"  - {c}")
+                peers_context = "Related companies:\n" + "\n".join(peer_lines)
+
             summary_prompt = (
                 "You are a macro analyst explaining how current macro and commodity "
                 "conditions affect a single stock.\n\n"
                 f"Stock: {ticker} ({company_name}), sector={sector}, industry={industry}\n"
                 f"Identified macro factors: {identified_factors}\n"
                 f"Commodity prices: {commodity_prices}\n"
-                f"Commodity trends (5d): {commodity_trends}\n\n"
+                f"Commodity trends (5d): {commodity_trends}\n"
+                f"{peers_context}\n\n"
                 "Write ONE short paragraph describing what this combination of macro "
                 "factors and commodity moves likely means for the stock PRICE going "
-                "forward (upside/downside risks, sensitivity). Do not repeat the raw "
-                "numbers; focus on implications for the stock."
+                "forward. Where relevant, mention how the related companies above "
+                "(suppliers, customers, competitors) amplify or reduce these risks. "
+                "Do not repeat raw numbers — focus on implications for the stock price."
             )
             summary_response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
             content = getattr(summary_response, "content", None)
@@ -1482,12 +1322,12 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         }
 
         market_context = {
-            "stock_classification": stock_classification,
-            "market_regime": market_regime,
-            "sector_industry_context": sector_industry_context,
-            "macro_factor_exposure": macro_factor_exposure,
+            "stock_classification":       stock_classification,
+            "market_regime":              market_regime,
+            "sector_industry_context":    sector_industry_context,
+            "macro_factor_exposure":      macro_factor_exposure,
             "market_correlation_profile": market_correlation_profile,
-            "news_sentiment_context": news_sentiment_context,
+            "news_sentiment_context":     news_sentiment_context,
         }
 
         elapsed = time.time() - start

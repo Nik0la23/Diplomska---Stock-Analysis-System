@@ -375,7 +375,12 @@ def print_analysis_summary(state: StockAnalysisState):
     
     # Related Companies
     if state.get('related_companies'):
-        print(f"🔗 Related Companies: {', '.join(state['related_companies'][:5])}")
+        rel = state['related_companies'][:5]
+        rel_str = ', '.join(
+            f"{c['ticker']} ({c.get('relationship', '?')})" if isinstance(c, dict) else c
+            for c in rel
+        )
+        print(f"🔗 Related Companies: {rel_str}")
     
     # News Data
     stock_news_count = len(state.get('cleaned_stock_news', []))
