@@ -31,11 +31,12 @@ Job 2 — Signal-Conditioned Historical Pattern Matching (NEW):
     Node 8 learning → Node 11 weights → Job 2 similarity quality
 
   The empirical outcomes (prob_up, expected_return_7d, percentiles) from
-  similar historical days are blended 60/40 with Node 7's GBM Monte Carlo
-  estimate to produce calibrated prediction graph parameters.
+  similar historical days are blended with Node 7's GBM Monte Carlo estimate.
+  Blend weight is data-driven: job2_weight = min(0.70, days_found/25 × 0.70).
 
-  Job 1 and Job 2 results are compared: when they agree, final_confidence
-  is boosted; when they disagree, it is penalised and flagged for Nodes 13/14.
+  Job 1 and Job 2 results are compared and stored as agreement_level
+  ('strong', 'mild', 'disagree', 'neutral') — a transparency flag for Nodes
+  13/14 only. It does NOT modify final_confidence.
 
   If backtest_results is None or fewer than MIN_SIMILAR_DAYS days pass the
   similarity threshold, Job 2 sets sufficient_data=False and the confidence
@@ -99,14 +100,7 @@ SECONDARY_SIMILARITY_THRESHOLD: float = 0.50 # fallback threshold
 MIN_SIMILAR_DAYS: int = 5                    # minimum matches to produce a prediction
 MAX_SIMILAR_DAYS: int = 25                   # cap to avoid noise from weak matches
 
-# Job 2 — blending empirical with Node 7 GBM
-JOB2_BLEND_WEIGHT: float = 0.60
-GBM_BLEND_WEIGHT: float = 0.40
-
-# Job 1/2 agreement — confidence adjustment multipliers
-STRONG_AGREEMENT_BOOST: float = 1.15
-MILD_AGREEMENT_BOOST: float = 1.05
-DISAGREEMENT_PENALTY: float = 0.80
+# Job 1/2 agreement — used only as a transparency flag, not to adjust confidence
 
 
 # ============================================================================
@@ -214,13 +208,22 @@ def _score_sentiment(state: Dict[str, Any]) -> Tuple[float, bool]:
 
 def _score_market(state: Dict[str, Any]) -> Tuple[float, bool]:
     """
-    Convert Node 6's market context to a continuous score on [-1, +1].
+    Convert Node 6's market_context to a continuous score on [-1, +1].
 
-    Prefers market_headwind_score (new Node 6 composite) when available.
-    Falls back to context_signal BUY/SELL/HOLD for backward compatibility.
+    Reads from Node 6's actual sub-dict structure:
+      market_regime              → SPY returns, VIX level, regime_label
+      sector_industry_context    → sector_return_5d, relative_strength_label
+      market_correlation_profile → market_correlation, beta_calculated
+      news_sentiment_context     → market_news_sentiment
 
-    In both cases the score is multiplied by market_correlation so that a
-    low-correlation stock is less affected by market headwinds.
+    Components and weights (sum to 1.0):
+      SPY 5d return    40%  normalised by /5.0  (5% move → ±1.0)
+      VIX fear         28%  (20 - vix) / 20     capped [-1, +0.3]
+      Sector 5d return 22%  normalised by /3.0  (3% move → ±1.0)
+      Market news      10%  already on [-1, +1]
+
+    Composite is multiplied by abs(market_correlation) so a low-beta
+    stock is less dragged by macro headwinds.
 
     Args:
         state: LangGraph state dict.
@@ -233,26 +236,42 @@ def _score_market(state: Dict[str, Any]) -> Tuple[float, bool]:
         logger.warning("  Market stream: no market_context → score=0.0")
         return 0.0, True
 
-    market_corr: Optional[float] = market_context.get("market_correlation")
-    if market_corr is None or (isinstance(market_corr, float) and math.isnan(market_corr)):
-        market_corr = 1.0  # treat as fully correlated when unknown or NaN
-    market_corr = float(market_corr)
+    corr_profile   = market_context.get("market_correlation_profile") or {}
+    market_regime  = market_context.get("market_regime")              or {}
+    sector_context = market_context.get("sector_industry_context")    or {}
+    news_context   = market_context.get("news_sentiment_context")     or {}
 
-    # Prefer the new continuous headwind score from the rewritten Node 6
-    headwind_score: Optional[float] = market_context.get("market_headwind_score")
-    if headwind_score is not None and math.isfinite(float(headwind_score)):
-        score = float(headwind_score) * min(market_corr, 1.0)
-        logger.debug(
-            f"  Market: headwind={headwind_score:+.3f} × correlation={market_corr:.3f} = {score:+.3f}"
-        )
-        return score, False
+    market_corr = float(corr_profile.get("market_correlation") or 1.0)
+    if not math.isfinite(market_corr):
+        market_corr = 1.0
 
-    # Fallback: old BUY/SELL/HOLD signal
-    context_signal: str = market_context.get("context_signal", "HOLD")
-    context_score = SIGNAL_TO_SCORE.get(context_signal.upper(), 0.0)
-    score = context_score * min(market_corr, 1.0)
+    spy_return_5d    = float(market_regime.get("spy_return_5d")        or 0.0)
+    vix_level        = float(market_regime.get("vix_level")            or 20.0)
+    sector_return_5d = float(sector_context.get("sector_return_5d")    or 0.0)
+    news_sentiment   = float(news_context.get("market_news_sentiment") or 0.0)
+
+    spy_score    = max(-1.0, min(1.0,  spy_return_5d    / 5.0))
+    vix_score    = max(-1.0, min(0.3, (20.0 - vix_level) / 20.0))
+    sector_score = max(-1.0, min(1.0,  sector_return_5d / 3.0))
+
+    raw = (
+        0.40 * spy_score
+        + 0.28 * vix_score
+        + 0.22 * sector_score
+        + 0.10 * news_sentiment
+    )
+    composite = max(-1.0, min(1.0, raw))
+    score = composite * min(abs(market_corr), 1.0)
+
     logger.debug(
-        f"  Market: {context_signal} × correlation={market_corr:.3f} = {score:+.3f}"
+        f"  Market: SPY5d={spy_return_5d:+.2f}%(→{spy_score:+.3f}) "
+        f"VIX={vix_level:.1f}(→{vix_score:+.3f}) "
+        f"sector5d={sector_return_5d:+.2f}%(→{sector_score:+.3f}) "
+        f"news={news_sentiment:+.3f} "
+        f"→ composite={composite:+.3f} × corr={market_corr:.3f} = {score:+.3f} "
+        f"| regime={market_regime.get('regime_label','?')} "
+        f"rel={sector_context.get('relative_strength_label','?')} "
+        f"beta={corr_profile.get('beta_calculated', 1.0):.2f}"
     )
     return score, False
 
@@ -783,14 +802,21 @@ def _build_prediction_graph_data(
     state: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Build prediction graph calibration parameters for the dashboard (Node 15).
+    Build prediction graph parameters for the dashboard (Node 15).
 
-    Blends Job 2's empirical return estimate (60%) with Node 7's GBM expected
-    return (40%) to produce a signal-conditioned forecast center. The GBM
-    confidence interval spread is preserved as the band shape; no new
-    simulation is run.
+    Blends Job 2's empirical return with Node 7's GBM expected return.
+    The blend weight is earned proportionally by how many similar historical
+    days Job 2 found — more evidence = higher empirical weight:
 
-    When Job 2 has insufficient data, falls back to GBM-only parameters.
+        job2_weight = min(0.70, similar_days_found / MAX_SIMILAR_DAYS × 0.70)
+        gbm_weight  = 1.0 - job2_weight
+
+    Examples:
+        5  similar days → Job2 14%,  GBM 86%
+        15 similar days → Job2 42%,  GBM 58%
+        25 similar days → Job2 70%,  GBM 30%
+
+    When Job 2 has insufficient data, falls back to GBM-only.
 
     Args:
         pattern_prediction: Output of _build_pattern_prediction().
@@ -802,7 +828,6 @@ def _build_prediction_graph_data(
     mc: Dict[str, Any] = state.get("monte_carlo_results") or {}
     gbm_expected: float = float(mc.get("expected_return") or 0.0)
 
-    # GBM spread as percentage relative to current price
     ci = mc.get("confidence_95") or {}
     current_price = float(mc.get("current_price") or 0.0)
     if current_price > 0:
@@ -810,32 +835,49 @@ def _build_prediction_graph_data(
         upper_pct = ((float(ci.get("upper", current_price)) - current_price) / current_price) * 100
     else:
         lower_pct = -5.0
-        upper_pct = 5.0
+        upper_pct =  5.0
 
-    if pattern_prediction.get("sufficient_data"):
-        emp_return: float = float(pattern_prediction.get("expected_return_7d", 0.0))
-        blended_return = JOB2_BLEND_WEIGHT * emp_return + GBM_BLEND_WEIGHT * gbm_expected
-
+    if not pattern_prediction.get("sufficient_data"):
         return {
-            "blended_expected_return":   round(blended_return, 4),
-            "gbm_expected_return":       round(gbm_expected,   4),
-            "empirical_expected_return": round(emp_return,     4),
-            "gbm_spread_lower":          round(lower_pct,      4),
-            "gbm_spread_upper":          round(upper_pct,      4),
-            "empirical_lower":           pattern_prediction.get("worst_case_7d"),
-            "empirical_upper":           pattern_prediction.get("best_case_7d"),
-            "data_source":               "blended",
+            "blended_expected_return":   round(gbm_expected, 4),
+            "gbm_expected_return":       round(gbm_expected, 4),
+            "empirical_expected_return": None,
+            "job2_blend_weight":         0.0,
+            "gbm_blend_weight":          1.0,
+            "similar_days_used":         0,
+            "gbm_spread_lower":          round(lower_pct, 4),
+            "gbm_spread_upper":          round(upper_pct, 4),
+            "empirical_lower":           None,
+            "empirical_upper":           None,
+            "data_source":               "gbm_only",
         }
 
+    similar_count = int(pattern_prediction.get("similar_days_found", 0))
+    job2_weight   = min(0.70, (similar_count / MAX_SIMILAR_DAYS) * 0.70)
+    gbm_weight    = 1.0 - job2_weight
+
+    emp_return: float = float(pattern_prediction.get("expected_return_7d", 0.0))
+    blended_return = job2_weight * emp_return + gbm_weight * gbm_expected
+
+    logger.debug(
+        f"  Graph blend: {similar_count} days → "
+        f"Job2={job2_weight:.0%} emp={emp_return:+.2f}% + "
+        f"GBM={gbm_weight:.0%} gbm={gbm_expected:+.2f}% "
+        f"= {blended_return:+.2f}%"
+    )
+
     return {
-        "blended_expected_return":   round(gbm_expected, 4),
-        "gbm_expected_return":       round(gbm_expected, 4),
-        "empirical_expected_return": None,
-        "gbm_spread_lower":          round(lower_pct, 4),
-        "gbm_spread_upper":          round(upper_pct, 4),
-        "empirical_lower":           None,
-        "empirical_upper":           None,
-        "data_source":               "gbm_only",
+        "blended_expected_return":   round(blended_return,  4),
+        "gbm_expected_return":       round(gbm_expected,    4),
+        "empirical_expected_return": round(emp_return,      4),
+        "job2_blend_weight":         round(job2_weight,     4),
+        "gbm_blend_weight":          round(gbm_weight,      4),
+        "similar_days_used":         similar_count,
+        "gbm_spread_lower":          round(lower_pct,       4),
+        "gbm_spread_upper":          round(upper_pct,       4),
+        "empirical_lower":           pattern_prediction.get("worst_case_7d"),
+        "empirical_upper":           pattern_prediction.get("best_case_7d"),
+        "data_source":               "blended",
     }
 
 
@@ -846,13 +888,13 @@ def _build_prediction_graph_data(
 def _check_job_agreement(
     final_signal: str,
     pattern_prediction: Dict[str, Any],
-) -> Tuple[str, float]:
+) -> str:
     """
-    Compare Job 1's directional signal with Job 2's empirical probability.
+    Compare Job 1's signal with Job 2's empirical probability.
 
-    When both methods agree, confidence is boosted. When they disagree, it
-    is penalised without overriding the Job 1 recommendation itself.
-    The penalty and flag are passed through signal_components for Nodes 13/14.
+    Returns an agreement_level string used as a transparency flag in Nodes 13/14.
+    Does NOT return a confidence multiplier — final_confidence is Job 1's
+    authoritative output and must not be modified by correlated data.
 
     Agreement thresholds:
       BUY  + prob_up >= 0.65 → strong | >= 0.55 → mild | < 0.40 → disagree
@@ -864,38 +906,29 @@ def _check_job_agreement(
         pattern_prediction: Output of _build_pattern_prediction().
 
     Returns:
-        (agreement_level, confidence_multiplier)
         agreement_level: 'strong' | 'mild' | 'disagree' | 'neutral'
     """
     if not pattern_prediction.get("sufficient_data"):
-        return "neutral", 1.0
+        return "neutral"
 
     prob_up: float = float(pattern_prediction.get("prob_up", 0.5))
 
     if final_signal == "BUY":
-        if prob_up >= 0.65:
-            return "strong",   STRONG_AGREEMENT_BOOST
-        if prob_up >= 0.55:
-            return "mild",     MILD_AGREEMENT_BOOST
-        if prob_up < 0.40:
-            return "disagree", DISAGREEMENT_PENALTY
-        return "neutral", 1.0
+        if prob_up >= 0.65:   return "strong"
+        if prob_up >= 0.55:   return "mild"
+        if prob_up < 0.40:    return "disagree"
+        return "neutral"
 
     if final_signal == "SELL":
-        if prob_up <= 0.35:
-            return "strong",   STRONG_AGREEMENT_BOOST
-        if prob_up <= 0.45:
-            return "mild",     MILD_AGREEMENT_BOOST
-        if prob_up > 0.60:
-            return "disagree", DISAGREEMENT_PENALTY
-        return "neutral", 1.0
+        if prob_up <= 0.35:   return "strong"
+        if prob_up <= 0.45:   return "mild"
+        if prob_up > 0.60:    return "disagree"
+        return "neutral"
 
     # HOLD
-    if 0.40 <= prob_up <= 0.60:
-        return "mild", MILD_AGREEMENT_BOOST
-    if prob_up > 0.65 or prob_up < 0.35:
-        return "disagree", DISAGREEMENT_PENALTY
-    return "neutral", 1.0
+    if 0.40 <= prob_up <= 0.60:          return "mild"
+    if prob_up > 0.65 or prob_up < 0.35: return "disagree"
+    return "neutral"
 
 
 # ============================================================================
@@ -1097,33 +1130,26 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         # ==================================================================
-        # JOB 2 — Agreement check → adjusted confidence
+        # JOB 2 — Agreement check (transparency flag only)
         # ==================================================================
-        agreement_level, confidence_multiplier = _check_job_agreement(
-            final_signal, pattern_prediction
-        )
-        adjusted_confidence: float = min(
-            1.0, max(0.0, raw_confidence * confidence_multiplier)
-        )
+        agreement_level = _check_job_agreement(final_signal, pattern_prediction)
+        pattern_prediction["agreement_with_job1"] = agreement_level
 
-        if agreement_level != "neutral":
-            logger.info(
-                f"  Job1/Job2 {agreement_level} (×{confidence_multiplier:.2f}) "
-                f"{raw_confidence:.4f} → {adjusted_confidence:.4f}"
-            )
         if agreement_level == "disagree":
             logger.warning(
-                f"  Disagreement: {final_signal} vs Job2 prob_up="
-                f"{pattern_prediction.get('prob_up', 0.5):.2f}"
+                f"  Job1/Job2 disagree: {final_signal} vs "
+                f"prob_up={pattern_prediction.get('prob_up', 0.5):.2f} "
+                f"— flagged for Nodes 13/14"
             )
-
-        pattern_prediction["agreement_with_job1"]   = agreement_level
-        pattern_prediction["confidence_multiplier"] = round(confidence_multiplier, 4)
+        elif agreement_level in ("strong", "mild"):
+            logger.info(f"  Job1/Job2 {agreement_level} agreement")
 
         # ==================================================================
         # JOB 2 — Prediction graph calibration for Node 15
         # ==================================================================
-        prediction_graph_data = _build_prediction_graph_data(pattern_prediction, state)
+        prediction_graph_data = _build_prediction_graph_data(
+            pattern_prediction, state
+        )
 
         logger.debug(
             f"  Graph data: source={prediction_graph_data['data_source']}, "
@@ -1134,9 +1160,9 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # STEP 6: Assemble signal_components and write to state
         # ==================================================================
         signal_components: Dict[str, Any] = {
-            "final_score":           round(final_score,          6),
+            "final_score":           round(final_score,      6),
             "final_signal":          final_signal,
-            "final_confidence":      round(adjusted_confidence,  6),
+            "final_confidence":      round(raw_confidence,   6),
             "stream_scores":         stream_scores,
             "risk_summary":          _build_risk_summary(state),
             "price_targets":         _build_price_targets(state),
@@ -1152,7 +1178,7 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
         state["final_signal"]      = final_signal
-        state["final_confidence"]  = round(adjusted_confidence, 6)
+        state["final_confidence"]  = round(raw_confidence, 6)
         state["signal_components"] = signal_components
 
         execution_time = (datetime.now() - start_time).total_seconds()

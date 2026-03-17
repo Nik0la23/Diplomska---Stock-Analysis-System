@@ -15,6 +15,7 @@ Can run in PARALLEL with: Nothing
 """
 
 import ast
+import asyncio
 import json
 import logging
 import time
@@ -49,16 +50,24 @@ PEERS_FALLBACK: Dict[str, List[str]] = {
 PEER_CLASSIFICATION_PROMPT = """
 You are a sell-side equity analyst at Goldman Sachs.
 
-Target stock: {ticker} ({sector}, {industry})
+Target stock: {ticker}
+  Sector  : {sector}
+  Industry: {industry}
+  Business: {target_description}
 
-Classify each of the following peer companies in relation to {ticker}.
+Classify each peer below in relation to {ticker}.
 Use ONLY these four relationship types:
 - COMPETITOR  : directly competes for the same customers or market share
 - SUPPLIER    : sells components, services, or inputs TO {ticker}
 - CUSTOMER    : buys products or services FROM {ticker}
 - SAME_SECTOR : same sector/industry but no direct competitive or supply relationship
 
-Peers to classify: {peers}
+IMPORTANT — base your classifications SOLELY on the business descriptions provided
+below. Do NOT rely on your training knowledge; company strategies and product lines
+change frequently and your knowledge may be outdated.
+
+Peers to classify:
+{peer_profiles}
 
 Return ONLY valid JSON. No preamble. No explanation outside the JSON.
 
@@ -67,7 +76,7 @@ Return ONLY valid JSON. No preamble. No explanation outside the JSON.
     {{
       "ticker": "string",
       "relationship": "COMPETITOR | SUPPLIER | CUSTOMER | SAME_SECTOR",
-      "reason": "one sentence max"
+      "reason": "one sentence max, grounded in the descriptions above"
     }}
   ]
 }}
@@ -260,26 +269,61 @@ async def detect_related_companies_node(
         peers = peers[:MAX_PEERS]
 
         # ------------------------------------------------------------------
-        # Step 2: Get sector/industry for the classification prompt (Pattern A)
+        # Step 2: Fetch target + all peer profiles concurrently (Pattern A)
+        # Each profile gives us sector, industry, and business description
+        # so the LLM can reason from data rather than training memory.
         # ------------------------------------------------------------------
-        sector   = "Unknown"
-        industry = "Unknown"
+        sector             = "Unknown"
+        industry           = "Unknown"
+        target_description = "No description available."
+        peer_descriptions: Dict[str, str] = {}
+
         profile_tool = tools_by_name.get("profile-symbol")
         if profile_tool is not None:
-            try:
-                raw_profile = await profile_tool.ainvoke({"symbol": ticker})
-                parsed_profile = _parse_tool_response(raw_profile)
-                if isinstance(parsed_profile, list) and parsed_profile:
-                    profile = parsed_profile[0]
-                elif isinstance(parsed_profile, dict):
-                    profile = parsed_profile
-                else:
-                    profile = {}
-                sector   = str(profile.get("sector")   or "Unknown")
-                industry = str(profile.get("industry") or "Unknown")
-                logger.info(f"[Node 3] {ticker} — sector={sector}, industry={industry}")
-            except Exception as exc:
-                logger.warning(f"[Node 3] profile-symbol tool failed for {ticker}: {exc}")
+            symbols_to_fetch = [ticker] + peers
+
+            async def _fetch_profile(sym: str) -> tuple[str, dict]:
+                try:
+                    raw = await profile_tool.ainvoke({"symbol": sym})
+                    parsed = _parse_tool_response(raw)
+                    if isinstance(parsed, list) and parsed:
+                        return sym, parsed[0]
+                    if isinstance(parsed, dict):
+                        return sym, parsed
+                except Exception as exc:
+                    logger.warning(f"[Node 3] profile-symbol failed for {sym}: {exc}")
+                return sym, {}
+
+            results = await asyncio.gather(*[_fetch_profile(s) for s in symbols_to_fetch])
+            profiles: Dict[str, dict] = dict(results)
+
+            target_prof = profiles.get(ticker, {})
+            sector             = str(target_prof.get("sector")      or "Unknown")
+            industry           = str(target_prof.get("industry")    or "Unknown")
+            target_description = str(target_prof.get("description") or "No description available.")
+            if len(target_description) > 300:
+                target_description = target_description[:297] + "..."
+
+            for p in peers:
+                prof = profiles.get(p, {})
+                desc = str(prof.get("description") or "No description available.")
+                if len(desc) > 300:
+                    desc = desc[:297] + "..."
+                sec  = str(prof.get("sector")   or "Unknown")
+                ind  = str(prof.get("industry") or "Unknown")
+                peer_descriptions[p] = f"Sector: {sec} | Industry: {ind} | {desc}"
+
+            logger.info(f"[Node 3] {ticker} — sector={sector}, industry={industry}")
+        else:
+            logger.warning("[Node 3] profile-symbol tool not found — LLM will use ticker symbols only")
+            for p in peers:
+                peer_descriptions[p] = "No description available."
+
+        # Format peer block for prompt
+        peer_profiles_block = "\n".join(
+            f"- {p}: {peer_descriptions.get(p, 'No description available.')}"
+            for p in peers
+        )
 
         # ------------------------------------------------------------------
         # Step 3: Classify peers via bare LLM call (Pattern C)
@@ -288,7 +332,8 @@ async def detect_related_companies_node(
             ticker=ticker,
             sector=sector,
             industry=industry,
-            peers=", ".join(peers),
+            target_description=target_description,
+            peer_profiles=peer_profiles_block,
         )
         classifications: List[Dict[str, Any]] = []
         try:

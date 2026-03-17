@@ -406,7 +406,6 @@ def _historical_pattern(state: Dict[str, Any]) -> Dict[str, Any]:
         "reason":                   pp.get("reason"),
         # Job 1/2 agreement — stored in pattern_prediction under "agreement_with_job1"
         "signal_agreement":         pp.get("agreement_with_job1"),
-        "confidence_multiplier":    pp.get("confidence_multiplier"),
         "streams_agreeing_count":   sa if isinstance(sa, int) else None,
     }
 

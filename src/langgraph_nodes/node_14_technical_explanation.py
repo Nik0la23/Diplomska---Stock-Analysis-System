@@ -289,8 +289,7 @@ def _build_user_prompt(
             f"  worst_case_7d (10th pct): {_fmt(pp.get('worst_case_7d'))}%\n"
             f"  best_case_7d (90th pct): {_fmt(pp.get('best_case_7d'))}%\n"
             f"  median_return_7d: {_fmt(pp.get('median_return_7d'))}%\n"
-            f"  agreement_with_job1: {pp.get('agreement_with_job1')} "
-            f"(confidence_multiplier: {_fmt(pp.get('confidence_multiplier'), '.4f')})\n"
+            f"  agreement_with_job1: {pp.get('agreement_with_job1')}\n"
             f"  similar_days_detail:\n{detail_rows}"
         )
     else:
