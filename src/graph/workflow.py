@@ -8,8 +8,9 @@ Current Flow (Nodes 1-11):
 2. Node 3: Related Companies Detection
 3. Node 2: Multi-Source News Fetching
 4. Node 9A: Content Analysis & Feature Extraction
-5. PARALLEL: Nodes 4, 5, 6, 7 (Technical, Sentiment, Market Context, Monte Carlo)
-6. Node 8: News Verification & Learning (thesis innovation)
+5. PARALLEL: Nodes 4, 5, 6 (Technical, Sentiment, Market Context)
+6. Node 7: Monte Carlo (sequential, after parallel join — needs Node 6 market_context)
+7. Node 8: News Verification & Learning (thesis innovation)
 7. Node 9B: Behavioral Anomaly Detection
 8. Node 10: Backtesting (raw accuracy metrics)
 9. Node 11: Adaptive Weights Calculation
@@ -127,10 +128,12 @@ def create_stock_analysis_workflow() -> StateGraph:
     Node 9A: Content Analysis
       ↓
     ┌─────────┬─────────┬─────────┐
-    ↓         ↓         ↓         ↓
-    Node 4    Node 5    Node 6    Node 7
-    Tech      Sent      Market    Monte Carlo
+    ↓         ↓         ↓
+    Node 4    Node 5    Node 6
+    Tech      Sent      Market
     └─────────┴─────────┴─────────┘
+      ↓
+    Node 7: Monte Carlo (needs Node 6 market_context)
       ↓
     Node 8: News Verification & Learning
       ↓
@@ -161,10 +164,12 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_node("fetch_news", fetch_all_news_node)
     workflow.add_node("content_analysis", content_analysis_node)
     
-    # Phase 2: Parallel Analysis (4 nodes execute simultaneously)
+    # Phase 2: Parallel Analysis (3 nodes execute simultaneously)
     workflow.add_node("technical_analysis", technical_analysis_node)
     workflow.add_node("sentiment_analysis", sentiment_analysis_node)
     workflow.add_node("market_context", market_context_node)
+
+    # Phase 2b: Monte Carlo (sequential after parallel join — needs Node 6 market_context)
     workflow.add_node("monte_carlo", monte_carlo_forecasting_node)
     
     # Phase 3: Background outcomes (before Node 8) then Learning + 9B
@@ -203,21 +208,20 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_edge("fetch_news", "content_analysis")
     
     # ========================================================================
-    # PARALLEL EXECUTION (Nodes 4, 5, 6, 7)
+    # PARALLEL EXECUTION (Nodes 4, 5, 6)
     # ========================================================================
-    
-    # From Node 9A, split to ALL 4 analysis nodes
+
+    # From Node 9A, split to 3 analysis nodes
     # These execute in PARALLEL (LangGraph handles this automatically)
     workflow.add_edge("content_analysis", "technical_analysis")
     workflow.add_edge("content_analysis", "sentiment_analysis")
     workflow.add_edge("content_analysis", "market_context")
-    workflow.add_edge("content_analysis", "monte_carlo")
-    
+
     # ========================================================================
-    # CONVERGENCE: parallel → background outcomes → Node 8
+    # CONVERGENCE: parallel → background outcomes → Node 7 → Node 8
     # ========================================================================
-    
-    # All 4 parallel nodes converge to background-outcomes node, then Node 8
+
+    # 3 parallel nodes converge to background-outcomes node, then Node 7
     workflow.add_conditional_edges(
         "technical_analysis",
         should_continue_after_parallel,
@@ -233,14 +237,12 @@ def create_stock_analysis_workflow() -> StateGraph:
         should_continue_after_parallel,
         {"continue": "run_background_outcomes", "end": END}
     )
-    workflow.add_conditional_edges(
-        "monte_carlo",
-        should_continue_after_parallel,
-        {"continue": "run_background_outcomes", "end": END}
-    )
-    
-    # Background outcomes runs first (fills news_outcomes when needed), then Node 8, then 9B
-    workflow.add_edge("run_background_outcomes", "news_verification")
+
+    # Background outcomes runs first (fills news_outcomes when needed),
+    # then Node 7 (Monte Carlo — needs Node 6 market_context for VIX scaling),
+    # then Node 8, then 9B
+    workflow.add_edge("run_background_outcomes", "monte_carlo")
+    workflow.add_edge("monte_carlo", "news_verification")
     workflow.add_edge("news_verification", "behavioral_anomaly_detection")
     workflow.add_edge("behavioral_anomaly_detection", "backtesting")
     workflow.add_edge("backtesting", "adaptive_weights")
@@ -250,7 +252,7 @@ def create_stock_analysis_workflow() -> StateGraph:
     workflow.add_edge("technical_explanation", "dashboard")
     workflow.add_edge("dashboard", END)
 
-    logger.info("Workflow built successfully (parallel → background outcomes → Node 8 → Node 9B → Node 10 → Node 11 → Node 12 → Node 13 → Node 14 → Node 15)")
+    logger.info("Workflow built successfully (parallel[4,5,6] → background outcomes → Node 7 → Node 8 → Node 9B → Node 10 → Node 11 → Node 12 → Node 13 → Node 14 → Node 15)")
     
     # Compile and return
     return workflow.compile()

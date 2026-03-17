@@ -311,6 +311,43 @@ def _score_monte_carlo(state: Dict[str, Any]) -> Tuple[float, bool]:
 
 
 # ============================================================================
+# HELPER 4b: RELATED SENTIMENT STREAM SCORING
+# ============================================================================
+
+def _score_related_sentiment(state: Dict[str, Any]) -> Tuple[float, bool]:
+    """
+    Return the related-company news sentiment score on [-1, +1].
+
+    Reads related_news_sentiment from Node 5's sentiment_analysis dict.
+    This replaces Monte Carlo as the 4th stream in Job 1 — related news
+    is a backtested stream in Node 10/11 with an earned weight, unlike
+    GBM which has no predictive weight from backtesting.
+
+    Args:
+        state: LangGraph state dict.
+
+    Returns:
+        (score, is_missing)
+    """
+    sentiment_analysis: Optional[Dict[str, Any]] = state.get("sentiment_analysis")
+    related_val: Optional[float] = None
+
+    if sentiment_analysis is not None:
+        related_val = sentiment_analysis.get("related_news_sentiment")
+
+    if related_val is None:
+        related_val = state.get("related_news_sentiment")
+
+    if related_val is None:
+        logger.warning("  Related news stream: no related_news_sentiment → score=0.0")
+        return 0.0, True
+
+    score = float(np.clip(float(related_val), -1.0, 1.0))
+    logger.debug(f"  Related news: score={score:+.3f}")
+    return score, False
+
+
+# ============================================================================
 # HELPER 5: SIGNAL CLASSIFICATION
 # ============================================================================
 
@@ -970,14 +1007,28 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         adaptive_weights: Dict[str, Any] = (
             state.get("adaptive_weights") or _EQUAL_WEIGHTS_FALLBACK
         )
-        w_tech:   float = float(adaptive_weights.get("technical_weight",    EQUAL_WEIGHT))
-        w_sent:   float = float(adaptive_weights.get("stock_news_weight",   EQUAL_WEIGHT))
-        w_market: float = float(adaptive_weights.get("market_news_weight",  EQUAL_WEIGHT))
-        w_mc:     float = float(adaptive_weights.get("related_news_weight", EQUAL_WEIGHT))
+
+        # Read all 4 backtested stream weights from Node 11.
+        # Monte Carlo is NOT backtested — it has no earned weight slot.
+        # Normalize the 4 real streams to sum to 1.0.
+        w_tech_raw:    float = float(adaptive_weights.get("technical_weight",    EQUAL_WEIGHT))
+        w_sent_raw:    float = float(adaptive_weights.get("stock_news_weight",   EQUAL_WEIGHT))
+        w_market_raw:  float = float(adaptive_weights.get("market_news_weight",  EQUAL_WEIGHT))
+        w_related_raw: float = float(adaptive_weights.get("related_news_weight", EQUAL_WEIGHT))
+
+        _w_total = w_tech_raw + w_sent_raw + w_market_raw + w_related_raw
+        if _w_total > 0:
+            w_tech    = w_tech_raw    / _w_total
+            w_sent    = w_sent_raw    / _w_total
+            w_market  = w_market_raw  / _w_total
+            w_related = w_related_raw / _w_total
+        else:
+            w_tech = w_sent = w_market = w_related = EQUAL_WEIGHT
 
         logger.info(
-            f"  Weights — tech={w_tech:.3f}, sent={w_sent:.3f}, "
-            f"market={w_market:.3f}, mc={w_mc:.3f}"
+            f"  Weights (4-stream, MC excluded from signal) — "
+            f"tech={w_tech:.3f}, sent={w_sent:.3f}, "
+            f"market={w_market:.3f}, related={w_related:.3f}"
         )
 
         # ==================================================================
@@ -985,15 +1036,19 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # ==================================================================
         streams_missing: List[str] = []
 
-        tech_score,  tech_missing  = _score_technical(state)
-        sent_score,  sent_missing  = _score_sentiment(state)
-        mkt_score,   mkt_missing   = _score_market(state)
-        mc_score,    mc_missing    = _score_monte_carlo(state)
+        tech_score,     tech_missing    = _score_technical(state)
+        sent_score,     sent_missing    = _score_sentiment(state)
+        mkt_score,      mkt_missing     = _score_market(state)
+        related_score,  related_missing = _score_related_sentiment(state)
 
-        if tech_missing:  streams_missing.append("technical")
-        if sent_missing:  streams_missing.append("sentiment")
-        if mkt_missing:   streams_missing.append("market")
-        if mc_missing:    streams_missing.append("monte_carlo")
+        if tech_missing:    streams_missing.append("technical")
+        if sent_missing:    streams_missing.append("sentiment")
+        if mkt_missing:     streams_missing.append("market")
+        if related_missing: streams_missing.append("related_news")
+
+        # Monte Carlo (Node 7) is excluded from Job 1 signal scoring.
+        # GBM probability_up near-random over 7 days adds noise not signal.
+        # Node 7 outputs remain in Job 2 prediction graph and price_targets.
 
         # ==================================================================
         # JOB 1 — STEP 3: All 4 streams missing → cannot produce a signal
@@ -1014,10 +1069,10 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "final_signal":     "HOLD",
                 "final_confidence": 0.0,
                 "stream_scores": {
-                    "technical":   {"raw_score": 0.0, "weight": w_tech,   "contribution": 0.0},
-                    "sentiment":   {"raw_score": 0.0, "weight": w_sent,   "contribution": 0.0},
-                    "market":      {"raw_score": 0.0, "weight": w_market, "contribution": 0.0},
-                    "monte_carlo": {"raw_score": 0.0, "weight": w_mc,     "contribution": 0.0},
+                    "technical":    {"raw_score": 0.0, "weight": w_tech,    "contribution": 0.0},
+                    "sentiment":    {"raw_score": 0.0, "weight": w_sent,    "contribution": 0.0},
+                    "market":       {"raw_score": 0.0, "weight": w_market,  "contribution": 0.0},
+                    "related_news": {"raw_score": 0.0, "weight": w_related, "contribution": 0.0},
                 },
                 "risk_summary":          _build_risk_summary(state),
                 "price_targets":         _build_price_targets(state),
@@ -1039,22 +1094,22 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # ==================================================================
         # JOB 1 — STEP 4: Weighted contributions and final score
         # ==================================================================
-        tech_contrib = tech_score * w_tech
-        sent_contrib = sent_score * w_sent
-        mkt_contrib  = mkt_score  * w_market
-        mc_contrib   = mc_score   * w_mc
+        tech_contrib    = tech_score    * w_tech
+        sent_contrib    = sent_score    * w_sent
+        mkt_contrib     = mkt_score     * w_market
+        related_contrib = related_score * w_related
 
-        final_score: float    = tech_contrib + sent_contrib + mkt_contrib + mc_contrib
+        final_score: float = tech_contrib + sent_contrib + mkt_contrib + related_contrib
         final_signal: str     = _classify_signal(final_score)
         raw_confidence: float = min(1.0, abs(final_score))
 
         logger.info(
             f"  Scores — tech={tech_score:+.3f}, sent={sent_score:+.3f}, "
-            f"market={mkt_score:+.3f}, mc={mc_score:+.3f}"
+            f"market={mkt_score:+.3f}, related={related_score:+.3f}"
         )
         logger.info(
             f"  Contributions — tech={tech_contrib:+.4f}, sent={sent_contrib:+.4f}, "
-            f"market={mkt_contrib:+.4f}, mc={mc_contrib:+.4f}"
+            f"market={mkt_contrib:+.4f}, related={related_contrib:+.4f}"
         )
         logger.info(
             f"  Job 1 → {final_signal} "
@@ -1065,10 +1120,10 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # JOB 1 — STEP 5: Stream scores breakdown
         # ==================================================================
         stream_scores: Dict[str, Dict[str, float]] = {
-            "technical":   {"raw_score": tech_score, "weight": w_tech,   "contribution": tech_contrib},
-            "sentiment":   {"raw_score": sent_score, "weight": w_sent,   "contribution": sent_contrib},
-            "market":      {"raw_score": mkt_score,  "weight": w_market, "contribution": mkt_contrib},
-            "monte_carlo": {"raw_score": mc_score,   "weight": w_mc,     "contribution": mc_contrib},
+            "technical":    {"raw_score": tech_score,    "weight": w_tech,    "contribution": tech_contrib},
+            "sentiment":    {"raw_score": sent_score,    "weight": w_sent,    "contribution": sent_contrib},
+            "market":       {"raw_score": mkt_score,     "weight": w_market,  "contribution": mkt_contrib},
+            "related_news": {"raw_score": related_score, "weight": w_related, "contribution": related_contrib},
         }
 
         signal_agreement: int = _count_signal_agreement(stream_scores, final_signal)
@@ -1093,7 +1148,7 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     today_vector = _get_today_vector(state, tech_score)
                     similar_days, threshold_used = _find_similar_days(
                         today_vector, snapshots,
-                        w_tech, w_sent, w_market, w_mc,
+                        w_tech, w_sent, w_market, w_related,
                     )
                     pattern_prediction = _build_pattern_prediction(
                         similar_days, threshold_used

@@ -51,6 +51,7 @@ Runs BEFORE: Node 12 (final signal generation)
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
+from src.langgraph_nodes.node_10_backtesting import RECENT_PERIOD_DAYS
 from src.utils.logger import get_node_logger
 
 logger = get_node_logger("node_11")
@@ -198,16 +199,41 @@ def _compute_weighted_accuracy(
             f"— contributing at measured accuracy"
         )
 
-    raw_full: float = float(stream_metrics.get("full_accuracy", NEUTRAL_ACCURACY))
-    total_days: int = int(stream_metrics.get("total_days_evaluated", 0))
+    # Prefer directional_accuracy — it is comparable across technical
+    # (which has HOLD days) and sentiment streams (which never produce HOLD).
+    # Fall back to full_accuracy for cached results that predate this field.
+    _dir_acc = stream_metrics.get("directional_accuracy")
+    raw_full: float = float(_dir_acc) if _dir_acc is not None else float(
+        stream_metrics.get("full_accuracy", NEUTRAL_ACCURACY)
+    )
+    # Use signal_count (BUY+SELL only) as the Bayesian smoothing denominator
+    # when directional_accuracy is available — consistent sample size.
+    total_days: int = int(
+        stream_metrics.get("signal_count", 0) if _dir_acc is not None
+        else stream_metrics.get("total_days_evaluated", 0)
+    )
     smoothed_full = _bayesian_smooth(raw_full, total_days)
 
-    raw_recent: Optional[float] = stream_metrics.get("recent_accuracy")
-    recent_days: int = int(stream_metrics.get("recent_days_evaluated", 0))
+    _dir_recent = stream_metrics.get("recent_directional_accuracy")
+    raw_recent: Optional[float] = (
+        float(_dir_recent) if _dir_recent is not None
+        else stream_metrics.get("recent_accuracy")
+    )
+    # Recent sample size: count recent BUY+SELL days from daily_results
+    if _dir_recent is not None:
+        recent_days: int = sum(
+            1 for r in stream_metrics.get("daily_results", [])
+            if r.get("days_ago", 999) <= RECENT_PERIOD_DAYS
+            and r.get("signal") in ("BUY", "SELL")
+        )
+    else:
+        recent_days: int = int(stream_metrics.get("recent_days_evaluated", 0))
+
+    accuracy_source = "directional" if _dir_acc is not None else "full"
 
     if raw_recent is None:
         logger.info(
-            f"  {stream_name}: No recent data → full_accuracy only "
+            f"  {stream_name} ({accuracy_source}): No recent data → full_accuracy only "
             f"raw={raw_full:.1%} → smoothed={smoothed_full:.1%} (n={total_days})"
         )
         return smoothed_full, "full_accuracy_only"
@@ -216,7 +242,7 @@ def _compute_weighted_accuracy(
 
     weighted = RECENCY_WEIGHT * smoothed_recent + FULL_WEIGHT * smoothed_full
     logger.info(
-        f"  {stream_name}: "
+        f"  {stream_name} ({accuracy_source}): "
         f"full={raw_full:.1%}→{smoothed_full:.1%} (n={total_days}), "
         f"recent={raw_recent:.1%}→{smoothed_recent:.1%} (n={recent_days}), "
         f"weighted={weighted:.1%} (70/30)"

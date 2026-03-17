@@ -584,26 +584,31 @@ def adjust_current_sentiment_confidence(
     
     # Scale effectiveness to ~1.0
     effectiveness_factor = weighted_effectiveness * 2.0
-    
-    # Apply adjustments to confidence
-    adjusted_confidence = original_confidence * avg_reliability_multiplier * effectiveness_factor
-    
+
+    # Blend the two signals into one adjustment (equal weight between them)
+    blended_adjustment = 0.5 * avg_reliability_multiplier + 0.5 * effectiveness_factor
+
+    # Apply blended adjustment to confidence
+    adjusted_confidence = original_confidence * blended_adjustment
+
     # Clamp to valid range [0.0, 1.0]
     adjusted_confidence = clamp_value(adjusted_confidence, 0.0, 1.0)
-    
+
     logger.info(f"Confidence adjustment: {original_confidence:.3f} → {adjusted_confidence:.3f} "
-               f"(reliability: {avg_reliability_multiplier:.3f}, effectiveness: {effectiveness_factor:.3f})")
+               f"(blended: {blended_adjustment:.3f}, reliability: {avg_reliability_multiplier:.3f}, "
+               f"effectiveness: {effectiveness_factor:.3f})")
     logger.info(f"  Sources matched: {sources_matched}, unmatched: {sources_unmatched}")
-    
+
     # Build adjusted sentiment dict
     adjusted_sentiment = current_sentiment.copy()
     adjusted_sentiment['confidence'] = float(adjusted_confidence)
-    
+
     # Build details dict
     adjustment_details = {
         'original': float(original_confidence),
         'reliability_multiplier': float(avg_reliability_multiplier),
         'effectiveness_factor': float(effectiveness_factor),
+        'blended_adjustment': float(blended_adjustment),
         'final': float(adjusted_confidence),
         'sources_matched': sources_matched,
         'sources_unmatched': sources_unmatched
@@ -803,11 +808,27 @@ def news_verification_node(state: Dict) -> Dict:
         # Calculate learning_adjustment factor for Node 11 (adaptive weighting)
         # High accuracy + high correlation → increase news weight (up to 2.0x)
         # Low accuracy or low correlation → decrease news weight (down to 0.5x)
-        learning_adjustment = (news_accuracy_score / 50.0) * historical_correlation * 2.0
+
+        # Step 1: Convert normalized correlation [0,1] to a centered signal [-1, +1]
+        # 0.5 → 0.0 (no effect), 1.0 → +1.0 (strong positive), 0.0 → -1.0 (inverse)
+        correlation_signal = (historical_correlation - 0.5) * 2.0
+
+        # Step 2: Accuracy deviation from random baseline (50%)
+        # 0% above random → 0.0, +30% above → +0.6, -20% below → -0.4
+        accuracy_deviation = (news_accuracy_score - 50.0) / 50.0
+
+        # Step 3: learning_adjustment = 1.0 + combined signal, clamped
+        # When correlation_signal = 0 (no correlation), accuracy_deviation still
+        # contributes but at half weight — news that predicts correctly even in
+        # uncorrelated environments is still somewhat useful
+        combined_signal = (0.6 * accuracy_deviation) + (0.4 * correlation_signal)
+        learning_adjustment = 1.0 + combined_signal
         learning_adjustment = clamp_value(learning_adjustment, 0.5, 2.0)
-        
+
         logger.info(f"Learning adjustment factor: {learning_adjustment:.3f} "
-                   f"(accuracy: {news_accuracy_score:.1f}%, correlation: {historical_correlation:.3f})")
+                   f"(accuracy_dev: {accuracy_deviation:+.3f}, "
+                   f"corr_signal: {correlation_signal:+.3f}, "
+                   f"combined: {combined_signal:+.3f})")
         
         # =====================================================================
         # STEP 7: Build results and update state

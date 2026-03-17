@@ -193,6 +193,18 @@ def reconstruct_technical_signal(
         return None, None
 
     try:
+        # LOOKAHEAD FIX: strip the last 7 rows before passing to
+        # calculate_technical_score(). fit_ic_regression() shifts
+        # targets by -7, so without this, the last 7 training rows
+        # have targets that reference prices at or after the signal date.
+        # Stripping 7 rows ensures the regression trains only on
+        # fully-resolved historical returns.
+        #
+        # We still pass the FULL price_slice to the individual indicator
+        # functions (rsi, macd, etc.) so indicator values are computed
+        # on day i — only the regression training window is cleaned.
+        regression_slice = price_slice.iloc[:-7] if len(price_slice) > MIN_PRICE_ROWS_FOR_TECHNICAL + 7 else price_slice
+
         rsi        = calculate_rsi(price_slice)
         macd       = calculate_macd(price_slice)
         bollinger  = calculate_bollinger_bands(price_slice)
@@ -202,7 +214,7 @@ def reconstruct_technical_signal(
 
         score_result = calculate_technical_score(
             rsi, macd, bollinger, moving_avg, volume,
-            price_data=price_slice,
+            price_data=regression_slice,   # <-- cleaned slice for regression
             adx=adx,
         )
 
@@ -675,6 +687,25 @@ def calculate_stream_metrics(
         recent_correct = sum(1 for r in recent_days if r["correct"])
         recent_accuracy = recent_correct / len(recent_days)
 
+    # --- Directional-only accuracy (BUY+SELL days only) ---
+    # Comparable across technical (which has HOLD days) and sentiment
+    # streams (which never produce HOLD). Node 11 should prefer these.
+    directional_days = [r for r in all_days if r["signal"] in ("BUY", "SELL")]
+    directional_correct_all = sum(1 for r in directional_days if r["correct"])
+    directional_accuracy = (
+        directional_correct_all / len(directional_days)
+        if directional_days else None
+    )
+
+    recent_directional_days = [
+        r for r in recent_days if r["signal"] in ("BUY", "SELL")
+    ]
+    recent_directional_correct = sum(1 for r in recent_directional_days if r["correct"])
+    recent_directional_accuracy = (
+        recent_directional_correct / len(recent_directional_days)
+        if len(recent_directional_days) >= MIN_RECENT_DAYS_FOR_ACCURACY else None
+    )
+
     # --- Actual price movements ---
     all_changes = [r["actual_change_7d"] for r in all_days]
     correct_changes = [r["actual_change_7d"] for r in all_days if r["correct"]]
@@ -713,6 +744,8 @@ def calculate_stream_metrics(
     return {
         "full_accuracy": round(full_accuracy, 4),
         "recent_accuracy": round(recent_accuracy, 4) if recent_accuracy is not None else None,
+        "directional_accuracy":        round(directional_accuracy, 4) if directional_accuracy is not None else None,
+        "recent_directional_accuracy": round(recent_directional_accuracy, 4) if recent_directional_accuracy is not None else None,
         "signal_count": signal_count,
         "buy_count": buy_count,
         "sell_count": sell_count,

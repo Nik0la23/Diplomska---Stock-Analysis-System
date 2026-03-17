@@ -12,9 +12,9 @@ where:
 - σ = volatility (historical standard deviation)
 - Z = random normal variable
 
-Runs in PARALLEL with: Nodes 4, 5, 6
-Runs AFTER: Node 1 (needs price data)
-Runs BEFORE: Node 8 (verification)
+Runs AFTER:  Nodes 4, 5, 6 (needs Node 6 market_context for VIX-conditional
+             volatility scaling)
+Runs BEFORE: Node 8 (news verification)
 """
 
 import numpy as np
@@ -436,6 +436,93 @@ def prepare_visualization_data(
 
 
 # ============================================================================
+# HELPER FUNCTION 6: VIX-Conditional Volatility Scaling
+# ============================================================================
+
+def calculate_regime_adjusted_volatility(
+    base_volatility: float,
+    vix_level: float,
+    regime_label: str,
+    beta: float,
+) -> float:
+    """
+    Scale historical volatility by current VIX regime relative to
+    a neutral baseline, then adjust for the stock's beta.
+
+    Why: GBM with flat 30-day historical volatility produces a
+    confidence interval that ignores the current stress environment.
+    When VIX is elevated, the actual distribution of 7-day returns
+    is wider than the recent calm period suggests, and vice versa.
+
+    Formula:
+        vix_ratio      = vix_level / VIX_NEUTRAL_BASELINE   (e.g. 20)
+        regime_scalar  = vix_ratio ^ VIX_EXPONENT           (e.g. 0.5)
+        beta_scalar    = 1.0 + (beta - 1.0) * BETA_BLEND    (partial beta)
+        adjusted_vol   = base_volatility * regime_scalar * beta_scalar
+        clamped to [base_volatility * 0.5, base_volatility * 3.0]
+
+    Constants:
+        VIX_NEUTRAL_BASELINE = 20.0   (long-run VIX average)
+        VIX_EXPONENT         = 0.5    (square-root dampening — avoids
+                                       extreme scaling at VIX=60+)
+        BETA_BLEND           = 0.5    (50% beta sensitivity — avoids
+                                       over-amplifying high-beta stocks)
+
+    Examples:
+        VIX=20 (neutral), beta=1.0 → ratio=1.0 → adjusted = base  (no change)
+        VIX=30 (elevated), beta=1.0 → ratio=1.5 → scalar=1.22 → vol +22%
+        VIX=12 (calm),     beta=1.0 → ratio=0.6 → scalar=0.77 → vol -23%
+        VIX=30 (elevated), beta=1.5 → ratio=1.5 → regime_scalar=1.22
+                                    → beta_scalar=1.25
+                                    → adjusted = base * 1.22 * 1.25 = base * 1.53
+        VIX=30 (elevated), beta=0.5 → beta_scalar=0.75
+                                    → adjusted = base * 1.22 * 0.75 = base * 0.92
+
+    Regime label override:
+        If regime_label is 'PANIC_SELLOFF', 'RISK_OFF_BEAR', or
+        'HIGH_VOL_BULL' (Node 6's high-stress regimes), apply an
+        additional +20% floor on top of the VIX scaling so that
+        qualitative regime assessment widens the interval even
+        when VIX hasn't fully repriced yet.
+
+    Args:
+        base_volatility: Historical daily volatility from calculate_historical_statistics()
+        vix_level:       Current VIX level from Node 6's market_context
+        regime_label:    Node 6's market_regime.regime_label string
+        beta:            Stock's beta from Node 6's market_correlation_profile.beta_calculated
+
+    Returns:
+        Adjusted daily volatility (float, always > 0)
+    """
+    VIX_NEUTRAL_BASELINE = 20.0
+    VIX_EXPONENT         = 0.5
+    BETA_BLEND           = 0.5
+
+    # VIX scaling
+    vix_ratio      = max(vix_level, 1.0) / VIX_NEUTRAL_BASELINE
+    regime_scalar  = float(vix_ratio ** VIX_EXPONENT)
+
+    # Beta scaling — partial sensitivity
+    safe_beta    = float(beta) if (beta is not None and np.isfinite(float(beta))) else 1.0
+    beta_scalar  = 1.0 + (safe_beta - 1.0) * BETA_BLEND
+
+    adjusted = base_volatility * regime_scalar * beta_scalar
+
+    # Regime label floor — uses Node 6's actual regime taxonomy:
+    # PANIC_SELLOFF and RISK_OFF_BEAR are crisis-level; HIGH_VOL_BULL is
+    # elevated but directional. All three warrant a wider cone floor.
+    HIGH_STRESS_REGIMES = {'PANIC_SELLOFF', 'RISK_OFF_BEAR', 'HIGH_VOL_BULL'}
+    if regime_label in HIGH_STRESS_REGIMES:
+       floor_vol = base_volatility * regime_scalar * beta_scalar * 1.20
+       adjusted  = max(adjusted, floor_vol)
+
+    # Hard clamps: never below 50% or above 300% of base
+    adjusted = float(np.clip(adjusted, base_volatility * 0.5, base_volatility * 3.0))
+
+    return adjusted
+
+
+# ============================================================================
 # MAIN NODE FUNCTION
 # ============================================================================
 
@@ -451,9 +538,8 @@ def monte_carlo_forecasting_node(state: Dict[str, Any]) -> Dict[str, Any]:
     5. Prepare visualization data
     6. Update state
     
-    Runs in PARALLEL with Nodes 4, 5, 6
-    Runs AFTER: Node 1 (need price data)
-    Runs BEFORE: Node 8 (verification)
+    Runs AFTER:  Nodes 4, 5, 6 (needs Node 6's market_context for VIX scaling)
+    Runs BEFORE: Node 8 (news verification)
     
     Args:
         state: LangGraph state
@@ -484,14 +570,44 @@ def monte_carlo_forecasting_node(state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"Insufficient price history (need {LOOKBACK_DAYS} days, have {len(price_data)})")
         
         logger.info(f"Using {len(price_data)} days of price data")
-        
+
+        # ====================================================================
+        # STEP 1b: Read Node 6 market context (available because Node 7 now
+        #           runs AFTER the parallel block of Nodes 4/5/6)
+        # ====================================================================
+        market_context  = state.get("market_context") or {}
+        market_regime   = market_context.get("market_regime")              or {}
+        corr_profile    = market_context.get("market_correlation_profile") or {}
+
+        vix_level    = float(market_regime.get("vix_level")          or 20.0)
+        regime_label = str(market_regime.get("regime_label")         or "NEUTRAL")
+        beta         = float(corr_profile.get("beta_calculated")     or 1.0)
+
+        logger.info(
+            f"Node 7: market context — VIX={vix_level:.1f}, "
+            f"regime={regime_label}, beta={beta:.2f}"
+        )
+
         # ====================================================================
         # STEP 2: Calculate Historical Statistics
         # ====================================================================
         logger.info(f"Calculating historical statistics from {LOOKBACK_DAYS} days...")
-        drift, volatility, current_price = calculate_historical_statistics(
-            price_data, 
+        drift, base_volatility, current_price = calculate_historical_statistics(
+            price_data,
             days=LOOKBACK_DAYS
+        )
+
+        # Apply VIX-conditional regime scaling to widen/narrow the GBM cone
+        volatility = calculate_regime_adjusted_volatility(
+            base_volatility=base_volatility,
+            vix_level=vix_level,
+            regime_label=regime_label,
+            beta=beta,
+        )
+        logger.info(
+            f"  Volatility: base={base_volatility:.4f} → "
+            f"regime-adjusted={volatility:.4f} "
+            f"(×{volatility/base_volatility:.3f})"
         )
         
         # ====================================================================
@@ -524,7 +640,11 @@ def monte_carlo_forecasting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         results = {
             'current_price': current_price,
             'drift': drift,
-            'volatility': volatility,
+            'volatility':          volatility,        # regime-adjusted (used for simulations)
+            'base_volatility':     base_volatility,   # raw historical (for diagnostics)
+            'vix_level':           vix_level,
+            'regime_label':        regime_label,
+            'volatility_scalar':   round(volatility / base_volatility, 4) if base_volatility > 0 else 1.0,
             'forecast_days': FORECAST_DAYS,
             'num_simulations': NUM_SIMULATIONS,
             'simulations': simulations.tolist(),  # Convert to list for JSON serialization
