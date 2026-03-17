@@ -117,7 +117,9 @@ class StockAnalysisState(TypedDict):
     # NODE 12: Final Signal Generation
     # ========================================================================
     final_signal: Optional[str]                       # 'BUY', 'SELL', 'HOLD'
-    final_confidence: Optional[float]                 # 0.0 to 1.0
+    final_confidence: Optional[float]                 # 0.0 to 1.0 (= trustworthiness)
+    signal_strength: Optional[int]                    # 0–100 display-friendly signal loudness
+    trustworthiness: Optional[float]                  # 0.0–1.0 historical-accuracy-grounded confidence
     signal_components: Optional[Dict[str, Any]]       # Breakdown of signal
     
     
@@ -200,6 +202,8 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         adaptive_weights=None,
         final_signal=None,
         final_confidence=None,
+        signal_strength=None,
+        trustworthiness=None,
         signal_components=None,
         beginner_explanation=None,
         technical_explanation=None,

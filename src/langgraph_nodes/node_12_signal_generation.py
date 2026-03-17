@@ -406,6 +406,160 @@ def _count_signal_agreement(
 
 
 # ============================================================================
+# HELPER 6b: SIGNAL STRENGTH
+# ============================================================================
+
+def _compute_signal_strength(
+    stream_scores: Dict[str, Dict[str, float]],
+    signal_agreement: int,
+) -> int:
+    """
+    Compute how loud and united the 4 streams are on a 0–100 scale.
+
+    Two components:
+      Intensity (70%): weighted average of abs(raw_score) across all streams.
+        Each stream contributes its own weight × abs(raw_score).
+        A stream scoring ±1.0 at full weight = maximum intensity.
+
+      Agreement (30%): fraction of streams pointing the same direction.
+        4/4 agree = 1.0, 3/4 = 0.75, 2/4 = 0.50, 1/4 = 0.25, 0/4 = 0.0
+
+    Returns integer 0–100 for clean UI display.
+
+    Args:
+        stream_scores:    Dict of stream data including 'raw_score' and 'weight'.
+        signal_agreement: Number of streams agreeing with the final signal (0–4).
+
+    Returns:
+        Integer 0–100.
+    """
+    intensity = sum(
+        abs(data["raw_score"]) * data["weight"]
+        for data in stream_scores.values()
+    )
+    agreement_ratio = signal_agreement / 4.0
+    raw = (0.70 * intensity) + (0.30 * agreement_ratio)
+    return int(round(min(1.0, raw) * 100))
+
+
+# ============================================================================
+# HELPER 6c: TRUSTWORTHINESS
+# ============================================================================
+
+def _compute_trustworthiness(
+    stream_scores: Dict[str, Dict[str, float]],
+    adaptive_weights: Dict[str, Any],
+    pattern_prediction: Dict[str, Any],
+    w_tech: float,
+    w_sent: float,
+    w_market: float,
+    w_related: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Compute how trustworthy the final recommendation is (0.0–1.0).
+
+    Three components and their weights:
+      Stream reliability  50%  — weighted hit rates from Node 11 backtesting.
+                                  Each stream's hit_rate × its adaptive weight.
+                                  Falls back to PRIOR (0.55) per stream when
+                                  Node 11 has insufficient data (flagged by
+                                  'fallback_equal_weights' or missing hit_rate
+                                  or sample_count < MIN_SAMPLES_FOR_RELIABILITY).
+      Stream agreement    30%  — fraction of streams agreeing with the signal.
+                                  4/4 = 1.0 … 0/4 = 0.0
+      Pattern backing     20%  — Job 2 empirical agreement with Job 1 signal.
+                                  strong=1.0, mild=0.70, neutral=0.50,
+                                  disagree=0.20, insufficient data=0.50 (neutral)
+
+    PRIOR = 0.55: slightly above coin-flip — streams are expected to have
+    some edge even before backtesting confirms it.
+
+    Also returns a breakdown dict for UI display and Node 13/14 explanations.
+    The 'insufficient_history' flag tells the UI to show "building track record"
+    rather than displaying the numeric score as if it reflects real accuracy.
+
+    Args:
+        stream_scores:      Dict of stream data with 'raw_score' and 'contribution'.
+        adaptive_weights:   Node 11 output dict (hit_rates, sample_counts, weights).
+        pattern_prediction: Job 2 output dict with 'agreement_with_job1'.
+        w_tech / w_sent / w_market / w_related: Normalized adaptive weights.
+
+    Returns:
+        (score, breakdown_dict)
+    """
+    PRIOR: float = 0.55
+    MIN_SAMPLES_FOR_RELIABILITY: int = 30
+
+    # --- Component 1: stream reliability ---
+    def _hit_rate(key: str) -> Tuple[float, bool]:
+        val = adaptive_weights.get(key)
+        samples = adaptive_weights.get(key.replace("hit_rate", "sample_count"), 0)
+        if val is None or int(samples or 0) < MIN_SAMPLES_FOR_RELIABILITY:
+            return PRIOR, True  # True = using prior
+        return float(val), False
+
+    tech_hr,    tech_prior    = _hit_rate("technical_hit_rate")
+    sent_hr,    sent_prior    = _hit_rate("stock_news_hit_rate")
+    market_hr,  market_prior  = _hit_rate("market_news_hit_rate")
+    related_hr, related_prior = _hit_rate("related_news_hit_rate")
+
+    reliability_score: float = (
+        tech_hr    * w_tech
+        + sent_hr    * w_sent
+        + market_hr  * w_market
+        + related_hr * w_related
+    )
+    using_prior: bool = any([tech_prior, sent_prior, market_prior, related_prior])
+
+    # --- Component 2: stream agreement ---
+    agreement_count = sum(
+        1 for data in stream_scores.values()
+        if (data["raw_score"] > 0 and data["contribution"] > 0)
+        or (data["raw_score"] < 0 and data["contribution"] < 0)
+        or (abs(data["raw_score"]) <= BUY_THRESHOLD)
+    )
+    agreement_ratio: float = agreement_count / 4.0
+
+    # --- Component 3: pattern backing ---
+    agreement_level: str = pattern_prediction.get("agreement_with_job1", "neutral")
+    pattern_map: Dict[str, float] = {
+        "strong":  1.00,
+        "mild":    0.70,
+        "neutral": 0.50,
+        "disagree": 0.20,
+    }
+    pattern_score: float = (
+        0.50  # neutral — no Job 2 data is not a penalty
+        if not pattern_prediction.get("sufficient_data")
+        else pattern_map.get(agreement_level, 0.50)
+    )
+
+    # --- Final weighted score ---
+    score = round(float(np.clip(
+        0.50 * reliability_score
+        + 0.30 * agreement_ratio
+        + 0.20 * pattern_score,
+        0.0, 1.0,
+    )), 4)
+
+    breakdown: Dict[str, Any] = {
+        "reliability_score":   round(reliability_score, 4),
+        "agreement_score":     round(agreement_ratio,   4),
+        "pattern_score":       round(pattern_score,     4),
+        "stream_hit_rates": {
+            "technical":    {"hit_rate": tech_hr,    "using_prior": tech_prior},
+            "sentiment":    {"hit_rate": sent_hr,    "using_prior": sent_prior},
+            "market":       {"hit_rate": market_hr,  "using_prior": market_prior},
+            "related_news": {"hit_rate": related_hr, "using_prior": related_prior},
+        },
+        "using_prior":          using_prior,
+        "insufficient_history": using_prior,
+    }
+
+    return score, breakdown
+
+
+# ============================================================================
 # HELPER 7: RISK SUMMARY (enhanced with full Node 9B data)
 # ============================================================================
 
@@ -1064,6 +1218,8 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }
             state["final_signal"]     = "HOLD"
             state["final_confidence"] = 0.0
+            state["signal_strength"]  = 0
+            state["trustworthiness"]  = 0.0
             state["signal_components"] = {
                 "final_score":      0.0,
                 "final_signal":     "HOLD",
@@ -1085,6 +1241,12 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "streams_missing":       streams_missing,
                 "pattern_prediction":    _empty_pattern,
                 "prediction_graph_data": {"data_source": "unavailable"},
+                "signal_strength":       0,
+                "trustworthiness":       0.0,
+                "trustworthiness_breakdown": {
+                    "insufficient_history": True,
+                    "using_prior":          True,
+                },
             }
             state.setdefault("node_execution_times", {})["node_12"] = (
                 datetime.now() - start_time
@@ -1200,6 +1362,33 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"  Job1/Job2 {agreement_level} agreement")
 
         # ==================================================================
+        # SIGNAL STRENGTH AND TRUSTWORTHINESS
+        # ==================================================================
+        signal_strength: int = _compute_signal_strength(stream_scores, signal_agreement)
+
+        trustworthiness: float
+        trustworthiness_breakdown: Dict[str, Any]
+        trustworthiness, trustworthiness_breakdown = _compute_trustworthiness(
+            stream_scores=stream_scores,
+            adaptive_weights=adaptive_weights,
+            pattern_prediction=pattern_prediction,
+            w_tech=w_tech,
+            w_sent=w_sent,
+            w_market=w_market,
+            w_related=w_related,
+        )
+
+        logger.info(
+            f"  Signal strength: {signal_strength}/100 | "
+            f"Trustworthiness: {trustworthiness:.3f}"
+            + (
+                " [using prior — insufficient history]"
+                if trustworthiness_breakdown["using_prior"]
+                else ""
+            )
+        )
+
+        # ==================================================================
         # JOB 2 — Prediction graph calibration for Node 15
         # ==================================================================
         prediction_graph_data = _build_prediction_graph_data(
@@ -1217,7 +1406,7 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         signal_components: Dict[str, Any] = {
             "final_score":           round(final_score,      6),
             "final_signal":          final_signal,
-            "final_confidence":      round(raw_confidence,   6),
+            "final_confidence":      round(trustworthiness,  6),
             "stream_scores":         stream_scores,
             "risk_summary":          _build_risk_summary(state),
             "price_targets":         _build_price_targets(state),
@@ -1226,14 +1415,19 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "streams_reliable":     int(adaptive_weights.get("streams_reliable", 0)),
                 "weights_are_fallback": bool(adaptive_weights.get("fallback_equal_weights", False)),
             },
-            "signal_agreement":      signal_agreement,
-            "streams_missing":       streams_missing,
-            "pattern_prediction":    pattern_prediction,
-            "prediction_graph_data": prediction_graph_data,
+            "signal_agreement":           signal_agreement,
+            "streams_missing":            streams_missing,
+            "pattern_prediction":         pattern_prediction,
+            "prediction_graph_data":      prediction_graph_data,
+            "signal_strength":            signal_strength,
+            "trustworthiness":            trustworthiness,
+            "trustworthiness_breakdown":  trustworthiness_breakdown,
         }
 
         state["final_signal"]      = final_signal
-        state["final_confidence"]  = round(raw_confidence, 6)
+        state["final_confidence"]  = trustworthiness
+        state["signal_strength"]   = signal_strength
+        state["trustworthiness"]   = trustworthiness
         state["signal_components"] = signal_components
 
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -1249,6 +1443,8 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         state.setdefault("errors", []).append(f"Node 12 (signal generation) failed: {e}")
         state["final_signal"]      = "HOLD"
         state["final_confidence"]  = 0.0
+        state["signal_strength"]   = 0
+        state["trustworthiness"]   = 0.0
         state["signal_components"] = None
         state.setdefault("node_execution_times", {})["node_12"] = (
             datetime.now() - start_time

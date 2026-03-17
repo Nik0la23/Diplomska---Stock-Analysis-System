@@ -395,6 +395,14 @@ def calculate_adaptive_weights(
             "sample_period_days": backtest_results.get("sample_period_days", 180),
             "per_stream_adjustments": applied_adjustments,
             "fallback_equal_weights": True,
+            "technical_hit_rate":        None,
+            "stock_news_hit_rate":        None,
+            "market_news_hit_rate":       None,
+            "related_news_hit_rate":      None,
+            "technical_sample_count":     0,
+            "stock_news_sample_count":    0,
+            "market_news_sample_count":   0,
+            "related_news_sample_count":  0,
         }
 
     # Normalize
@@ -417,8 +425,33 @@ def calculate_adaptive_weights(
         if src in ("calculated", "full_accuracy_only")
     )
 
+    # Expose per-stream hit rates and sample counts for Node 12 trustworthiness.
+    # Only streams that were actually used get a real value; neutralised streams
+    # get None / 0 so Node 12's PRIOR = 0.55 fallback triggers cleanly.
+    hit_rates: Dict[str, Any] = {}
+    sample_counts: Dict[str, int] = {}
+    for stream_key, _ in STREAM_KEYS:
+        stream_metrics = backtest_results.get(stream_key) or {}
+        weight_source  = weight_sources.get(stream_key, "neutral_no_data")
+        if weight_source in ("calculated", "full_accuracy_only"):
+            dir_acc  = stream_metrics.get("directional_accuracy")
+            full_acc = stream_metrics.get("full_accuracy", 0.5)
+            hit_rates[f"{stream_key}_hit_rate"] = float(
+                dir_acc if dir_acc is not None else full_acc
+            )
+            sample_counts[f"{stream_key}_sample_count"] = int(
+                stream_metrics.get("signal_count")
+                or stream_metrics.get("total_days_evaluated")
+                or 0
+            )
+        else:
+            hit_rates[f"{stream_key}_hit_rate"]         = None
+            sample_counts[f"{stream_key}_sample_count"] = 0
+
     return {
         **weights,
+        **hit_rates,
+        **sample_counts,
         "weighted_accuracies": {k: round(v, 6) for k, v in weighted_accuracies.items()},
         "weight_sources": weight_sources,
         "streams_reliable": streams_reliable,
@@ -468,6 +501,14 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
         'fallback_equal_weights': bool,
         'learning_adjustment_applied': float,
         'historical_correlation': float,
+        'technical_hit_rate':       float | None,  # raw directional accuracy for Node 12 trustworthiness
+        'stock_news_hit_rate':      float | None,  # None when stream was neutralised → Node 12 uses PRIOR
+        'market_news_hit_rate':     float | None,
+        'related_news_hit_rate':    float | None,
+        'technical_sample_count':   int,           # number of evaluated signals; < 30 → Node 12 uses PRIOR
+        'stock_news_sample_count':  int,
+        'market_news_sample_count': int,
+        'related_news_sample_count': int,
     }
 
     Runs AFTER: Node 10 (backtesting)
@@ -499,6 +540,14 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "fallback_equal_weights": True,
                 "learning_adjustment_applied": DEFAULT_LEARNING_ADJUSTMENT,
                 "historical_correlation": 0.5,
+                "technical_hit_rate":        None,
+                "stock_news_hit_rate":        None,
+                "market_news_hit_rate":       None,
+                "related_news_hit_rate":      None,
+                "technical_sample_count":     0,
+                "stock_news_sample_count":    0,
+                "market_news_sample_count":   0,
+                "related_news_sample_count":  0,
             }
             state.setdefault("node_execution_times", {})["node_11"] = (
                 datetime.now() - start_time
@@ -582,6 +631,14 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "fallback_equal_weights": True,
             "learning_adjustment_applied": DEFAULT_LEARNING_ADJUSTMENT,
             "historical_correlation": 0.5,
+            "technical_hit_rate":        None,
+            "stock_news_hit_rate":        None,
+            "market_news_hit_rate":       None,
+            "related_news_hit_rate":      None,
+            "technical_sample_count":     0,
+            "stock_news_sample_count":    0,
+            "market_news_sample_count":   0,
+            "related_news_sample_count":  0,
         }
         state.setdefault("node_execution_times", {})["node_11"] = (
             datetime.now() - start_time

@@ -67,8 +67,8 @@ def calculate_historical_statistics(
         # Get last N days of data
         recent_data = price_data.tail(days).copy()
         
-        # Calculate daily returns (percentage change)
-        returns = recent_data['close'].pct_change().dropna()
+        # Calculate daily log returns (required for GBM drift/volatility estimation)
+        returns = np.log(recent_data['close'] / recent_data['close'].shift(1)).dropna()
         
         if len(returns) == 0:
             logger.warning("No returns calculated, using defaults")
@@ -111,7 +111,8 @@ def simulate_gbm_path(
     drift: float,
     volatility: float,
     days: int,
-    dt: float = 1/252
+    dt: float = 1.0,
+    rng=None,
 ) -> np.ndarray:
     """
     Simulate a single price path using Geometric Brownian Motion.
@@ -150,7 +151,8 @@ def simulate_gbm_path(
         prices[0] = current_price
         
         # Generate all random shocks at once (more efficient)
-        Z = np.random.standard_normal(days)
+        _rng = rng if rng is not None else np.random.default_rng()
+        Z = _rng.standard_normal(days)
         
         # Calculate drift and diffusion components
         drift_component = (drift - 0.5 * volatility**2) * dt
@@ -177,7 +179,8 @@ def run_monte_carlo_simulations(
     drift: float,
     volatility: float,
     forecast_days: int = 7,
-    num_simulations: int = 1000
+    num_simulations: int = 1000,
+    seed: int = 42,
 ) -> np.ndarray:
     """
     Run multiple Monte Carlo simulations.
@@ -212,13 +215,15 @@ def run_monte_carlo_simulations(
     """
     try:
         logger.info(f"Running {num_simulations} Monte Carlo simulations...")
-        
+
+        rng = np.random.default_rng(seed)
+
         # Initialize simulations array
         simulations = np.zeros((num_simulations, forecast_days + 1))
-        
+
         # Run simulations
         for i in range(num_simulations):
-            path = simulate_gbm_path(current_price, drift, volatility, forecast_days)
+            path = simulate_gbm_path(current_price, drift, volatility, forecast_days, rng=rng)
             simulations[i, :] = path
             
             # Optional: Show progress for large simulations
@@ -285,7 +290,7 @@ def calculate_forecast_statistics(
         # Calculate basic statistics
         mean_forecast = float(final_prices.mean())
         median_forecast = float(np.median(final_prices))
-        std_dev = float(final_prices.std())
+        std_dev = float(final_prices.std(ddof=0))
         
         # Calculate confidence intervals
         # 68% confidence (±1 standard deviation)
@@ -516,8 +521,10 @@ def calculate_regime_adjusted_volatility(
        floor_vol = base_volatility * regime_scalar * beta_scalar * 1.20
        adjusted  = max(adjusted, floor_vol)
 
-    # Hard clamps: never below 50% or above 300% of base
-    adjusted = float(np.clip(adjusted, base_volatility * 0.5, base_volatility * 3.0))
+    # Lower clamp: VIX=8 (extreme calm) → scalar≈0.63, so 0.60 is the
+    # tightest realistic floor. Upper clamp: VIX=60 crisis → scalar≈1.73,
+    # but beta and regime floor can push higher; 3.0× caps tail extremes.
+    adjusted = float(np.clip(adjusted, base_volatility * 0.60, base_volatility * 3.0))
 
     return adjusted
 
@@ -614,12 +621,14 @@ def monte_carlo_forecasting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # STEP 3: Run Monte Carlo Simulations
         # ====================================================================
         logger.info(f"Running {NUM_SIMULATIONS} Monte Carlo simulations for {FORECAST_DAYS} days...")
+        seed = state.get("monte_carlo_seed", 42)
         simulations = run_monte_carlo_simulations(
             current_price=current_price,
             drift=drift,
             volatility=volatility,
             forecast_days=FORECAST_DAYS,
-            num_simulations=NUM_SIMULATIONS
+            num_simulations=NUM_SIMULATIONS,
+            seed=seed,
         )
         
         # ====================================================================
