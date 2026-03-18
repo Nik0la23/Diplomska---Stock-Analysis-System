@@ -35,7 +35,7 @@ logger = get_node_logger("node_13")
 # ============================================================================
 
 CLAUDE_MODEL: str = "claude-sonnet-4-5"
-MAX_TOKENS: int = 700   # ~400 words with headroom
+MAX_TOKENS: int = 900   # ~500 words with headroom
 
 # Score thresholds for translating raw_score to plain English
 STRONG_POSITIVE: float = 0.4
@@ -65,7 +65,11 @@ verbatim in the provided article titles.
 Do not estimate or infer missing values.
 - Write in plain English. Avoid financial jargon. If you must use a term like RSI, \
 explain it in one sentence immediately after.
-- Keep the response between 250 and 400 words.
+- Keep the response between 350 and 500 words.
+- Signal Strength tells the reader how loudly the indicators are agreeing — explain \
+it as a simple score out of 100. Trustworthiness tells the reader how often this \
+type of signal has been right historically — explain it as a percentage if available, \
+or note that the system is still building its track record if marked insufficient.
 - Use the exact 7-section structure provided. Do not add sections or change their order.
 - Do not give specific investment advice beyond what the signal says.
 - Always end with the disclaimer exactly as provided — word for word."""
@@ -156,12 +160,16 @@ def _build_user_prompt(
 
     final_signal:      str   = sc.get("final_signal", "HOLD")
     final_confidence:  float = float(sc.get("final_confidence") or 0.0)
+    signal_strength:   int   = int(sc.get("signal_strength") or 0)
+    trustworthiness:   float = float(sc.get("trustworthiness") or 0.0)
+    tw_breakdown: Dict        = sc.get("trustworthiness_breakdown") or {}
+    insufficient_history: bool = tw_breakdown.get("insufficient_history", True)
     signal_agreement:  int   = int(sc.get("signal_agreement") or 0)
     streams_missing:   List  = sc.get("streams_missing") or []
 
     # --- STREAM DIRECTIONS ---
     stream_lines: List[str] = []
-    for stream in ("technical", "sentiment", "market", "monte_carlo"):
+    for stream in ("technical", "sentiment", "market", "related_news"):
         data = ss.get(stream) or {}
         raw  = float(data.get("raw_score") or 0.0)
         wt   = float(data.get("weight") or 0.25)
@@ -261,7 +269,7 @@ def _build_user_prompt(
     return f"""Generate a beginner explanation for the following stock analysis.
 Follow the 7-section structure exactly in this order:
 1. Headline
-2. Signal Strength Context
+2. How Strong and Reliable is This Signal
 3. What's Driving This
 4. Historical Pattern (skip entirely if marked insufficient)
 5. Price Expectation (skip if unavailable)
@@ -273,6 +281,8 @@ TICKER: {ticker}
 SIGNAL:
 - Recommendation: {final_signal}
 - Confidence: {final_confidence:.0%}
+- Signal strength: {signal_strength}/100 (how loud and united the indicators are)
+- Trustworthiness: {"building track record — not enough history yet" if insufficient_history else f"{trustworthiness:.0%} (based on historical stream accuracy)"}
 - Number of indicators agreeing: {signal_agreement} out of 4{missing_note}{weights_note}
 
 STREAM DIRECTIONS (translate these to plain English in section 3):
@@ -403,7 +413,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
-            temperature=0.3,   # low temperature → consistent, factual output
+            temperature=0.55,
         )
         llm_elapsed = (datetime.now() - llm_start).total_seconds()
 

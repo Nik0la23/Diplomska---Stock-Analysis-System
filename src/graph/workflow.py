@@ -3,20 +3,22 @@ LangGraph Workflow Builder
 
 Defines the complete stock analysis workflow with all nodes and edges.
 
-Current Flow (Nodes 1-11):
-1. Node 1: Price Data Fetching
-2. Node 3: Related Companies Detection
-3. Node 2: Multi-Source News Fetching
-4. Node 9A: Content Analysis & Feature Extraction
-5. PARALLEL: Nodes 4, 5, 6 (Technical, Sentiment, Market Context)
-6. Node 7: Monte Carlo (sequential, after parallel join — needs Node 6 market_context)
-7. Node 8: News Verification & Learning (thesis innovation)
-7. Node 9B: Behavioral Anomaly Detection
-8. Node 10: Backtesting (raw accuracy metrics)
-9. Node 11: Adaptive Weights Calculation
-
-Future additions:
-- Nodes 12-15: Signal generation, explanations, dashboard
+Current Flow (Nodes 1-15):
+ 1. Node 1:  Price Data Fetching
+ 2. Node 3:  Related Companies Detection
+ 3. Node 2:  Multi-Source News Fetching
+ 4. Node 9A: Content Analysis & Feature Extraction
+ 5. PARALLEL: Nodes 4, 5, 6 (Technical, Sentiment, Market Context)
+    └─ fan-in via parallel_join barrier
+ 6. Node 7:  Monte Carlo (sequential, after parallel join — needs Node 6 market_context)
+ 7. Node 8:  News Verification & Learning (thesis innovation)
+ 8. Node 9B: Behavioral Anomaly Detection
+ 9. Node 10: Backtesting (raw accuracy metrics)
+10. Node 11: Adaptive Weights Calculation
+11. Node 12: Final Signal Generation
+12. Node 13: Beginner Explanation (LLM)
+13. Node 14: Technical Explanation (LLM)
+14. Node 15: Dashboard Data Preparation
 """
 
 from langgraph.graph import StateGraph, END
@@ -77,6 +79,11 @@ def should_continue_after_parallel(state: StockAnalysisState) -> Literal["contin
             return "end"
     logger.info("Parallel nodes complete, routing to background outcomes then Node 8")
     return "continue"
+
+
+def parallel_join_node(state: StockAnalysisState) -> StockAnalysisState:
+    """No-op fan-in barrier: waits for all three parallel branches before proceeding."""
+    return state
 
 
 def run_background_outcomes_node(state: StockAnalysisState) -> StockAnalysisState:
@@ -172,6 +179,9 @@ def create_stock_analysis_workflow() -> StateGraph:
     # Phase 2b: Monte Carlo (sequential after parallel join — needs Node 6 market_context)
     workflow.add_node("monte_carlo", monte_carlo_forecasting_node)
     
+    # Phase 2c: Fan-in barrier — all three parallel branches must arrive here first
+    workflow.add_node("parallel_join", parallel_join_node)
+
     # Phase 3: Background outcomes (before Node 8) then Learning + 9B
     workflow.add_node("run_background_outcomes", run_background_outcomes_node)
     workflow.add_node("news_verification", news_verification_node)
@@ -221,22 +231,23 @@ def create_stock_analysis_workflow() -> StateGraph:
     # CONVERGENCE: parallel → background outcomes → Node 7 → Node 8
     # ========================================================================
 
-    # 3 parallel nodes converge to background-outcomes node, then Node 7
+    # 3 parallel nodes converge to the fan-in barrier, then background-outcomes, then Node 7
     workflow.add_conditional_edges(
         "technical_analysis",
         should_continue_after_parallel,
-        {"continue": "run_background_outcomes", "end": END}
+        {"continue": "parallel_join", "end": END}
     )
     workflow.add_conditional_edges(
         "sentiment_analysis",
         should_continue_after_parallel,
-        {"continue": "run_background_outcomes", "end": END}
+        {"continue": "parallel_join", "end": END}
     )
     workflow.add_conditional_edges(
         "market_context",
         should_continue_after_parallel,
-        {"continue": "run_background_outcomes", "end": END}
+        {"continue": "parallel_join", "end": END}
     )
+    workflow.add_edge("parallel_join", "run_background_outcomes")
 
     # Background outcomes runs first (fills news_outcomes when needed),
     # then Node 7 (Monte Carlo — needs Node 6 market_context for VIX scaling),

@@ -42,7 +42,7 @@ logger = get_node_logger("node_14")
 # ============================================================================
 
 CLAUDE_MODEL: str = "claude-sonnet-4-5"
-MAX_TOKENS: int = 2000  # ~900 words with headroom
+MAX_TOKENS: int = 2800  # ~1200 words with headroom
 
 
 def _fmt(value: Any, fmt: str = "+.4f", fallback: str = "N/A") -> str:
@@ -66,16 +66,19 @@ Rules you must follow:
 - Use ONLY the data provided in the user message. Do not supplement with any external \
 knowledge about the company, sector, or market from your training data.
 - Report exact numbers as given. Do not round unless the number is already rounded.
-- If a data field is None or marked UNAVAILABLE, explicitly note the gap in the \
-relevant section — do not skip silently and do not invent values.
-- When Job 1 and Job 2 disagree (agreement_with_job1 = "disagree"), this MUST be \
-the most prominent finding in the report — lead the Executive Summary with it.
-- If weights_are_fallback is True, state this explicitly in the Adaptive Weighting \
-section and note it limits interpretation of stream contributions.
-- Keep the response between 600 and 900 words.
-- Use markdown headers (##) for each section. Follow the section order provided exactly.
-- Do not add conclusions or recommendations beyond what the signal data states.
-- Do not add sections not listed in the prompt."""
+- If a data field is None or marked UNAVAILABLE, explicitly note the gap — do not skip \
+silently and do not invent values.
+- When Job 1 and Job 2 disagree (agreement_with_job1 = "disagree"), lead the Executive \
+Summary with this finding prominently.
+- When insufficient_history is True, note in the Signal Quality section that \
+trustworthiness reflects a statistical prior (0.55), not measured accuracy.
+- When insufficient_history is False, interpret trustworthiness as a backtested hit rate \
+and note which streams are driving it up or down based on stream_hit_rates.
+- Keep the response between 900 and 1200 words.
+- Use markdown headers (##) for each section. Follow the 7-section order exactly.
+- Synthesise — do not just list data points. A sophisticated reader wants your \
+interpretation of what the combination of signals means, not a table of values.
+- Do not add sections not listed below."""
 
 
 # ============================================================================
@@ -135,7 +138,7 @@ def _build_user_prompt(
     # STREAM SCORES TABLE
     # -------------------------------------------------------------------------
     stream_rows: List[str] = []
-    for stream in ("technical", "sentiment", "market", "monte_carlo"):
+    for stream in ("technical", "sentiment", "market", "related_news"):
         d = ss.get(stream) or {}
         stream_rows.append(
             f"  {stream:<12} | raw={d.get('raw_score')}  "
@@ -311,7 +314,9 @@ def _build_user_prompt(
             f"  empirical_expected_return: {pg.get('empirical_expected_return')}\n"
             f"  gbm_spread: {_fmt(blend_lower)}% to {_fmt(blend_upper)}%\n"
             f"  empirical_spread: {pg.get('empirical_lower')} to {pg.get('empirical_upper')}\n"
-            f"  formula (blended): 60% empirical + 40% GBM"
+            f"  blend_formula: {pg.get('job2_blend_weight', 0):.0%} empirical + "
+            f"{pg.get('gbm_blend_weight', 1.0):.0%} GBM "
+            f"({int(pg.get('similar_days_used', 0))} similar days → dynamic weight)"
         )
     else:
         blend_block = "UNAVAILABLE"
@@ -348,21 +353,27 @@ def _build_user_prompt(
         ca_block = "UNAVAILABLE"
 
     # -------------------------------------------------------------------------
+    # SIGNAL QUALITY METRICS BLOCK
+    # -------------------------------------------------------------------------
+    tw: Dict = sc.get("trustworthiness_breakdown") or {}
+    hit_rates_block = "\n".join([
+        f"  {stream}: hit_rate={tw.get('stream_hit_rates', {}).get(stream, {}).get('hit_rate')} "
+        f"using_prior={tw.get('stream_hit_rates', {}).get(stream, {}).get('using_prior')}"
+        for stream in ("technical", "sentiment", "market", "related_news")
+    ])
+
+    # -------------------------------------------------------------------------
     # ASSEMBLE
     # -------------------------------------------------------------------------
     return f"""Generate a technical research report for the following stock analysis.
 Use markdown (##) headers. Follow this section order exactly — do not skip, merge, or add sections:
-1. Executive Summary
-2. Signal Decomposition
-3. Technical Analysis
-4. Sentiment Analysis
-5. Market Context
-6. Monte Carlo / Probabilistic Forecast
-7. Historical Pattern Matching (Job 2)
-8. Adaptive Weighting (Node 11)
-9. Anomaly Detection
-10. Risk Quantification
-11. Methodology Notes
+1. Executive Summary (signal, key conviction drivers, any Job1/Job2 disagreement)
+2. Signal Decomposition & Quality (stream scores, signal_strength, trustworthiness, hit rates)
+3. Technical & Quantitative Analysis (technical indicators, Monte Carlo, price targets, blending)
+4. Sentiment & News Analysis (all three streams, credibility, Node 8 learning adjustment)
+5. Market Context & Risk (sector, correlation, VIX, beta)
+6. Anomaly Detection (Node 9A content, Node 9B behavioral, pump score, trading_safe)
+7. Methodology Notes (weights, fallback flags, data gaps, caveats)
 
 TICKER: {ticker}
 
@@ -387,6 +398,16 @@ TICKER: {ticker}
   hold_threshold_pct: {aw.get('hold_threshold_pct')}
   streams_reliable: {aw.get('streams_reliable')}
   weights_are_fallback: {bc.get('weights_are_fallback')}
+
+--- SIGNAL QUALITY METRICS ---
+  signal_strength: {sc.get('signal_strength')}/100
+  trustworthiness: {sc.get('trustworthiness')}
+  insufficient_history: {tw.get('insufficient_history')}
+  reliability_score: {tw.get('reliability_score')}
+  agreement_score: {tw.get('agreement_score')}
+  pattern_score: {tw.get('pattern_score')}
+  stream_hit_rates:
+{hit_rates_block}
 
 --- SENTIMENT BREAKDOWN (Node 5) ---
 {sb_block}
@@ -557,7 +578,7 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
-            temperature=0.2,   # very low → consistent, factual, precise
+            temperature=0.35,
         )
         llm_elapsed = (datetime.now() - llm_start).total_seconds()
 
