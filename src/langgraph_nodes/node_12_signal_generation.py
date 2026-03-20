@@ -71,6 +71,10 @@ BUY_THRESHOLD: float = 0.15
 SELL_THRESHOLD: float = -0.15
 EQUAL_WEIGHT: float = 0.25
 
+# Minimum weight floor so no stream is ever fully silenced.
+# Anti-predictive streams (weight_source == "neutral_anti_predictive") are exempt.
+MIN_STREAM_WEIGHT: float = 0.05
+
 # Maps signal strings to directional signs on [-1, +1]
 SIGNAL_TO_SCORE: Dict[str, float] = {
     "BUY":  1.0,
@@ -351,21 +355,24 @@ def _score_related_sentiment(state: Dict[str, Any]) -> Tuple[float, bool]:
 # HELPER 5: SIGNAL CLASSIFICATION
 # ============================================================================
 
-def _classify_signal(final_score: float) -> str:
+def _classify_signal(final_score: float, threshold: float = BUY_THRESHOLD) -> str:
     """
     Convert a weighted final score to a BUY/SELL/HOLD label.
 
-    Thresholds: > +0.15 → BUY | < -0.15 → SELL | else → HOLD
+    The threshold is symmetric: > +threshold → BUY | < -threshold → SELL | else HOLD.
+    Node 11 may supply a learnt threshold via adaptive_weights["signal_threshold"];
+    if absent the module-level BUY_THRESHOLD (0.15) is used as the default.
 
     Args:
-        final_score: Weighted sum of stream scores.
+        final_score: Weighted sum of stream scores on [-1, +1].
+        threshold:   Classification boundary; defaults to BUY_THRESHOLD (0.15).
 
     Returns:
         'BUY', 'SELL', or 'HOLD'.
     """
-    if final_score > BUY_THRESHOLD:
+    if final_score > threshold:
         return "BUY"
-    if final_score < SELL_THRESHOLD:
+    if final_score < -threshold:
         return "SELL"
     return "HOLD"
 
@@ -493,10 +500,13 @@ def _compute_trustworthiness(
     # --- Component 1: stream reliability ---
     def _hit_rate(key: str) -> Tuple[float, bool]:
         val = adaptive_weights.get(key)
-        samples = adaptive_weights.get(key.replace("hit_rate", "sample_count"), 0)
-        if val is None or int(samples or 0) < MIN_SAMPLES_FOR_RELIABILITY:
-            return PRIOR, True  # True = using prior
-        return float(val), False
+        n = int(adaptive_weights.get(key.replace("hit_rate", "sample_count"), 0) or 0)
+        if val is None:
+            return PRIOR, True
+        # Bayesian blend — same formula as Node 11: pull toward PRIOR when n is small
+        blended = (float(val) * n + PRIOR * 10) / (n + 10)
+        using_prior = n < MIN_SAMPLES_FOR_RELIABILITY
+        return round(blended, 4), using_prior
 
     tech_hr,    tech_prior    = _hit_rate("technical_hit_rate")
     sent_hr,    sent_prior    = _hit_rate("stock_news_hit_rate")
@@ -1164,11 +1174,19 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         # Read all 4 backtested stream weights from Node 11.
         # Monte Carlo is NOT backtested — it has no earned weight slot.
-        # Normalize the 4 real streams to sum to 1.0.
-        w_tech_raw:    float = float(adaptive_weights.get("technical_weight",    EQUAL_WEIGHT))
-        w_sent_raw:    float = float(adaptive_weights.get("stock_news_weight",   EQUAL_WEIGHT))
-        w_market_raw:  float = float(adaptive_weights.get("market_news_weight",  EQUAL_WEIGHT))
-        w_related_raw: float = float(adaptive_weights.get("related_news_weight", EQUAL_WEIGHT))
+        # Apply MIN_STREAM_WEIGHT floor before normalising — except for
+        # anti-predictive streams that earned their 0.0 through backtesting.
+        _weight_sources = adaptive_weights.get("weight_sources") or {}
+
+        def _floored(raw: float, stream_key: str) -> float:
+            if _weight_sources.get(stream_key) == "neutral_anti_predictive":
+                return raw  # earned its 0.0 — do not restore
+            return max(raw, MIN_STREAM_WEIGHT)
+
+        w_tech_raw    = _floored(float(adaptive_weights.get("technical_weight",    EQUAL_WEIGHT)), "technical")
+        w_sent_raw    = _floored(float(adaptive_weights.get("stock_news_weight",   EQUAL_WEIGHT)), "stock_news")
+        w_market_raw  = _floored(float(adaptive_weights.get("market_news_weight",  EQUAL_WEIGHT)), "market_news")
+        w_related_raw = _floored(float(adaptive_weights.get("related_news_weight", EQUAL_WEIGHT)), "related_news")
 
         _w_total = w_tech_raw + w_sent_raw + w_market_raw + w_related_raw
         if _w_total > 0:
@@ -1179,8 +1197,14 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         else:
             w_tech = w_sent = w_market = w_related = EQUAL_WEIGHT
 
+        # Learnt threshold from Node 11's threshold optimisation; falls back
+        # to the module-level BUY_THRESHOLD (0.15) when not present.
+        signal_threshold: float = float(
+            adaptive_weights.get("signal_threshold", BUY_THRESHOLD)
+        )
+
         logger.info(
-            f"  Weights (4-stream, MC excluded from signal) — "
+            f"  Weights (4-stream, MC excluded from signal, threshold=±{signal_threshold}) — "
             f"tech={w_tech:.3f}, sent={w_sent:.3f}, "
             f"market={w_market:.3f}, related={w_related:.3f}"
         )
@@ -1262,7 +1286,7 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         related_contrib = related_score * w_related
 
         final_score: float = tech_contrib + sent_contrib + mkt_contrib + related_contrib
-        final_signal: str     = _classify_signal(final_score)
+        final_signal: str     = _classify_signal(final_score, threshold=signal_threshold)
         raw_confidence: float = min(1.0, abs(final_score))
 
         logger.info(
@@ -1293,6 +1317,13 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"  Agreement: {signal_agreement}/4 streams, "
             f"missing: {streams_missing or 'none'}"
         )
+
+        dominant_sign = np.sign(final_score) if final_score != 0 else 0.0
+        agreeing = sum(1 for s in [tech_score, sent_score, mkt_score, related_score]
+                       if np.sign(s) == dominant_sign and s != 0)
+        stream_agreement_score = round(agreeing / 4.0, 4)
+        stream_confidence = round(stream_agreement_score * abs(final_score), 4)
+        active_streams = sum(1 for w in [w_tech, w_sent, w_market, w_related] if w > 0.05)
 
         # ==================================================================
         # JOB 2 — Build historical snapshots from Node 10 daily_results
@@ -1352,6 +1383,13 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         agreement_level = _check_job_agreement(final_signal, pattern_prediction)
         pattern_prediction["agreement_with_job1"] = agreement_level
 
+        JOB2_MULTIPLIER = {
+            "strong":   1.00,
+            "mild":     1.00,
+            "neutral":  0.95,
+            "disagree": 0.80,
+        }
+
         if agreement_level == "disagree":
             logger.warning(
                 f"  Job1/Job2 disagree: {final_signal} vs "
@@ -1377,6 +1415,12 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             w_market=w_market,
             w_related=w_related,
         )
+
+        # Apply Job 2 disagreement penalty to trustworthiness
+        if pattern_prediction.get("sufficient_data"):
+            j2_mult = JOB2_MULTIPLIER.get(agreement_level, 1.0)
+            trustworthiness = round(float(np.clip(trustworthiness * j2_mult, 0.0, 1.0)), 4)
+            trustworthiness_breakdown["job2_multiplier_applied"] = j2_mult
 
         logger.info(
             f"  Signal strength: {signal_strength}/100 | "
@@ -1407,6 +1451,9 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "final_score":           round(final_score,      6),
             "final_signal":          final_signal,
             "final_confidence":      round(trustworthiness,  6),
+            "stream_agreement_score": stream_agreement_score,
+            "stream_confidence":      stream_confidence,
+            "active_streams":         active_streams,
             "stream_scores":         stream_scores,
             "risk_summary":          _build_risk_summary(state),
             "price_targets":         _build_price_targets(state),

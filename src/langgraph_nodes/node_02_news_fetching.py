@@ -504,6 +504,32 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"({newly_fetched_stock_count} stock + {newly_fetched_market_count} market "
             f"+ {newly_fetched_related_count} related)"
         )
+
+        # ====================================================================
+        # AV DOWN FALLBACK: if all three AV calls returned nothing, load
+        # whatever is cached in DB (may be stale) so downstream nodes have
+        # something to work with instead of producing a zero-data HOLD signal.
+        # ====================================================================
+        _av_down_fallback = False
+        if newly_fetched_total == 0:
+            _db_stock   = get_news_for_ticker(ticker, "stock",   days=NEWS_LOOKBACK_DAYS)
+            _db_market  = get_news_for_ticker(ticker, "market",  days=NEWS_LOOKBACK_DAYS)
+            _db_related = get_news_for_ticker(ticker, "related", days=NEWS_LOOKBACK_DAYS)
+            if _db_stock or _db_market or _db_related:
+                stock_news            = _db_stock
+                market_news           = _db_market
+                related_company_news  = _db_related
+                _av_down_fallback     = True
+                logger.warning(
+                    f"Node 2: AV returned 0 articles — using stale DB data as fallback "
+                    f"(stock:{len(stock_news)}, market:{len(market_news)}, "
+                    f"related:{len(related_company_news)})"
+                )
+            else:
+                logger.warning(
+                    "Node 2: AV returned 0 articles AND no DB fallback available — "
+                    "downstream nodes will run with empty news"
+                )
         
         # ====================================================================
         # Filter by Date Range
@@ -590,6 +616,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "newly_fetched_market": newly_fetched_market_count,
             "newly_fetched_related": newly_fetched_related_count,
             "was_incremental_fetch": latest_news_date is not None,
+            "was_av_down_fallback": _av_down_fallback,
             "daily_article_avg": daily_avg,
         }
 

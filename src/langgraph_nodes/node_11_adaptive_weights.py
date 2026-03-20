@@ -97,6 +97,14 @@ STREAM_KEYS: list = [
     ("related_news", "related_news_weight"),
 ]
 
+# Signal threshold optimisation — learn the ±t that maximises directional
+# accuracy on historical data instead of using the hardcoded ±0.15 default.
+THRESHOLD_CANDIDATES: list = [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]
+THRESHOLD_HOLDOUT_DAYS: int = 30       # last 30 days held out for validation
+MIN_DAYS_FOR_THRESHOLD_OPT: int = 20   # skip if train set is too thin
+THRESHOLD_MIN_TEST_ACCURACY: float = 0.45  # fallback if test set underperforms
+DEFAULT_SIGNAL_THRESHOLD: float = 0.15     # safe fallback
+
 
 # ============================================================================
 # HELPER 1: BAYESIAN ACCURACY SMOOTHING
@@ -319,7 +327,162 @@ def _compute_per_stream_adjustments(
 
 
 # ============================================================================
-# HELPER 4: FULL WEIGHT CALCULATION
+# HELPER 4: SIGNAL THRESHOLD OPTIMISATION
+# ============================================================================
+
+def _optimize_signal_threshold(
+    backtest_results: Dict[str, Any],
+    weights: Dict[str, Any],
+) -> float:
+    """
+    Find the combined-score classification threshold that maximises directional
+    accuracy, validated on a held-out recent window to prevent in-sample bias.
+
+    Algorithm:
+    1. Reconstruct weighted combined_score for every historical day using the
+       just-computed adaptive weights.
+    2. Split: train = days_ago > THRESHOLD_HOLDOUT_DAYS, test = rest.
+    3. For each candidate threshold, measure directional accuracy on TRAIN.
+    4. Pick the best threshold, then confirm it on TEST.
+       If test accuracy < THRESHOLD_MIN_TEST_ACCURACY, fall back to default.
+    5. Return DEFAULT_SIGNAL_THRESHOLD when data is too thin.
+
+    Args:
+        backtest_results: Node 10 output dict.
+        weights:          Adaptive weights just computed by calculate_adaptive_weights().
+
+    Returns:
+        Best validated threshold from THRESHOLD_CANDIDATES, or DEFAULT_SIGNAL_THRESHOLD.
+    """
+    w_tech    = float(weights.get("technical_weight",    EQUAL_WEIGHT))
+    w_sent    = float(weights.get("stock_news_weight",   EQUAL_WEIGHT))
+    w_market  = float(weights.get("market_news_weight",  EQUAL_WEIGHT))
+    w_related = float(weights.get("related_news_weight", EQUAL_WEIGHT))
+
+    # --- helpers to extract scores from Node 10 daily_results records ---
+    def _tech_score(r: Dict[str, Any]) -> float:
+        sig  = r.get("signal", "HOLD") or "HOLD"
+        conf = float(r.get("confidence") or 0.0)
+        return conf if sig == "BUY" else (-conf if sig == "SELL" else 0.0)
+
+    def _sent_score(r: Dict[str, Any]) -> float:
+        return float(r.get("sentiment_score") or 0.0)
+
+    # --- build per-date lookups ---
+    tech_daily    = (backtest_results.get("technical")    or {}).get("daily_results") or []
+    stock_daily   = (backtest_results.get("stock_news")   or {}).get("daily_results") or []
+    market_daily  = (backtest_results.get("market_news")  or {}).get("daily_results") or []
+    related_daily = (backtest_results.get("related_news") or {}).get("daily_results") or []
+
+    tech_by_date    = {r["date"]: r for r in tech_daily    if "date" in r}
+    stock_by_date   = {r["date"]: r for r in stock_daily   if "date" in r}
+    market_by_date  = {r["date"]: r for r in market_daily  if "date" in r}
+    related_by_date = {r["date"]: r for r in related_daily if "date" in r}
+
+    all_dates = (
+        set(tech_by_date)
+        | set(stock_by_date)
+        | set(market_by_date)
+        | set(related_by_date)
+    )
+
+    # --- reconstruct combined score + actual change for every date ---
+    combined_data: List[Dict[str, Any]] = []
+    for date in all_dates:
+        tech_r    = tech_by_date.get(date)
+        stock_r   = stock_by_date.get(date)
+        market_r  = market_by_date.get(date)
+        related_r = related_by_date.get(date)
+
+        anchor = tech_r or stock_r or market_r or related_r
+        if anchor is None or anchor.get("actual_change_7d") is None:
+            continue
+
+        score = (
+            (_tech_score(tech_r)    if tech_r    else 0.0) * w_tech
+          + (_sent_score(stock_r)   if stock_r   else 0.0) * w_sent
+          + (_sent_score(market_r)  if market_r  else 0.0) * w_market
+          + (_sent_score(related_r) if related_r else 0.0) * w_related
+        )
+        combined_data.append({
+            "score":    score,
+            "change":   float(anchor["actual_change_7d"]),
+            "days_ago": int(anchor.get("days_ago", 999)),
+        })
+
+    # --- split train / test ---
+    train = [d for d in combined_data if d["days_ago"] > THRESHOLD_HOLDOUT_DAYS]
+    test  = [d for d in combined_data if d["days_ago"] <= THRESHOLD_HOLDOUT_DAYS]
+
+    if len(train) < MIN_DAYS_FOR_THRESHOLD_OPT:
+        logger.info(
+            f"  Threshold optimisation: only {len(train)} train days "
+            f"(< {MIN_DAYS_FOR_THRESHOLD_OPT}) — using default {DEFAULT_SIGNAL_THRESHOLD}"
+        )
+        return DEFAULT_SIGNAL_THRESHOLD
+
+    # --- find best threshold on train set ---
+    best_threshold = DEFAULT_SIGNAL_THRESHOLD
+    best_train_acc = 0.0
+    best_n         = 0
+
+    for t in THRESHOLD_CANDIDATES:
+        directional = [d for d in train if abs(d["score"]) > t]
+        if not directional:
+            continue
+        correct = sum(
+            1 for d in directional
+            if (d["score"] > 0 and d["change"] > 0)
+            or (d["score"] < 0 and d["change"] < 0)
+        )
+        acc = correct / len(directional)
+        # prefer higher accuracy; tie-break toward lower threshold (more signals)
+        if acc > best_train_acc or (acc == best_train_acc and len(directional) > best_n):
+            best_threshold = t
+            best_train_acc = acc
+            best_n         = len(directional)
+
+    # --- validate on test set ---
+    if test:
+        test_dir = [d for d in test if abs(d["score"]) > best_threshold]
+        if test_dir:
+            test_correct = sum(
+                1 for d in test_dir
+                if (d["score"] > 0 and d["change"] > 0)
+                or (d["score"] < 0 and d["change"] < 0)
+            )
+            test_acc = test_correct / len(test_dir)
+
+            if test_acc < THRESHOLD_MIN_TEST_ACCURACY:
+                logger.warning(
+                    f"  Threshold optimisation: best_threshold={best_threshold} "
+                    f"failed validation (test_acc={test_acc:.1%} < "
+                    f"{THRESHOLD_MIN_TEST_ACCURACY:.0%}) — falling back to "
+                    f"{DEFAULT_SIGNAL_THRESHOLD}"
+                )
+                return DEFAULT_SIGNAL_THRESHOLD
+
+            logger.info(
+                f"  Threshold optimisation: best_threshold=±{best_threshold} "
+                f"train_acc={best_train_acc:.1%} (n={best_n}) "
+                f"test_acc={test_acc:.1%} (n={len(test_dir)}) ✓"
+            )
+        else:
+            logger.info(
+                f"  Threshold optimisation: no test signals at threshold={best_threshold} "
+                f"— accepting train result"
+            )
+    else:
+        logger.info(
+            f"  Threshold optimisation: no test data — accepting train result "
+            f"threshold=±{best_threshold} train_acc={best_train_acc:.1%}"
+        )
+
+    return best_threshold
+
+
+# ============================================================================
+# HELPER 5: FULL WEIGHT CALCULATION
 # ============================================================================
 
 def calculate_adaptive_weights(
@@ -403,6 +566,7 @@ def calculate_adaptive_weights(
             "stock_news_sample_count":    0,
             "market_news_sample_count":   0,
             "related_news_sample_count":  0,
+            "signal_threshold":           DEFAULT_SIGNAL_THRESHOLD,
         }
 
     # Normalize
@@ -548,6 +712,7 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "stock_news_sample_count":    0,
                 "market_news_sample_count":   0,
                 "related_news_sample_count":  0,
+                "signal_threshold":           DEFAULT_SIGNAL_THRESHOLD,
             }
             state.setdefault("node_execution_times", {})["node_11"] = (
                 datetime.now() - start_time
@@ -593,6 +758,12 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
         adaptive_weights["learning_adjustment_applied"] = round(learning_adjustment, 4)
         adaptive_weights["historical_correlation"] = round(historical_correlation, 4)
 
+        # Learn the optimal signal classification threshold from backtested data.
+        # Uses train/test split to prevent in-sample bias.
+        logger.info("Optimising signal classification threshold:")
+        signal_threshold = _optimize_signal_threshold(backtest_results, adaptive_weights)
+        adaptive_weights["signal_threshold"] = signal_threshold
+
         state["adaptive_weights"] = adaptive_weights
 
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -604,6 +775,10 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"stock_news={adaptive_weights['stock_news_weight']:.1%}, "
             f"market_news={adaptive_weights['market_news_weight']:.1%}, "
             f"related_news={adaptive_weights['related_news_weight']:.1%}"
+        )
+        logger.info(
+            f"  Signal threshold: ±{adaptive_weights['signal_threshold']} "
+            f"(learnt from back-test, validated on last {THRESHOLD_HOLDOUT_DAYS} days)"
         )
         logger.info(f"  Reliable streams: {adaptive_weights['streams_reliable']}/4")
         if adaptive_weights.get("fallback_equal_weights"):
@@ -639,6 +814,7 @@ def adaptive_weights_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "stock_news_sample_count":    0,
             "market_news_sample_count":   0,
             "related_news_sample_count":  0,
+            "signal_threshold":           DEFAULT_SIGNAL_THRESHOLD,
         }
         state.setdefault("node_execution_times", {})["node_11"] = (
             datetime.now() - start_time
