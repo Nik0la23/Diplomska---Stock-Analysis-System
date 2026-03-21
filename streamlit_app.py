@@ -851,6 +851,93 @@ def main():
         st.plotly_chart(build_similar_days_chart(pp), width="stretch",
                         config={"displayModeBar": False})
 
+    # ── Macro & Commodity Factors ─────────────────────────────────────────────
+    macro_exp = (state.get("market_context") or {}).get("macro_factor_exposure") or {}
+    factors   = macro_exp.get("identified_factors") or []
+    if factors:
+        st.markdown(
+            '<div class="section-header">Macro &amp; commodity factors</div>',
+            unsafe_allow_html=True,
+        )
+        _EXPOSURE_COLORS: dict = {
+            "COST_INPUT":           ("#7f1d1d", "#fca5a5"),   # dark red bg, light red text
+            "REVENUE_DRIVER":       ("#14532d", "#86efac"),   # dark green bg, light green text
+            "COMPETITOR_PRESSURE":  ("#78350f", "#fcd34d"),   # dark amber bg, amber text
+            "MACRO_SENSITIVITY":    ("#1e3a5f", "#93c5fd"),   # dark blue bg, blue text
+        }
+        _TREND_ICON: dict = {
+            "UP":   ('<span style="color:#4ade80;font-weight:700">↑ UP</span>',),
+            "DOWN": ('<span style="color:#f87171;font-weight:700">↓ DOWN</span>',),
+            "FLAT": ('<span style="color:#9ca3af;font-weight:700">→ FLAT</span>',),
+        }
+
+        rows_html = ""
+        for fac in factors:
+            if not isinstance(fac, dict):
+                continue
+            name     = fac.get("factor_name", "—")
+            exp_type = fac.get("exposure_type", "")
+            expl     = fac.get("exposure_explanation", "")
+            price    = fac.get("current_price")
+            trend    = fac.get("price_trend")
+
+            bg_c, txt_c = _EXPOSURE_COLORS.get(exp_type, ("#374151", "#d1d5db"))
+            badge_html = (
+                f'<span style="background:{bg_c};color:{txt_c};'
+                f'padding:2px 7px;border-radius:4px;font-size:11px;'
+                f'font-family:\'DM Mono\',monospace;white-space:nowrap">'
+                f'{exp_type}</span>'
+            )
+            price_str = (
+                f'<span style="font-family:\'DM Mono\',monospace">'
+                f'${price:,.2f}</span>'
+                if price is not None
+                else '<span style="color:#6b7280">N/A</span>'
+            )
+            trend_html = (
+                _TREND_ICON.get(trend, ('<span style="color:#9ca3af">—</span>',))[0]
+                if trend else '<span style="color:#9ca3af">—</span>'
+            )
+            rows_html += (
+                f"<tr>"
+                f'<td style="font-size:13px;padding:6px 10px;color:#e5e7eb">{name}</td>'
+                f'<td style="padding:6px 10px">{badge_html}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{price_str}</td>'
+                f'<td style="padding:6px 10px;text-align:center">{trend_html}</td>'
+                f'<td style="font-size:12px;color:#9ca3af;padding:6px 10px">{expl}</td>'
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"""<table style="width:100%;border-collapse:collapse;
+                background:#111827;border-radius:8px;overflow:hidden;margin-bottom:16px">
+              <thead>
+                <tr style="border-bottom:1px solid #374151">
+                  <th style="text-align:left;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Factor</th>
+                  <th style="text-align:left;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Exposure</th>
+                  <th style="text-align:right;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Price</th>
+                  <th style="text-align:center;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">5d trend</th>
+                  <th style="text-align:left;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Why it matters</th>
+                </tr>
+              </thead>
+              <tbody>{rows_html}</tbody>
+            </table>""",
+            unsafe_allow_html=True,
+        )
+
+        macro_summary = macro_exp.get("macro_summary") or ""
+        if macro_summary and macro_summary != "Unavailable.":
+            st.markdown(
+                f'<div style="font-size:12px;color:#9ca3af;line-height:1.6;'
+                f'margin-bottom:16px;padding:0 2px">{macro_summary}</div>',
+                unsafe_allow_html=True,
+            )
+
     # ── Analysis text ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Analysis</div>',
                 unsafe_allow_html=True)

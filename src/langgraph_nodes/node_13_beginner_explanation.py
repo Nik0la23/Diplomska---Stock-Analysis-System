@@ -140,14 +140,16 @@ def _build_user_prompt(
     sc: Dict[str, Any],
     sb: Dict[str, Any],
     ticker: str,
+    macro_factors: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Assemble the dynamic data block from pre-extracted state dicts.
 
     Args:
-        sc:     signal_components dict from Node 12.
-        sb:     sentiment_breakdown dict from Node 5 (may be empty).
-        ticker: Stock ticker symbol.
+        sc:            signal_components dict from Node 12.
+        sb:            sentiment_breakdown dict from Node 5 (may be empty).
+        ticker:        Stock ticker symbol.
+        macro_factors: identified_factors list from Node 6 (may be None/empty).
 
     Returns:
         Formatted user prompt string ready to send to the LLM.
@@ -266,11 +268,42 @@ def _build_user_prompt(
     if bc.get("weights_are_fallback"):
         weights_note = "\nNOTE: Historical learning data was insufficient — do not mention 'historical learning' in the explanation."
 
+    # --- COMMODITY & MACRO FACTORS BLOCK ---
+    commodity_section = ""
+    if macro_factors:
+        trend_arrow = {"UP": "↑", "DOWN": "↓", "FLAT": "→"}
+        lines: List[str] = []
+        for f in macro_factors:
+            if not isinstance(f, dict):
+                continue
+            name     = f.get("factor_name", "Unknown")
+            exp_type = f.get("exposure_type", "")
+            expl     = f.get("exposure_explanation", "")
+            price    = f.get("current_price")
+            trend    = f.get("price_trend")
+            price_str = f"${price:,.2f}" if price is not None else "price unavailable"
+            trend_str = (
+                f" {trend_arrow.get(trend, '')} {trend}" if trend else ""
+            )
+            lines.append(f"- {name} ({exp_type}): {price_str}{trend_str} — {expl}")
+        if lines:
+            commodity_section = (
+                "\nCOMMODITY & MACRO FACTOR PRICES"
+                " (incorporate into section 3 — What's Driving This):\n"
+                + "\n".join(lines)
+                + "\nInterpretation guide: COST_INPUT rising (↑) = cost headwind for the company."
+                " COST_INPUT falling (↓) = cost tailwind."
+                " REVENUE_DRIVER rising (↑) = revenue tailwind."
+                " REVENUE_DRIVER falling (↓) = revenue headwind."
+                " MACRO_SENSITIVITY / COMPETITOR_PRESSURE — mention the directional impact"
+                " in plain English without technical jargon.\n"
+            )
+
     return f"""Generate a beginner explanation for the following stock analysis.
 Follow the 7-section structure exactly in this order:
 1. Headline
 2. How Strong and Reliable is This Signal
-3. What's Driving This
+3. What's Driving This (incorporate commodity/macro factor prices if provided)
 4. Historical Pattern (skip entirely if marked insufficient)
 5. Price Expectation (skip if unavailable)
 6. Risk
@@ -287,7 +320,7 @@ SIGNAL:
 
 STREAM DIRECTIONS (translate these to plain English in section 3):
 {streams_block}
-
+{commodity_section}
 {top_articles_block}
 
 PRICE TARGETS:
@@ -377,6 +410,10 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # =========================================================================
     sc: Optional[Dict[str, Any]] = state.get("signal_components")
     sb: Dict[str, Any]           = state.get("sentiment_breakdown") or {}
+    mc_ctx: Dict[str, Any]       = state.get("market_context") or {}
+    macro_factors: List[Dict[str, Any]] = (
+        mc_ctx.get("macro_factor_exposure", {}).get("identified_factors", []) or []
+    )
 
     # =========================================================================
     # STEP 2: Guard — signal_components is required
@@ -395,7 +432,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # =========================================================================
     # STEP 3: Build prompts
     # =========================================================================
-    user_prompt = _build_user_prompt(sc, sb, ticker)
+    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors)
 
     logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")
 

@@ -91,6 +91,35 @@ MARKET_INDICES: Dict[str, str] = {
     "Dow Jones": "DIA",
 }
 
+# Maps FMP commodity symbol names (from LLM output) to yfinance futures tickers
+_FMP_TO_YF: Dict[str, str] = {
+    "CRUDE_OIL":   "CL=F",
+    "NATURAL_GAS": "NG=F",
+    "GOLD":        "GC=F",
+    "SILVER":      "SI=F",
+    "COPPER":      "HG=F",
+    "WHEAT":       "ZW=F",
+    "CORN":        "ZC=F",
+    "SOYBEANS":    "ZS=F",
+    "PLATINUM":    "PL=F",
+    "ALUMINUM":    "ALI=F",
+    "IRON_ORE":    "TIO=F",
+    "LITHIUM":     "LIT",
+    "NICKEL":      "NI=F",
+    "ZINC":        "ZNC=F",
+    "COAL":        "MTF=F",
+    "URANIUM":     "UX=F",
+    "LUMBER":      "LBS=F",
+    "COTTON":      "CT=F",
+    "SUGAR":       "SB=F",
+    "COFFEE":      "KC=F",
+    "COCOA":       "CC=F",
+    "OIL":         "CL=F",
+    "BRENT_OIL":   "BZ=F",
+    "GASOLINE":    "RB=F",
+    "HEATING_OIL": "HO=F",
+}
+
 # How many days of market news to include in sentiment average
 MARKET_NEWS_LOOKBACK_DAYS: int = 14
 
@@ -122,6 +151,80 @@ Return ONLY valid JSON. No preamble. No explanation outside the JSON.
   ]
 }}
 """
+
+
+def _fetch_commodity_prices_sync(
+    fmp_symbols: List[str],
+) -> Tuple[Dict[str, float], Dict[str, str]]:
+    """
+    Fetch latest closing prices and 5-day trends for a list of FMP commodity symbols
+    using yfinance. Returns (commodity_prices, commodity_trends) keyed by fmp_symbol.
+
+    Trend thresholds: >+1% → UP, <-1% → DOWN, otherwise FLAT.
+    """
+    prices: Dict[str, float] = {}
+    trends: Dict[str, str] = {}
+
+    # Build yf_symbol → fmp_symbol reverse map (some fmp symbols may share a yf symbol)
+    yf_to_fmp: Dict[str, str] = {}
+    yf_symbols: List[str] = []
+    for fmp_sym in fmp_symbols:
+        yf_sym = _FMP_TO_YF.get(fmp_sym.upper())
+        if yf_sym:
+            yf_to_fmp[yf_sym] = fmp_sym
+            yf_symbols.append(yf_sym)
+
+    if not yf_symbols:
+        return prices, trends
+
+    try:
+        # Download 10 calendar days to ensure ≥5 trading-day closes
+        data = yf.download(
+            yf_symbols,
+            period="10d",
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            threads=False,
+        )
+
+        if data.empty:
+            return prices, trends
+
+        # yfinance returns MultiIndex columns when >1 symbol, flat when exactly 1
+        close_df: pd.DataFrame
+        if isinstance(data.columns, pd.MultiIndex):
+            close_df = data["Close"]
+        else:
+            close_df = data[["Close"]].rename(columns={"Close": yf_symbols[0]})
+
+        for yf_sym in yf_symbols:
+            fmp_sym = yf_to_fmp[yf_sym]
+            if yf_sym not in close_df.columns:
+                continue
+            series = close_df[yf_sym].dropna()
+            if series.empty:
+                continue
+            latest_price = float(series.iloc[-1])
+            prices[fmp_sym] = round(latest_price, 4)
+            if len(series) >= 5:
+                five_day_ago = float(series.iloc[-5])
+                if five_day_ago != 0:
+                    pct_change = (latest_price - five_day_ago) / five_day_ago * 100
+                    if pct_change > 1.0:
+                        trends[fmp_sym] = "UP"
+                    elif pct_change < -1.0:
+                        trends[fmp_sym] = "DOWN"
+                    else:
+                        trends[fmp_sym] = "FLAT"
+                else:
+                    trends[fmp_sym] = "FLAT"
+            else:
+                trends[fmp_sym] = "FLAT"
+    except Exception as exc:
+        logger.warning(f"[Node 6] yfinance commodity fetch failed: {exc}")
+
+    return prices, trends
 
 
 def _parse_tool_response(raw: Any) -> Any:
@@ -1111,8 +1214,35 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
                     f"[Node 6] VIX quote tool failed for {ticker}: {exc}"
                 )
 
-        # Commodity fetching removed (402 on plan). macro_factor_exposure still has
-        # identified_factors from the LLM; commodity_prices/commodity_trends stay empty.
+        # Fetch live commodity prices via yfinance for identified commodity symbols.
+        if commodity_symbols:
+            try:
+                import asyncio
+                commodity_prices, commodity_trends = await asyncio.to_thread(
+                    _fetch_commodity_prices_sync, commodity_symbols
+                )
+                logger.info(
+                    f"[Node 6] Fetched commodity prices for {ticker}: "
+                    f"{list(commodity_prices.keys())}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[Node 6] Commodity price fetch via asyncio.to_thread failed: {exc}"
+                )
+                commodity_prices = {}
+                commodity_trends = {}
+
+        # Enrich identified_factors in-place with price + trend for downstream nodes
+        for factor in identified_factors:
+            if not isinstance(factor, dict):
+                continue
+            fmp_sym = factor.get("fmp_commodity_symbol")
+            if fmp_sym and fmp_sym in commodity_prices:
+                factor["current_price"] = commodity_prices[fmp_sym]
+                factor["price_trend"] = commodity_trends.get(fmp_sym, "FLAT")
+            else:
+                factor["current_price"] = None
+                factor["price_trend"] = None
 
         # ------------------------------------------------------------------
         # Step 4: Pure Python layers (SPY/VIX/regime, relative strength)

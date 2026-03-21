@@ -235,19 +235,60 @@ def _build_user_prompt(
 
     # -------------------------------------------------------------------------
     # MARKET CONTEXT BLOCK (specific fields only — never dump raw dict)
+    # Node 6 stores a nested dict; extract from the correct sub-keys.
     # -------------------------------------------------------------------------
     if mc_ctx:
-        rel_perf = mc_ctx.get("related_companies_performance") or {}
-        rel_lines = [f"    {t}: {v:+.2f}%" for t, v in list(rel_perf.items())[:5]] if rel_perf else ["    none"]
+        regime       = mc_ctx.get("market_regime") or {}
+        sector_ctx   = mc_ctx.get("sector_industry_context") or {}
+        corr_profile = mc_ctx.get("market_correlation_profile") or {}
+        stock_cls    = mc_ctx.get("stock_classification") or {}
+        news_ctx     = mc_ctx.get("news_sentiment_context") or {}
+        macro_exp    = mc_ctx.get("macro_factor_exposure") or {}
+
+        # Commodity factors block (only factors with a fetched price)
+        identified_factors: List[Dict[str, Any]] = macro_exp.get("identified_factors") or []
+        _trend_arrow = {"UP": "↑", "DOWN": "↓", "FLAT": "→"}
+        commodity_lines: List[str] = []
+        for fac in identified_factors:
+            if not isinstance(fac, dict):
+                continue
+            f_name  = fac.get("factor_name", "Unknown")
+            f_type  = fac.get("exposure_type", "")
+            f_expl  = fac.get("exposure_explanation", "")
+            f_price = fac.get("current_price")
+            f_trend = fac.get("price_trend")
+            price_str = f"${f_price:,.4f}" if f_price is not None else "N/A"
+            trend_str = (
+                f" | trend: {_trend_arrow.get(f_trend, '')} {f_trend}"
+                if f_trend else ""
+            )
+            commodity_lines.append(
+                f"    {f_name} ({f_type}): {price_str}{trend_str} — {f_expl}"
+            )
+        commodity_block_str = (
+            "\n".join(commodity_lines) if commodity_lines else "    none fetched"
+        )
+
         mc_ctx_block = (
-            f"  context_signal: {mc_ctx.get('context_signal')}\n"
-            f"  market_correlation: {mc_ctx.get('market_correlation')}\n"
-            f"  sector_performance: {mc_ctx.get('sector_performance')}\n"
-            f"  market_trend: {mc_ctx.get('market_trend')}\n"
-            f"  spy_5day_change: {mc_ctx.get('spy_5day_change')}\n"
-            f"  beta: {mc_ctx.get('beta')}\n"
-            f"  sector: {mc_ctx.get('sector')}\n"
-            f"  related_companies_performance (top 5):\n" + "\n".join(rel_lines)
+            f"  regime_label: {regime.get('regime_label')}\n"
+            f"  regime_description: {regime.get('regime_description')}\n"
+            f"  spy_trend_label: {regime.get('spy_trend_label')}\n"
+            f"  spy_return_5d: {_fmt(regime.get('spy_return_5d'))}%\n"
+            f"  spy_return_21d: {_fmt(regime.get('spy_return_21d'))}%\n"
+            f"  vix_level: {regime.get('vix_level')} ({regime.get('vix_category')})\n"
+            f"  sector: {stock_cls.get('sector')}\n"
+            f"  sector_return_5d: {_fmt(sector_ctx.get('sector_return_5d'))}%"
+            f" | trend: {sector_ctx.get('sector_trend')}\n"
+            f"  relative_strength_label: {sector_ctx.get('relative_strength_label')}\n"
+            f"  sector_context_note: {sector_ctx.get('sector_context_note')}\n"
+            f"  market_correlation: {_fmt(corr_profile.get('market_correlation'))}\n"
+            f"  beta_calculated: {_fmt(corr_profile.get('beta_calculated'))}\n"
+            f"  beta_interpretation: {corr_profile.get('beta_interpretation')}\n"
+            f"  market_news_sentiment: {_fmt(news_ctx.get('market_news_sentiment'))}"
+            f" ({news_ctx.get('sentiment_label')})\n"
+            f"  macro_summary: {macro_exp.get('macro_summary')}\n"
+            f"  commodity_factors (use to assess cost/revenue impact on price):\n"
+            + commodity_block_str
         )
     else:
         mc_ctx_block = "UNAVAILABLE"
