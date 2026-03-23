@@ -31,6 +31,8 @@ import asyncio
 from datetime import datetime
 from typing import Dict, Optional
 
+from streamlit_app.components.signal_diagnostics import render_signal_diagnostics
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -44,6 +46,13 @@ try:
     PIPELINE_AVAILABLE = True
 except ImportError:
     PIPELINE_AVAILABLE = False
+
+try:
+    from src.langgraph_nodes.node_15_dashboard import dashboard_node as _dashboard_node
+    DASHBOARD_NODE_AVAILABLE = True
+except ImportError:
+    _dashboard_node = None
+    DASHBOARD_NODE_AVAILABLE = False
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 
@@ -188,6 +197,42 @@ def fetch_price_history(ticker: str, period: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300)
+def fetch_commodity_live_prices(yf_tickers: tuple) -> Dict[str, Dict]:
+    """Fetch live price and 1-day change for a set of yfinance commodity tickers.
+
+    Args:
+        yf_tickers: tuple of yfinance ticker strings (e.g. ("CL=F", "GC=F")).
+                    Must be a tuple (not list) so Streamlit can hash it for caching.
+
+    Returns:
+        dict keyed by yf_ticker: {"price": float, "change_pct": float}
+        Missing or failed tickers are omitted.
+    """
+    result: Dict[str, Dict] = {}
+    for sym in yf_tickers:
+        if not sym:
+            continue
+        try:
+            df = yf.download(sym, period="5d", interval="1d",
+                             progress=False, auto_adjust=True,
+                             multi_level_index=False)
+            if df.empty:
+                continue
+            df = df.reset_index()
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            closes = df["Close"].dropna()
+            if len(closes) < 2:
+                continue
+            latest   = float(closes.iloc[-1])
+            prev     = float(closes.iloc[-2])
+            chg_pct  = (latest - prev) / prev * 100 if prev else 0.0
+            result[sym] = {"price": latest, "change_pct": chg_pct}
+        except Exception:
+            pass
+    return result
+
+
 # ─── Chart layout helper ──────────────────────────────────────────────────────
 # FIX 1: Split the old monolithic CHART_LAYOUT dict into a base dict (no axis
 # keys) and separate axis defaults. The _layout() helper merges them so that
@@ -259,8 +304,8 @@ def build_stock_chart(df: pd.DataFrame, ticker: str, period: str) -> go.Figure:
     return fig
 
 
-def build_monte_carlo_chart(mc_results: Dict) -> go.Figure:
-    viz          = mc_results.get("visualization_data") or {}
+def build_monte_carlo_chart(viz: Dict) -> go.Figure:
+    """viz is dashboard_data["visualization"]["mc_visualization"]."""
     sample_paths = viz.get("sample_paths") or []
     mean_path    = viz.get("mean_path") or []
     upper_95     = viz.get("upper_95") or []
@@ -312,10 +357,9 @@ def build_monte_carlo_chart(mc_results: Dict) -> go.Figure:
     return fig
 
 
-def build_forecast_chart(sc: Dict, mc: Dict) -> go.Figure:
-    pg            = sc.get("prediction_graph_data") or {}
-    current_price = float(mc.get("current_price") or 0)
-    days          = list(range(8))
+def build_forecast_chart(pg: Dict, current_price: float) -> go.Figure:
+    """pg is dashboard_data["visualization"]["prediction_graph_data"]."""
+    days = list(range(8))
 
     def pct_to_price(pct):
         return current_price * (1 + pct / 100) if current_price else None
@@ -385,8 +429,8 @@ def build_forecast_chart(sc: Dict, mc: Dict) -> go.Figure:
     return fig
 
 
-def build_similar_days_chart(pp: Dict) -> go.Figure:
-    detail = pp.get("similar_days_detail") or []
+def build_similar_days_chart(detail: list, exp_ret: Optional[float]) -> go.Figure:
+    """detail is dashboard_data["visualization"]["similar_days_detail"]."""
     if not detail:
         fig = go.Figure()
         fig.add_annotation(text="Insufficient historical data",
@@ -395,11 +439,11 @@ def build_similar_days_chart(pp: Dict) -> go.Figure:
         fig.update_layout(**_layout(220))
         return fig
 
-    changes = [d.get("actual_change_7d", 0) for d in detail
-               if d.get("actual_change_7d") is not None]
+    valid   = [d for d in detail if d.get("actual_change_7d") is not None]
+    changes = [d.get("actual_change_7d", 0) for d in valid]
     colors  = ["#22c55e" if c >= 0 else "#ef4444" for c in changes]
     borders = ["#16a34a" if c >= 0 else "#dc2626" for c in changes]
-    labels  = [d.get("date", "")[:10] for d in detail]
+    labels  = [d.get("date", "")[:10] for d in valid]
 
     fig = go.Figure(go.Bar(
         x=labels, y=changes,
@@ -411,7 +455,6 @@ def build_similar_days_chart(pp: Dict) -> go.Figure:
     ))
     fig.add_hline(y=0, line=dict(color="#ddd", width=1))
 
-    exp_ret = pp.get("expected_return_7d")
     if exp_ret is not None:
         fig.add_hline(y=exp_ret, line=dict(color="#065f46", width=1, dash="dot"),
                       annotation_text=f"Avg {exp_ret:+.1f}%",
@@ -421,8 +464,9 @@ def build_similar_days_chart(pp: Dict) -> go.Figure:
     return fig
 
 
-def build_stream_bars(sc: Dict) -> go.Figure:
-    ss      = sc.get("stream_scores") or {}
+def build_stream_bars(stream_scores: Dict) -> go.Figure:
+    """stream_scores is dashboard_data["visualization"]["stream_scores"]."""
+    ss      = stream_scores
     streams = ["technical", "sentiment", "market", "related_news"]
     labels  = ["Technical", "Sentiment", "Market", "Related news"]
     scores  = [float((ss.get(s) or {}).get("raw_score") or 0) for s in streams]
@@ -480,7 +524,7 @@ def _mock_state(ticker: str) -> Dict:
         {"date": "2023-11-14", "similarity_score": 0.81, "actual_change_7d":  5.6, "direction": "UP"},
     ]
 
-    return {
+    state = {
         "ticker": ticker,
         "final_signal":     "BUY",
         "final_confidence": 0.6412,
@@ -618,6 +662,10 @@ def _mock_state(ticker: str) -> Dict:
             "sample count reaches 30. Job 2 threshold 0.65."
         ),
     }
+    # Populate dashboard_data so the app always has one consistent data source.
+    if DASHBOARD_NODE_AVAILABLE:
+        state = _dashboard_node(state)
+    return state
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -678,7 +726,16 @@ def main():
                     try:
                         state = asyncio.run(run_stock_analysis_async(ticker_input))
                     except Exception as e:
-                        pipeline_error = str(e)
+                        # ExceptionGroup (Python 3.11+ TaskGroup) hides the real cause.
+                        # Unwrap one level so the user sees the actual sub-exception.
+                        if hasattr(e, "exceptions") and e.exceptions:
+                            causes = "\n".join(
+                                f"[{i+1}] {type(sub).__name__}: {sub}"
+                                for i, sub in enumerate(e.exceptions)
+                            )
+                            pipeline_error = f"{e}\n\nSub-exceptions:\n{causes}"
+                        else:
+                            pipeline_error = f"{type(e).__name__}: {e}"
                         state = _mock_state(ticker_input)
                 else:
                     pipeline_error = "Pipeline not available — import failed."
@@ -702,20 +759,25 @@ def main():
             icon="🔴",
         )
 
-    sc    = state.get("signal_components") or {}
-    mc    = state.get("monte_carlo_results") or {}
-    pp    = sc.get("pattern_prediction") or {}
-    pt    = sc.get("price_targets") or {}
-    rs    = sc.get("risk_summary") or {}
-    pg    = sc.get("prediction_graph_data") or {}
-    tw    = sc.get("trustworthiness_breakdown") or {}
+    # ── All display data comes from Node 15's dashboard_data ─────────────────
+    dd   = state.get("dashboard_data") or {}
+    es   = dd.get("executive_summary")    or {}
+    pi   = dd.get("price_intelligence")   or {}
+    mc_d = dd.get("monte_carlo")          or {}
+    risk = dd.get("risk_assessment")      or {}
+    hp   = dd.get("historical_pattern")   or {}
+    llm  = dd.get("llm_analysis")         or {}
+    viz  = dd.get("visualization")        or {}
+    macro= dd.get("macro_factors")        or {}
+    diag = dd.get("diagnostics")          or {}
+    tw   = dd.get("trustworthiness")      or {}
 
-    ticker        = state.get("ticker", ticker_input)
-    final_signal  = state.get("final_signal", "HOLD")
-    sig_strength  = int(state.get("signal_strength") or 0)
-    trust         = float(state.get("trustworthiness") or 0)
-    current_price = float(mc.get("current_price") or pt.get("current_price") or 0)
-    risk_level    = rs.get("overall_risk_level", "UNKNOWN")
+    ticker        = es.get("ticker") or ticker_input
+    final_signal  = es.get("recommendation", "HOLD")
+    sig_strength  = int(es.get("signal_strength") or 0)
+    trust         = float(es.get("confidence_raw") or 0)
+    current_price = float(es.get("current_price_usd") or 0)
+    risk_level    = risk.get("overall_risk_level", "UNKNOWN")
     insuff        = tw.get("insufficient_history", True)
 
     # ── Header ────────────────────────────────────────────────────────────────
@@ -728,7 +790,7 @@ def main():
             {datetime.now().strftime('%d %b %Y · %H:%M')}</div>
         """, unsafe_allow_html=True)
     with col_s:
-        agree = int(sc.get("signal_agreement") or 0)
+        agree = int(es.get("streams_agreeing") or 0)
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:10px;padding-top:4px">
             {signal_pill(final_signal)}
@@ -742,7 +804,7 @@ def main():
     with m1:
         st.metric("Current price", fmt_price(current_price))
     with m2:
-        forecast  = pt.get("forecasted_price")
+        forecast  = pi.get("forecasted_price_7d_usd")
         delta_pct = ((forecast - current_price) / current_price * 100
                      if forecast and current_price else None)
         st.metric("7-day forecast", fmt_price(forecast),
@@ -753,14 +815,14 @@ def main():
         st.metric("Trustworthiness",
                   "Building…" if insuff else f"{trust:.0%}")
     with m5:
-        prob_up = pp.get("prob_up")
-        n_sim   = pp.get("similar_days_found", 0)
+        prob_up = hp.get("prob_up_empirical")
+        n_sim   = hp.get("similar_days_found", 0)
         st.metric("Hist. prob up",
                   f"{prob_up:.0%}" if prob_up else "N/A",
-                  delta=(f"{n_sim} similar days" if pp.get("sufficient_data")
+                  delta=(f"{n_sim} similar days" if hp.get("sufficient_data")
                          else "Insufficient data"))
     with m6:
-        pnds = int(rs.get("pump_and_dump_score") or 0)
+        pnds = int(risk.get("pump_and_dump_score") or 0)
         st.metric("Risk", risk_level, delta=f"P&D {pnds}/100",
                   delta_color="inverse")
 
@@ -796,6 +858,7 @@ def main():
     ch1, ch2 = st.columns([3, 2])
 
     with ch1:
+        pg   = viz.get("prediction_graph_data") or {}
         j2w  = pg.get("job2_blend_weight", 0)
         gbmw = pg.get("gbm_blend_weight", 1)
         src  = pg.get("data_source", "gbm_only")
@@ -806,16 +869,20 @@ def main():
             f'+ {gbmw:.0%} GBM · {src}</div>',
             unsafe_allow_html=True,
         )
-        st.plotly_chart(build_forecast_chart(sc, mc), width="stretch",
-                        config={"displayModeBar": False})
+        st.plotly_chart(
+            build_forecast_chart(pg, viz.get("current_price", 0)),
+            width="stretch", config={"displayModeBar": False},
+        )
 
     with ch2:
         st.markdown('<div class="chart-title">Stream scores</div>',
                     unsafe_allow_html=True)
         st.markdown('<div class="chart-subtitle">Raw score × adaptive weight</div>',
                     unsafe_allow_html=True)
-        st.plotly_chart(build_stream_bars(sc), width="stretch",
-                        config={"displayModeBar": False})
+        st.plotly_chart(
+            build_stream_bars(viz.get("stream_scores") or {}),
+            width="stretch", config={"displayModeBar": False},
+        )
 
     # ── Monte Carlo + similar days ────────────────────────────────────────────
     st.markdown('<div class="section-header">Simulation & historical patterns</div>',
@@ -823,8 +890,8 @@ def main():
     ch3, ch4 = st.columns([3, 2])
 
     with ch3:
-        n_mc = mc.get("simulation_count", 1000)
-        vol  = mc.get("volatility", 0)
+        n_mc = mc_d.get("num_simulations", 1000)
+        vol  = mc_d.get("volatility_daily", 0)
         st.markdown('<div class="chart-title">Monte Carlo paths</div>',
                     unsafe_allow_html=True)
         st.markdown(
@@ -832,44 +899,56 @@ def main():
             f'vol {vol:.2%} · 68% & 95% CI bands</div>',
             unsafe_allow_html=True,
         )
-        st.plotly_chart(build_monte_carlo_chart(mc), width="stretch",
-                        config={"displayModeBar": False})
+        st.plotly_chart(
+            build_monte_carlo_chart(viz.get("mc_visualization") or {}),
+            width="stretch", config={"displayModeBar": False},
+        )
 
     with ch4:
-        n_days = pp.get("similar_days_found", 0)
-        prob_u = pp.get("prob_up", 0)
+        n_days = hp.get("similar_days_found", 0)
+        prob_u = hp.get("prob_up_empirical") or 0
         st.markdown('<div class="chart-title">Similar historical days</div>',
                     unsafe_allow_html=True)
         st.markdown(
             (f'<div class="chart-subtitle">{n_days} days · '
              f'prob up {prob_u:.0%} · '
-             f'avg {fmt_pct(pp.get("expected_return_7d"))}</div>')
-            if pp.get("sufficient_data")
+             f'avg {fmt_pct(hp.get("expected_return_7d_pct"))}</div>')
+            if hp.get("sufficient_data")
             else '<div class="chart-subtitle">Insufficient data</div>',
             unsafe_allow_html=True,
         )
-        st.plotly_chart(build_similar_days_chart(pp), width="stretch",
-                        config={"displayModeBar": False})
+        st.plotly_chart(
+            build_similar_days_chart(
+                viz.get("similar_days_detail") or [],
+                hp.get("expected_return_7d_pct"),
+            ),
+            width="stretch", config={"displayModeBar": False},
+        )
 
     # ── Macro & Commodity Factors ─────────────────────────────────────────────
-    macro_exp = (state.get("market_context") or {}).get("macro_factor_exposure") or {}
-    factors   = macro_exp.get("identified_factors") or []
+    factors = macro.get("identified_factors") or []
     if factors:
         st.markdown(
             '<div class="section-header">Macro &amp; commodity factors</div>',
             unsafe_allow_html=True,
         )
         _EXPOSURE_COLORS: dict = {
-            "COST_INPUT":           ("#7f1d1d", "#fca5a5"),   # dark red bg, light red text
-            "REVENUE_DRIVER":       ("#14532d", "#86efac"),   # dark green bg, light green text
-            "COMPETITOR_PRESSURE":  ("#78350f", "#fcd34d"),   # dark amber bg, amber text
-            "MACRO_SENSITIVITY":    ("#1e3a5f", "#93c5fd"),   # dark blue bg, blue text
+            "COST_INPUT":           ("#7f1d1d", "#fca5a5"),
+            "REVENUE_DRIVER":       ("#14532d", "#86efac"),
+            "COMPETITOR_PRESSURE":  ("#78350f", "#fcd34d"),
+            "MACRO_SENSITIVITY":    ("#1e3a5f", "#93c5fd"),
         }
-        _TREND_ICON: dict = {
-            "UP":   ('<span style="color:#4ade80;font-weight:700">↑ UP</span>',),
-            "DOWN": ('<span style="color:#f87171;font-weight:700">↓ DOWN</span>',),
-            "FLAT": ('<span style="color:#9ca3af;font-weight:700">→ FLAT</span>',),
-        }
+
+        # Fetch live prices for all factors that have a yf_ticker
+        commodity_tickers = tuple(
+            fac["yf_ticker"]
+            for fac in factors
+            if isinstance(fac, dict) and fac.get("yf_ticker")
+        )
+        live_prices: Dict[str, Dict] = (
+            fetch_commodity_live_prices(commodity_tickers)
+            if commodity_tickers else {}
+        )
 
         rows_html = ""
         for fac in factors:
@@ -878,8 +957,12 @@ def main():
             name     = fac.get("factor_name", "—")
             exp_type = fac.get("exposure_type", "")
             expl     = fac.get("exposure_explanation", "")
-            price    = fac.get("current_price")
-            trend    = fac.get("price_trend")
+            yf_sym   = fac.get("yf_ticker")
+
+            # Prefer live price; fall back to pipeline price if live fetch failed
+            live     = live_prices.get(yf_sym) if yf_sym else None
+            price    = live["price"]    if live else fac.get("current_price")
+            chg_pct  = live["change_pct"] if live else None
 
             bg_c, txt_c = _EXPOSURE_COLORS.get(exp_type, ("#374151", "#d1d5db"))
             badge_html = (
@@ -894,16 +977,23 @@ def main():
                 if price is not None
                 else '<span style="color:#6b7280">N/A</span>'
             )
-            trend_html = (
-                _TREND_ICON.get(trend, ('<span style="color:#9ca3af">—</span>',))[0]
-                if trend else '<span style="color:#9ca3af">—</span>'
-            )
+            if chg_pct is not None:
+                chg_color = "#4ade80" if chg_pct >= 0 else "#f87171"
+                sign      = "+" if chg_pct >= 0 else ""
+                chg_html  = (
+                    f'<span style="font-family:\'DM Mono\',monospace;'
+                    f'color:{chg_color};font-weight:600">'
+                    f'{sign}{chg_pct:.2f}%</span>'
+                )
+            else:
+                chg_html = '<span style="color:#6b7280">—</span>'
+
             rows_html += (
                 f"<tr>"
                 f'<td style="font-size:13px;padding:6px 10px;color:#e5e7eb">{name}</td>'
                 f'<td style="padding:6px 10px">{badge_html}</td>'
                 f'<td style="padding:6px 10px;text-align:right">{price_str}</td>'
-                f'<td style="padding:6px 10px;text-align:center">{trend_html}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{chg_html}</td>'
                 f'<td style="font-size:12px;color:#9ca3af;padding:6px 10px">{expl}</td>'
                 f"</tr>"
             )
@@ -919,8 +1009,8 @@ def main():
                       font-size:11px;color:#6b7280;font-weight:500">Exposure</th>
                   <th style="text-align:right;padding:8px 10px;
                       font-size:11px;color:#6b7280;font-weight:500">Price</th>
-                  <th style="text-align:center;padding:8px 10px;
-                      font-size:11px;color:#6b7280;font-weight:500">5d trend</th>
+                  <th style="text-align:right;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">1d chg</th>
                   <th style="text-align:left;padding:8px 10px;
                       font-size:11px;color:#6b7280;font-weight:500">Why it matters</th>
                 </tr>
@@ -930,7 +1020,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        macro_summary = macro_exp.get("macro_summary") or ""
+        macro_summary = macro.get("macro_summary") or ""
         if macro_summary and macro_summary != "Unavailable.":
             st.markdown(
                 f'<div style="font-size:12px;color:#9ca3af;line-height:1.6;'
@@ -947,11 +1037,11 @@ def main():
         if view_mode == "Beginner":
             st.markdown(
                 f'<div class="explanation-body">'
-                f'{state.get("beginner_explanation","")}</div>',
+                f'{llm.get("beginner_explanation","")}</div>',
                 unsafe_allow_html=True,
             )
         else:
-            st.markdown(state.get("technical_explanation", ""))
+            st.markdown(llm.get("technical_explanation", ""))
 
     with detail_col:
         st.markdown("**Signal quality**")
@@ -970,8 +1060,8 @@ def main():
                         f'{val}{badge}</td></tr>')
 
         rel = tw.get("reliability_score", 0)
-        agr = tw.get("agreement_score",   0)
-        pat = tw.get("pattern_score",     0)
+        agr = tw.get("agreement_score", 0)
+        pat = tw.get("pattern_score", 0)
 
         st.markdown(f"""
         <table class="sim-table" style="margin-bottom:12px">
@@ -988,11 +1078,11 @@ def main():
 
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-        if pp.get("sufficient_data"):
+        if hp.get("sufficient_data"):
             st.markdown("**Top similar days**")
-            detail   = pp.get("similar_days_detail") or []
-            rows_sim = []
-            for d in detail[:5]:
+            sim_detail = viz.get("similar_days_detail") or []
+            rows_sim   = []
+            for d in sim_detail[:5]:
                 chg = d.get("actual_change_7d", 0)
                 cls = "up" if chg >= 0 else "dn"
                 rows_sim.append(
@@ -1008,9 +1098,9 @@ def main():
 
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
         st.markdown("**Risk**")
-        alerts       = rs.get("alerts") or []
-        risk_factors = rs.get("primary_risk_factors") or []
-        pnd          = int(rs.get("pump_and_dump_score") or 0)
+        alerts       = risk.get("alerts") or []
+        risk_factors = risk.get("primary_risk_factors") or []
+        pnd          = int(risk.get("pump_and_dump_score") or 0)
         st.markdown(f"""
         <div style="font-size:12px;color:#666;line-height:1.9">
             Level &nbsp;{risk_badge(risk_level)}<br/>
@@ -1023,6 +1113,9 @@ def main():
                 f'<div style="font-size:11px;color:#991b1b;margin-top:3px">⚠ {a}</div>',
                 unsafe_allow_html=True,
             )
+
+    # ── Signal diagnostics ────────────────────────────────────────────────────
+    render_signal_diagnostics(diag)
 
     # ── Disclaimer ────────────────────────────────────────────────────────────
     st.markdown("""

@@ -60,7 +60,8 @@ def _executive_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         risk_verdict = f"Clear — risk level {risk.get('overall_risk_level','UNKNOWN')}"
 
     return {
-        "ticker":                 state.get("ticker", "N/A"),
+        "ticker":                 state.get("ticker",         "N/A"),
+        "signal_strength":        int(state.get("signal_strength") or 0),
         "analysis_timestamp":     state.get("timestamp", datetime.now()).isoformat()
                                   if hasattr(state.get("timestamp", ""), "isoformat")
                                   else str(state.get("timestamp", datetime.now())),
@@ -471,6 +472,101 @@ def _pipeline_integrity(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================================
+# ADDITIONAL SECTION BUILDERS
+# ============================================================================
+
+def _trustworthiness(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tier 1 — signal trustworthiness and per-stream hit rates.
+
+    Exposes the trustworthiness_breakdown produced by Node 12 so the
+    Streamlit app can display hit rates, reliability, and prior flags
+    without touching signal_components directly.
+    """
+    sc = state.get("signal_components") or {}
+    tw = sc.get("trustworthiness_breakdown") or {}
+    return {
+        "reliability_score":    tw.get("reliability_score", 0),
+        "agreement_score":      tw.get("agreement_score",   0),
+        "pattern_score":        tw.get("pattern_score",     0),
+        "insufficient_history": tw.get("insufficient_history", True),
+        "using_prior":          tw.get("using_prior", False),
+        "stream_hit_rates":     tw.get("stream_hit_rates", {}),
+    }
+
+
+def _visualization(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tier 1 — raw chart data for Streamlit.
+
+    Bundles the bulk arrays and nested dicts that the four chart
+    builders need (MC paths, similar-day records, stream scores,
+    forecast graph parameters) so the app never has to reach into
+    signal_components or monte_carlo_results directly.
+    """
+    mc = state.get("monte_carlo_results") or {}
+    sc = state.get("signal_components")   or {}
+    pp = sc.get("pattern_prediction")     or {}
+    pg = sc.get("prediction_graph_data")  or {}
+    ss = sc.get("stream_scores")          or {}
+    return {
+        # build_monte_carlo_chart — needs the raw path arrays
+        "mc_visualization":      mc.get("visualization_data") or {},
+        # build_similar_days_chart — needs individual day records
+        "similar_days_detail":   pp.get("similar_days_detail", []),
+        # build_stream_bars — needs per-stream raw_score + weight
+        "stream_scores":         ss,
+        # build_forecast_chart — needs blend weights and spread bounds
+        "prediction_graph_data": pg,
+        # shared baseline for forecast chart
+        "current_price":         float(mc.get("current_price") or 0),
+    }
+
+
+def _macro_factors(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tier 2 — commodity / macro factor exposure table.
+
+    Extracted from Node 6 market_context so the app renders the
+    factor table without touching the raw market_context dict.
+    """
+    mc_data   = state.get("market_context") or {}
+    macro_exp = mc_data.get("macro_factor_exposure") or {}
+    return {
+        "identified_factors": macro_exp.get("identified_factors", []),
+        "macro_summary":      macro_exp.get("macro_summary", ""),
+    }
+
+
+def _diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tier 4 — data-availability and backtest-sufficiency counters.
+
+    Pre-computes the row/article counts and backtest stream dicts
+    that the signal-diagnostics widget needs, so the widget never
+    reads raw state lists.
+    """
+    price_data = state.get("raw_price_data")
+    br         = state.get("backtest_results") or {}
+    return {
+        "price_rows": len(price_data) if price_data is not None else 0,
+        "stock_articles":   len(
+            state.get("cleaned_stock_news")
+            or state.get("stock_news", [])
+        ),
+        "market_articles":  len(
+            state.get("cleaned_market_news")
+            or state.get("market_news", [])
+        ),
+        "related_articles": len(
+            state.get("cleaned_related_company_news")
+            or state.get("related_company_news", [])
+        ),
+        "backtest_results": br,
+    }
+
+
+# ============================================================================
 # FORMATTED PRINT REPORT (visible in LangSmith trace stdout)
 # ============================================================================
 
@@ -723,21 +819,25 @@ def dashboard_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         dashboard_data: Dict[str, Any] = {
             # Tier 1: what clients see
-            "executive_summary":    _executive_summary(state),
-            "price_intelligence":   _price_intelligence(state),
-            "llm_analysis":         _llm_analysis(state),
+            "executive_summary":      _executive_summary(state),
+            "price_intelligence":     _price_intelligence(state),
+            "llm_analysis":           _llm_analysis(state),
+            "trustworthiness":        _trustworthiness(state),
+            "visualization":          _visualization(state),
             # Tier 2: what drives the call
-            "technical_analysis":   _technical_analysis(state),
+            "technical_analysis":     _technical_analysis(state),
             "sentiment_intelligence": _sentiment_intelligence(state),
-            "market_context":       _market_context(state),
-            "monte_carlo":          _monte_carlo(state),
+            "market_context":         _market_context(state),
+            "monte_carlo":            _monte_carlo(state),
+            "macro_factors":          _macro_factors(state),
             # Tier 3: model quality & validation
-            "model_performance":    _model_performance(state),
-            "news_intelligence":    _news_intelligence(state),
-            "historical_pattern":   _historical_pattern(state),
-            "risk_assessment":      _risk_assessment(state),
+            "model_performance":      _model_performance(state),
+            "news_intelligence":      _news_intelligence(state),
+            "historical_pattern":     _historical_pattern(state),
+            "risk_assessment":        _risk_assessment(state),
             # Tier 4: pipeline health
-            "pipeline_integrity":   _pipeline_integrity(state),
+            "pipeline_integrity":     _pipeline_integrity(state),
+            "diagnostics":            _diagnostics(state),
         }
 
         # Compute total_execution_time and stamp it before printing

@@ -1237,6 +1237,8 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
             if not isinstance(factor, dict):
                 continue
             fmp_sym = factor.get("fmp_commodity_symbol")
+            yf_ticker = _FMP_TO_YF.get(fmp_sym) if fmp_sym else None
+            factor["yf_ticker"] = yf_ticker
             if fmp_sym and fmp_sym in commodity_prices:
                 factor["current_price"] = commodity_prices[fmp_sym]
                 factor["price_trend"] = commodity_trends.get(fmp_sym, "FLAT")
