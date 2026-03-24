@@ -681,14 +681,21 @@ def news_verification_node(state: Dict) -> Dict:
         # =====================================================================
         
         # Get current sentiment analysis (from Node 5)
-        # Node 5 writes flat keys; also support sentiment_analysis dict if present
+        # Node 5 stores per-stream values in sentiment_breakdown (not sentiment_analysis),
+        # so we must pull them here so they survive into state['sentiment_analysis']
+        # for Node 12 (_score_related_sentiment / _build_signal_vector).
         current_sentiment = state.get('sentiment_analysis')
         if not current_sentiment:
             confidence = state.get('sentiment_confidence', 0.5)
+            breakdown = state.get('sentiment_breakdown') or {}
             current_sentiment = {
                 'confidence': confidence,
                 'signal': state.get('sentiment_signal'),
                 'aggregated_sentiment': state.get('aggregated_sentiment'),
+                # Per-stream scores that Node 12 reads from sentiment_analysis
+                'stock_news_sentiment': (breakdown.get('stock') or {}).get('weighted_sentiment'),
+                'market_news_sentiment': (breakdown.get('market') or {}).get('weighted_sentiment'),
+                'related_news_sentiment': (breakdown.get('related') or {}).get('weighted_sentiment'),
             }
         
         # Get cleaned news (from Node 9A) - state uses cleaned_related_company_news

@@ -30,6 +30,7 @@ class StockAnalysisState(TypedDict):
     # NODE 1: Price Data Fetching
     # ========================================================================
     raw_price_data: Optional[pd.DataFrame]         # OHLCV data (50+ days)
+    spy_daily_prices: Optional[Dict[str, float]]   # SPY close prices keyed by 'YYYY-MM-DD' (for Node 10 return decomposition)
     
     
     # ========================================================================
@@ -174,6 +175,7 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         
         # Initialize all fields
         raw_price_data=None,
+        spy_daily_prices=None,
         stock_news=[],
         market_news=[],
         related_company_news=[],

@@ -223,27 +223,46 @@ def _sentiment_intelligence(state: Dict[str, Any]) -> Dict[str, Any]:
 def _market_context(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Tier 2 — macro / sector context and market correlation.
+
+    Node 6 returns a nested structure; flatten it here for downstream display.
+    Sub-dicts: stock_classification, market_regime, sector_industry_context,
+               macro_factor_exposure, market_correlation_profile, news_sentiment_context.
     """
-    mc_data = state.get("market_context") or {}
-    sc      = state.get("signal_components") or {}
-    ss      = sc.get("stream_scores") or {}
-    mkt_st  = ss.get("market_context") or {}
-    aw      = state.get("adaptive_weights") or {}
+    mc_data   = state.get("market_context") or {}
+    sc        = state.get("signal_components") or {}
+    ss        = sc.get("stream_scores") or {}
+    mkt_st    = ss.get("market_context") or {}
+    aw        = state.get("adaptive_weights") or {}
+
+    # Node 6 nested sub-dicts
+    stk_cls   = mc_data.get("stock_classification")    or {}
+    regime    = mc_data.get("market_regime")            or {}
+    sector_cx = mc_data.get("sector_industry_context")  or {}
+    corr_prof = mc_data.get("market_correlation_profile") or {}
+    news_ctx  = mc_data.get("news_sentiment_context")  or {}
 
     return {
-        "sector":              mc_data.get("sector"),
-        "sector_trend":        mc_data.get("sector_trend"),
-        "market_trend":        mc_data.get("market_trend"),
-        "market_correlation":  mc_data.get("market_correlation"),
+        # Sector / industry (from sector_industry_context + stock_classification)
+        "sector":              stk_cls.get("sector"),
+        "sector_trend":        sector_cx.get("sector_trend"),
+        "sector_return":       sector_cx.get("sector_return_5d"),
+        "relative_strength":   sector_cx.get("relative_strength_label"),
+        # Market regime (from market_regime)
+        "market_trend":        regime.get("spy_trend_label"),
+        "spy_return":          regime.get("spy_return_5d"),
+        "vix_level":           regime.get("vix_level"),
+        "vix_trend":           regime.get("vix_category"),
+        "regime_label":        regime.get("regime_label"),
+        # Correlation (from market_correlation_profile)
+        "market_correlation":  corr_prof.get("market_correlation"),
+        "beta":                corr_prof.get("beta_calculated"),
+        # Legacy flat keys — kept for backward compatibility with any consumers
+        # that were written before the Node 6 refactor
         "context_signal":      mc_data.get("context_signal"),
         "context_score":       mc_data.get("context_score"),
-        "spy_return":          mc_data.get("spy_return"),
-        "sector_return":       mc_data.get("sector_return"),
-        "vix_level":           mc_data.get("vix_level"),
-        "vix_trend":           mc_data.get("vix_trend"),
         # Stream aggregate
         "stream_raw_score":    mkt_st.get("raw_score"),
-        "stream_weight":       aw.get("market_news_weight"),  # market_context uses market_news_weight
+        "stream_weight":       aw.get("market_news_weight"),
         "stream_weighted_score": mkt_st.get("weighted_score"),
     }
 
@@ -334,6 +353,21 @@ def _model_performance(state: Dict[str, Any]) -> Dict[str, Any]:
         stream = br.get(key) or {}
         return stream.get("recent_accuracy")
 
+    def _stream_ic(key: str) -> Optional[float]:
+        stream = br.get(key) or {}
+        return stream.get("ic_score")
+
+    def _stream_ic_p(key: str) -> Optional[float]:
+        stream = br.get(key) or {}
+        return stream.get("ic_p_value")
+
+    def _stream_ic_sig(key: str) -> Optional[bool]:
+        stream = br.get(key) or {}
+        return stream.get("ic_significant")
+
+    # Use the explicit flag stored by calculate_news_ic — no need to scan daily results
+    market_decomposed: bool = bool((br.get("market_news") or {}).get("ic_used_idiosyncratic"))
+
     return {
         # Normalized weights (sum to 1.0)
         "technical_weight":          aw.get("technical_weight"),
@@ -359,6 +393,20 @@ def _model_performance(state: Dict[str, Any]) -> Dict[str, Any]:
         "market_news_accuracy_recent": _stream_recent("market_news"),
         "related_news_accuracy_full":  _stream_accuracy("related_news"),
         "related_news_accuracy_recent": _stream_recent("related_news"),
+        # Information Coefficient per stream — continuous predictive power measure
+        "technical_ic":              _stream_ic("technical"),
+        "technical_ic_p":            _stream_ic_p("technical"),
+        "technical_ic_significant":  _stream_ic_sig("technical"),
+        "stock_news_ic":             _stream_ic("stock_news"),
+        "stock_news_ic_p":           _stream_ic_p("stock_news"),
+        "stock_news_ic_significant": _stream_ic_sig("stock_news"),
+        "market_news_ic":            _stream_ic("market_news"),
+        "market_news_ic_p":          _stream_ic_p("market_news"),
+        "market_news_ic_significant": _stream_ic_sig("market_news"),
+        "market_news_decomposed":    market_decomposed,
+        "related_news_ic":           _stream_ic("related_news"),
+        "related_news_ic_p":         _stream_ic_p("related_news"),
+        "related_news_ic_significant": _stream_ic_sig("related_news"),
     }
 
 
@@ -670,11 +718,11 @@ def _print_gs_report(data: Dict[str, Any]) -> None:
     mc_d = data["market_context"]
     lines += [
         "  [3] MARKET CONTEXT",
-        f"      Sector: {mc_d.get('sector','N/A')}  |  Trend: {mc_d.get('sector_trend','N/A')}",
-        f"      Market Trend: {mc_d.get('market_trend','N/A')}  |  Correlation: {mc_d.get('market_correlation', 0):.2f}"
+        f"      Sector: {mc_d.get('sector','N/A')}  |  Trend: {mc_d.get('sector_trend','N/A')}  |  Regime: {mc_d.get('regime_label','N/A')}",
+        f"      Market Trend: {mc_d.get('market_trend','N/A')}  |  Correlation: {mc_d.get('market_correlation', 0):.2f}  |  Beta: {_f(mc_d.get('beta'),'.2f')}"
         if mc_d.get("market_correlation") is not None else
         "      Market Trend: N/A  |  Correlation: N/A",
-        f"      Context Signal: {mc_d.get('context_signal','N/A')}",
+        f"      VIX: {_f(mc_d.get('vix_level'),'.2f')} ({mc_d.get('vix_trend','N/A')})  |  Relative Strength: {mc_d.get('relative_strength','N/A')}",
         "",
     ]
 
@@ -728,13 +776,26 @@ def _print_gs_report(data: Dict[str, Any]) -> None:
         v = mp.get(key)
         return f"{v*100:.1f}%" if v is not None else "N/A"
 
+    def _ic(ic_key: str, p_key: str) -> str:
+        ic_val = mp.get(ic_key)
+        ic_p   = mp.get(p_key)
+        if ic_val is None:
+            return "N/A"
+        sig_flag = " *" if (ic_p is not None and ic_p < 0.05) else ""
+        return f"{ic_val:+.3f}{sig_flag} (p={_f(ic_p, '.3f')})"
+
+    mkt_decomp = "decomposed" if mp.get("market_news_decomposed") else "raw return"
+
     lines += [
         "  MODEL PERFORMANCE (180-day backtest, Bayesian-smoothed)",
         SEP2,
-        f"  Technical:   weight {_wt('technical_weight')}  |  accuracy full: {_acc('technical_accuracy_full')}  recent: {_acc('technical_accuracy_recent')}",
-        f"  Stock News:  weight {_wt('stock_news_weight')}  |  accuracy full: {_acc('stock_news_accuracy_full')}  recent: {_acc('stock_news_accuracy_recent')}",
-        f"  Market News: weight {_wt('market_news_weight')}  |  accuracy full: {_acc('market_news_accuracy_full')}  recent: {_acc('market_news_accuracy_recent')}",
-        f"  Related:     weight {_wt('related_news_weight')}  |  accuracy full: {_acc('related_news_accuracy_full')}  recent: {_acc('related_news_accuracy_recent')}",
+        f"  {'Stream':<14}  {'Weight':>8}  {'Full acc':>10}  {'Recent':>10}  {'IC Score':>20}",
+        f"  {'-'*14}  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*20}",
+        f"  {'Technical':<14}  {_wt('technical_weight'):>8}  {_acc('technical_accuracy_full'):>10}  {_acc('technical_accuracy_recent'):>10}  {_ic('technical_ic','technical_ic_p'):>20}",
+        f"  {'Stock news':<14}  {_wt('stock_news_weight'):>8}  {_acc('stock_news_accuracy_full'):>10}  {_acc('stock_news_accuracy_recent'):>10}  {_ic('stock_news_ic','stock_news_ic_p'):>20}",
+        f"  {'Market news':<14}  {_wt('market_news_weight'):>8}  {_acc('market_news_accuracy_full'):>10}  {_acc('market_news_accuracy_recent'):>10}  {_ic('market_news_ic','market_news_ic_p'):>20}  [{mkt_decomp}]",
+        f"  {'Related':<14}  {_wt('related_news_weight'):>8}  {_acc('related_news_accuracy_full'):>10}  {_acc('related_news_accuracy_recent'):>10}  {_ic('related_news_ic','related_news_ic_p'):>20}",
+        f"  (* IC significant at p<0.05)",
         f"  Streams Reliable: {mp.get('streams_reliable',0)}/4  |  Equal-weight Fallback: {mp.get('fallback_equal_weights',False)}",
         f"  News Learning Adj.: {_f(ni.get('learning_adjustment',1.0),'.3f')}  |  Hist. Correlation: {_f(ni.get('historical_correlation'),'.3f')}",
         "",

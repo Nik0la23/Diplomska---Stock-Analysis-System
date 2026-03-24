@@ -495,7 +495,7 @@ def _compute_trustworthiness(
         (score, breakdown_dict)
     """
     PRIOR: float = 0.55
-    MIN_SAMPLES_FOR_RELIABILITY: int = 30
+    MIN_SAMPLES_FOR_RELIABILITY: int = 10
 
     # --- Component 1: stream reliability ---
     def _hit_rate(key: str) -> Tuple[float, bool]:
@@ -519,7 +519,18 @@ def _compute_trustworthiness(
         + market_hr  * w_market
         + related_hr * w_related
     )
-    using_prior: bool = any([tech_prior, sent_prior, market_prior, related_prior])
+    # Only count a stream as "using prior" when it actually carries weight.
+    # Neutralised/anti-predictive streams have None hit_rate (prior=True) but
+    # weight=0 — they don't influence the signal, so they must not hide the
+    # real backtested accuracy of the streams that do contribute.
+    _WEIGHT_THRESHOLD = 0.01
+    weighted_prior_exposure = (
+        (tech_prior    * w_tech)    +
+        (sent_prior    * w_sent)    +
+        (market_prior  * w_market)  +
+        (related_prior * w_related)
+    )
+    using_prior: bool = weighted_prior_exposure > 0.30  # 30% threshold for "using prior"
 
     # --- Component 2: stream agreement ---
     agreement_count = sum(
@@ -1278,12 +1289,60 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
             return state
 
         # ==================================================================
-        # JOB 1 — STEP 4: Weighted contributions and final score
+        # JOB 1 — STEP 4: Redistribute missing-stream weights, then score
         # ==================================================================
-        tech_contrib    = tech_score    * w_tech
-        sent_contrib    = sent_score    * w_sent
-        mkt_contrib     = mkt_score     * w_market
-        related_contrib = related_score * w_related
+        # A stream marked missing has no data this run (0 articles / no node
+        # output). Its Node-11 weight is dead weight at score=0.  Re-normalise
+        # across the streams that DO have data so signal capacity is preserved.
+        # Anti-predictive streams that earned 0.0 weight are NOT redistributed
+        # — they are correctly zero regardless of whether data is present.
+        _raw_weights: Dict[str, float] = {
+            "technical":    w_tech,
+            "sentiment":    w_sent,
+            "market":       w_market,
+            "related_news": w_related,
+        }
+        _scores: Dict[str, float] = {
+            "technical":    tech_score,
+            "sentiment":    sent_score,
+            "market":       mkt_score,
+            "related_news": related_score,
+        }
+        _missing_set = set(streams_missing)  # streams with no data this run
+
+        # Sum weights of streams that have data (or have an earned 0-weight).
+        # Missing streams contribute their weight to be redistributed.
+        _present_weight_sum = sum(
+            w for key, w in _raw_weights.items() if key not in _missing_set
+        )
+
+        if 0.0 < _present_weight_sum < 1.0 - 1e-6:
+            # At least one stream is missing and at least one is present.
+            _scale = 1.0 / _present_weight_sum
+            _eff_weights: Dict[str, float] = {
+                key: (w * _scale if key not in _missing_set else 0.0)
+                for key, w in _raw_weights.items()
+            }
+            logger.info(
+                f"  Weight redistribution (missing={sorted(_missing_set)}): "
+                + ", ".join(
+                    f"{k}:{_raw_weights[k]:.3f}→{_eff_weights[k]:.3f}"
+                    for k in _raw_weights
+                    if abs(_eff_weights[k] - _raw_weights[k]) > 0.001
+                )
+            )
+        else:
+            _eff_weights = _raw_weights  # nothing to redistribute
+
+        ew_tech    = _eff_weights["technical"]
+        ew_sent    = _eff_weights["sentiment"]
+        ew_market  = _eff_weights["market"]
+        ew_related = _eff_weights["related_news"]
+
+        tech_contrib    = tech_score    * ew_tech
+        sent_contrib    = sent_score    * ew_sent
+        mkt_contrib     = mkt_score     * ew_market
+        related_contrib = related_score * ew_related
 
         final_score: float = tech_contrib + sent_contrib + mkt_contrib + related_contrib
         final_signal: str     = _classify_signal(final_score, threshold=signal_threshold)
@@ -1303,13 +1362,13 @@ def signal_generation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # ==================================================================
-        # JOB 1 — STEP 5: Stream scores breakdown
+        # JOB 1 — STEP 5: Stream scores breakdown (use effective weights)
         # ==================================================================
         stream_scores: Dict[str, Dict[str, float]] = {
-            "technical":    {"raw_score": tech_score,    "weight": w_tech,    "contribution": tech_contrib},
-            "sentiment":    {"raw_score": sent_score,    "weight": w_sent,    "contribution": sent_contrib},
-            "market":       {"raw_score": mkt_score,     "weight": w_market,  "contribution": mkt_contrib},
-            "related_news": {"raw_score": related_score, "weight": w_related, "contribution": related_contrib},
+            "technical":    {"raw_score": tech_score,    "weight": ew_tech,    "contribution": tech_contrib},
+            "sentiment":    {"raw_score": sent_score,    "weight": ew_sent,    "contribution": sent_contrib},
+            "market":       {"raw_score": mkt_score,     "weight": ew_market,  "contribution": mkt_contrib},
+            "related_news": {"raw_score": related_score, "weight": ew_related, "contribution": related_contrib},
         }
 
         signal_agreement: int = _count_signal_agreement(stream_scores, final_signal)

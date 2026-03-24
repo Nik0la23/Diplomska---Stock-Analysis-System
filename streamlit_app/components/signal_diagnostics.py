@@ -99,13 +99,44 @@ def render_signal_diagnostics(diag: Dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    def _stream_row(name: str, data_pts: str, metrics: Optional[Dict[str, Any]]) -> str:
+    def _ic_cell(metrics: Optional[Dict[str, Any]], note: str = "") -> str:
+        """Render the IC score cell with colour coding and p-value tooltip."""
+        if metrics is None:
+            return '<td style="color:#aaa;font-size:12px;padding:5px 8px">—</td>'
+        ic  = metrics.get("ic_score")
+        ic_p = metrics.get("ic_p_value")
+        sig  = metrics.get("ic_significant", False)
+        if ic is None:
+            return '<td style="color:#aaa;font-size:12px;padding:5px 8px">N/A</td>'
+        if sig:
+            color = "#065f46" if ic > 0 else "#991b1b"
+            star  = " ✦"
+        else:
+            color = "#92400e" if abs(ic) > 0.03 else "#999"
+            star  = ""
+        p_str = f" p={ic_p:.3f}" if ic_p is not None else ""
+        note_html = (
+            f'<span style="font-size:10px;color:#aaa;margin-left:3px">{note}</span>'
+            if note else ""
+        )
+        return (
+            f'<td style="font-family:\'DM Mono\',monospace;font-size:12px;'
+            f'color:{color};padding:5px 8px" title="IC={ic:+.4f}{p_str}">'
+            f'{ic:+.3f}{star}{note_html}</td>'
+        )
+
+    def _stream_row(
+        name: str,
+        data_pts: str,
+        metrics: Optional[Dict[str, Any]],
+        ic_note: str = "",
+    ) -> str:
         if metrics is None:
             return (
                 f"<tr>"
                 f'<td style="color:#333;font-size:12px">{name}</td>'
                 f'<td style="color:#aaa;font-size:12px">{data_pts}</td>'
-                f'<td colspan="5" style="color:#aaa;font-size:12px">—</td>'
+                f'<td colspan="6" style="color:#aaa;font-size:12px">—</td>'
                 f'<td>{_badge("No data", "red")}</td>'
                 f"</tr>"
             )
@@ -137,16 +168,22 @@ def render_signal_diagnostics(diag: Dict[str, Any]) -> None:
             f'<td style="font-family:\'DM Mono\',monospace;font-size:12px;color:#991b1b;padding:5px 8px">{sells}</td>'
             f'<td style="font-family:\'DM Mono\',monospace;font-size:12px;color:#92400e;padding:5px 8px">{holds}</td>'
             f'<td style="font-family:\'DM Mono\',monospace;font-size:12px;padding:5px 8px">{sigs}</td>'
+            + _ic_cell(metrics, ic_note) +
             f'<td style="padding:5px 8px">{badge}</td>'
             f"</tr>"
         )
 
+    # Use the explicit ic_used_idiosyncratic flag stored by calculate_news_ic
+    market_metrics_raw = br.get("market_news") or {}
+    market_ic_note = "idiosyn." if market_metrics_raw.get("ic_used_idiosyncratic") else "raw ret"
+
     rows_html = "".join([
-        _stream_row("Technical",   f"{price_rows} price rows",      br.get("technical")),
-        _stream_row("Stock news",  f"{stock_articles} articles",     br.get("stock_news")),
-        _stream_row("Market news", f"{market_articles} articles",    br.get("market_news")),
-        _stream_row("Related news",f"{related_articles} articles",   br.get("related_news")),
-        _stream_row("Combined",    "all 4 streams",                  br.get("combined_stream")),
+        _stream_row("Technical",    f"{price_rows} price rows",   br.get("technical")),
+        _stream_row("Stock news",   f"{stock_articles} articles",  br.get("stock_news")),
+        _stream_row("Market news",  f"{market_articles} articles", br.get("market_news"),
+                    ic_note=market_ic_note),
+        _stream_row("Related news", f"{related_articles} articles",br.get("related_news")),
+        _stream_row("Combined",     "all 4 streams",               br.get("combined_stream")),
     ])
 
     st.markdown(f"""
@@ -155,11 +192,18 @@ def render_signal_diagnostics(diag: Dict[str, Any]) -> None:
             <tr>
                 <th>Stream</th><th>Input</th><th>Days eval.</th>
                 <th>BUY</th><th>SELL</th><th>HOLD</th>
-                <th>Directional</th><th>Status</th>
+                <th>Directional</th>
+                <th title="Information Coefficient — Pearson correlation between score and 7d return. ✦ = p&lt;0.05">IC score</th>
+                <th>Status</th>
             </tr>
         </thead>
         <tbody>{rows_html}</tbody>
-    </table>""", unsafe_allow_html=True)
+    </table>
+    <div style="font-size:10px;color:#aaa;margin-top:4px">
+      IC score: Pearson correlation between stream score and 7-day return
+      (✦ = significant at p&lt;0.05 · ≥10 samples required).
+      Market news IC uses idiosyncratic return when SPY history is available.
+    </div>""", unsafe_allow_html=True)
 
     # ------------------------------------------------------------------ #
     # Issues summary                                                       #

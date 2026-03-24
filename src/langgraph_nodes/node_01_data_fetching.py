@@ -34,6 +34,51 @@ PRICE_OVERLAP_DAYS = 3
 
 
 # ============================================================================
+# HELPER FUNCTION: Fetch SPY history for return decomposition
+# ============================================================================
+
+def fetch_spy_history(days: int = 200) -> Optional[Dict[str, float]]:
+    """
+    Fetch SPY daily close prices as a date-keyed dict for return decomposition.
+
+    200 days covers the 180-day backtest window with a ~20-day buffer for
+    weekends and holidays. Stored in state as spy_daily_prices and consumed
+    by Node 10's market news backtest.
+
+    Returns:
+        Dict mapping 'YYYY-MM-DD' → float(close_price), or None on failure.
+    """
+    try:
+        logger.info(f"Fetching SPY history ({days} days) for return decomposition...")
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days + 10)
+
+        spy_obj = yf.Ticker("SPY")
+        df = spy_obj.history(
+            start=start_date.strftime('%Y-%m-%d'),
+            end=end_date.strftime('%Y-%m-%d'),
+            auto_adjust=True,
+        )
+
+        if df.empty:
+            logger.warning("SPY history: No data returned from yfinance")
+            return None
+
+        df = df.reset_index()
+        result: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            date_key = str(pd.to_datetime(row['Date']).date())
+            result[date_key] = float(row['Close'])
+
+        logger.info(f"SPY history: {len(result)} trading days fetched")
+        return result
+
+    except Exception as e:
+        logger.error(f"SPY history fetch failed: {e}")
+        return None
+
+
+# ============================================================================
 # HELPER FUNCTION: Fetch from yfinance (Primary)
 # ============================================================================
 
@@ -235,9 +280,16 @@ def fetch_price_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     start_time = datetime.now()
     ticker = state['ticker']
-    
+    state['spy_daily_prices'] = None  # default; populated below inside try block
+
     try:
         logger.info(f"Node 1: Starting price data fetch for {ticker}")
+
+        # Fetch SPY history for return decomposition in Node 10.
+        # Non-critical: None disables market-news decomposition gracefully.
+        # Placed inside the try block so any unexpected error is caught and
+        # logged rather than crashing Node 1 before the ticker data is fetched.
+        state['spy_daily_prices'] = fetch_spy_history()
         
         # ====================================================================
         # STEP 1: Same-day cache (hybrid) — avoid API if we have fresh data

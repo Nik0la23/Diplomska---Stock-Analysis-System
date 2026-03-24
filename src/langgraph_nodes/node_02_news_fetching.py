@@ -6,7 +6,12 @@ Data Sources (6-month historical window):
 1. Alpha Vantage (Primary - stock, related-company, and market/global news + built-in sentiment)
    - Stock news: target ticker
    - Related-company news: peers from Node 3 (Finnhub)
-   - Market/global news: financial_markets topic
+   - Market/global news: two complementary strategies
+       Strategy 1: topics=financial_markets,economy_macro,economy_fiscal (broad, no ticker filter)
+       Strategy 2: tickers=TICKER + same topics (macro articles mentioning the target ticker)
+     Strategy 2 is the key addition: its articles share publication dates with stock news,
+     so price_change_7day is already resolved — converting market news from ~10 sparse dates
+     to 50-80 usable dates without any state schema changes.
 
 Runs AFTER: Node 1 (price data), Node 3 (related companies)
 Runs BEFORE: Node 5 (sentiment), Node 6 (market context)
@@ -48,6 +53,12 @@ NEWS_OVERLAP_DAYS = 3
 # 6 months / 30 days = 6 calls per stream (stock, market, related each make 6 calls).
 _AV_WINDOW_DAYS = 30
 
+# Topics used for market news — both strategies use the same base set.
+# earnings is added for Strategy 2 (ticker-filtered) to capture macro context
+# around earnings seasons which are high-sentiment dates.
+_MARKET_TOPICS_BROAD  = "financial_markets,economy_macro,economy_fiscal"
+_MARKET_TOPICS_TICKER = "financial_markets,economy_macro,economy_fiscal,earnings"
+
 
 def _parse_av_timestamp(time_str: str) -> int:
     """Parse Alpha Vantage time_published string to Unix timestamp."""
@@ -69,14 +80,14 @@ async def _av_window_fetch(
 ) -> List[Dict[str, Any]]:
     """
     Fetch Alpha Vantage NEWS_SENTIMENT by slicing the date range into fixed
-    monthly windows and making one API call per window (sort=RELEVANCE).
+    monthly windows and making one API call per window (sort=LATEST).
 
     Strategy
     --------
     - Divide [from_date, to_date] into N windows of `window_days` each.
     - For a 6-month window with window_days=30 this is exactly 6 calls.
-    - Each call uses sort=RELEVANCE so the 1 000-article limit returns the
-      most important articles from that period rather than an arbitrary cut-off.
+    - Each call uses sort=LATEST so articles are returned in chronological
+      order within each window, giving genuine historical distribution.
     - Duplicates across windows are removed by URL.
 
     Returns the raw feed items (not yet parsed into our article format).
@@ -85,7 +96,7 @@ async def _av_window_fetch(
         logger.warning(f"Alpha Vantage API key not configured ({label})")
         return []
 
-    effective_to = to_date if to_date is not None else datetime.now()
+    effective_to   = to_date   if to_date   is not None else datetime.now()
     effective_from = from_date if from_date is not None else (effective_to - timedelta(days=180))
 
     # Build windows from newest to oldest so logs read naturally
@@ -104,11 +115,11 @@ async def _av_window_fetch(
         params = {
             **base_params,
             "function": "NEWS_SENTIMENT",
-            "apikey": ALPHA_VANTAGE_API_KEY,
-            "limit": 1000,
-            "sort": "RELEVANCE",
+            "apikey":   ALPHA_VANTAGE_API_KEY,
+            "limit":    1000,
+            "sort":     "LATEST",
             "time_from": win_from.strftime("%Y%m%dT%H%M"),
-            "time_to": win_to.strftime("%Y%m%dT%H%M"),
+            "time_to":   win_to.strftime("%Y%m%dT%H%M"),
         }
 
         logger.info(
@@ -170,8 +181,8 @@ async def fetch_alpha_vantage_news_async(
     """
     Fetch ticker-specific stock news + sentiment from Alpha Vantage (paginated).
 
-    Walks backwards through the full 6-month window by repeating the 1 000-article
-    call with a sliding time_to until from_date is reached.
+    Walks backwards through the full 6-month window using 30-day windows with
+    sort=LATEST to return genuine historical coverage per window.
     """
     raw_items = await _av_window_fetch(
         session=session,
@@ -192,17 +203,17 @@ async def fetch_alpha_vantage_news_async(
                 break
 
         articles.append({
-            "headline": item.get("title", ""),
-            "summary": item.get("summary", ""),
-            "source": item.get("source", ""),
-            "url": item.get("url", ""),
-            "datetime": item["_ts"],
-            "image": item.get("banner_image", ""),
-            "news_type": "stock",
+            "headline":                item.get("title", ""),
+            "summary":                 item.get("summary", ""),
+            "source":                  item.get("source", ""),
+            "url":                     item.get("url", ""),
+            "datetime":                item["_ts"],
+            "image":                   item.get("banner_image", ""),
+            "news_type":               "stock",
             "overall_sentiment_score": item.get("overall_sentiment_score", 0.0),
             "overall_sentiment_label": item.get("overall_sentiment_label", "Neutral"),
-            "ticker_sentiment_score": ticker_sentiment,
-            "ticker_relevance_score": ticker_relevance,
+            "ticker_sentiment_score":  ticker_sentiment,
+            "ticker_relevance_score":  ticker_relevance,
         })
 
     logger.info(f"Alpha Vantage: {len(articles)} stock news articles for {ticker}")
@@ -211,39 +222,94 @@ async def fetch_alpha_vantage_news_async(
 
 async def fetch_alpha_vantage_market_news_async(
     session: aiohttp.ClientSession,
+    ticker: str,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
-    topics: str = "financial_markets",
 ) -> List[Dict[str, Any]]:
     """
-    Fetch broad market / global news from Alpha Vantage (paginated).
+    Fetch market-context news using two complementary strategies, both stored
+    as news_type='market' — no state schema changes required.
 
-    Uses the topics filter (e.g. 'financial_markets') to capture macro stories.
-    Paginates through the full 6-month window.
+    Strategy 1 — broad topics, no ticker filter:
+        topics=financial_markets,economy_macro,economy_fiscal
+        Returns macro news regardless of ticker mentions. Provides pure market
+        context (Fed decisions, GDP, inflation) but produces few unique publication
+        dates because AV's topic-only feed returns recent articles even for
+        historical windows.
+
+    Strategy 2 — same topics, filtered to target ticker:
+        tickers=TICKER + topics=financial_markets,economy_macro,economy_fiscal,earnings
+        Returns macro articles that explicitly mention the target ticker — e.g.
+        Fed rate articles framed around AAPL's valuation, inflation pieces
+        discussing tech sector impact. These share publication dates with stock
+        news, so price_change_7day is already resolved for them in the DB.
+        This converts market news from ~10 sparse pipeline-run dates to 50-80
+        dates aligned with existing stock news coverage.
+
+    Both strategies run concurrently. Results are deduplicated by URL before
+    being returned as a single list with news_type='market'.
+
+    Args:
+        session:   Shared aiohttp ClientSession.
+        ticker:    Target ticker (e.g. 'AAPL') — used for Strategy 2.
+        from_date: Start of fetch window.
+        to_date:   End of fetch window.
+
+    Returns:
+        Combined deduplicated list of market news article dicts.
+        All articles have news_type='market' — identical schema to before.
     """
-    raw_items = await _av_window_fetch(
-        session=session,
-        base_params={"topics": topics},
-        from_date=from_date,
-        to_date=to_date,
-        label=f"market:{topics}",
+    # Run both strategies concurrently — no extra wall-clock time vs single fetch
+    raw_broad, raw_ticker_macro = await asyncio.gather(
+        # Strategy 1: broad market topics, no ticker filter
+        _av_window_fetch(
+            session=session,
+            base_params={"topics": _MARKET_TOPICS_BROAD},
+            from_date=from_date,
+            to_date=to_date,
+            label="market:broad",
+        ),
+        # Strategy 2: same macro topics filtered to articles mentioning ticker
+        _av_window_fetch(
+            session=session,
+            base_params={
+                "tickers": ticker,
+                "topics":  _MARKET_TOPICS_TICKER,
+            },
+            from_date=from_date,
+            to_date=to_date,
+            label=f"market:ticker_macro:{ticker}",
+        ),
     )
 
+    seen_urls: set = set()
     articles: List[Dict[str, Any]] = []
-    for item in raw_items:
+
+    for item in raw_broad + raw_ticker_macro:
+        item_url = item.get("url", "")
+        if item_url and item_url in seen_urls:
+            continue
+        if item_url:
+            seen_urls.add(item_url)
+
         articles.append({
-            "headline": item.get("title", ""),
-            "summary": item.get("summary", ""),
-            "source": item.get("source", ""),
-            "url": item.get("url", ""),
-            "datetime": item["_ts"],
-            "image": item.get("banner_image", ""),
-            "news_type": "market",
+            "headline":                item.get("title", ""),
+            "summary":                 item.get("summary", ""),
+            "source":                  item.get("source", ""),
+            "url":                     item_url,
+            "datetime":                item["_ts"],
+            "image":                   item.get("banner_image", ""),
+            "news_type":               "market",
             "overall_sentiment_score": item.get("overall_sentiment_score", 0.0),
             "overall_sentiment_label": item.get("overall_sentiment_label", "Neutral"),
         })
 
-    logger.info(f"Alpha Vantage: {len(articles)} market/global news articles")
+    dupes = len(raw_broad) + len(raw_ticker_macro) - len(articles)
+    logger.info(
+        f"Alpha Vantage: {len(articles)} market news articles "
+        f"({len(raw_broad)} broad + {len(raw_ticker_macro)} ticker-macro "
+        f"for {ticker}, {dupes} dupes removed)"
+    )
     return articles
 
 
@@ -257,7 +323,7 @@ async def fetch_alpha_vantage_related_company_news_async(
     """
     Fetch top N most relevant articles for each peer concurrently.
 
-    One API call per peer (sort=RELEVANCE, limit=per_peer_limit) over the full
+    One API call per peer (sort=LATEST, limit=per_peer_limit) over the full
     6-month window.  Passing all tickers comma-separated to AV returns 0 results;
     individual calls per ticker work reliably.
 
@@ -275,10 +341,10 @@ async def fetch_alpha_vantage_related_company_news_async(
     async def _fetch_one(peer: str) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {
             "function": "NEWS_SENTIMENT",
-            "tickers": peer.upper(),
-            "apikey": ALPHA_VANTAGE_API_KEY,
-            "limit": per_peer_limit,
-            "sort": "RELEVANCE",
+            "tickers":  peer.upper(),
+            "apikey":   ALPHA_VANTAGE_API_KEY,
+            "limit":    per_peer_limit,
+            "sort":     "LATEST",
         }
         if from_date is not None:
             params["time_from"] = from_date.strftime("%Y%m%dT%H%M")
@@ -305,14 +371,14 @@ async def fetch_alpha_vantage_related_company_news_async(
         for item in feed:
             ts = _parse_av_timestamp(item.get("time_published", ""))
             peer_articles.append({
-                "headline": item.get("title", ""),
-                "summary": item.get("summary", ""),
-                "source": item.get("source", ""),
-                "url": item.get("url", ""),
-                "datetime": ts,
-                "image": item.get("banner_image", ""),
-                "news_type": "related",
-                "related_ticker": peer.upper(),
+                "headline":                item.get("title", ""),
+                "summary":                 item.get("summary", ""),
+                "source":                  item.get("source", ""),
+                "url":                     item.get("url", ""),
+                "datetime":                ts,
+                "image":                   item.get("banner_image", ""),
+                "news_type":               "related",
+                "related_ticker":          peer.upper(),
                 "overall_sentiment_score": item.get("overall_sentiment_score", 0.0),
                 "overall_sentiment_label": item.get("overall_sentiment_label", "Neutral"),
             })
@@ -355,7 +421,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
     1. Check cache for recent news (< 6 hours)
     2. If cached, return cached news
     3. Fetch stock news from Alpha Vantage (ticker-specific, with sentiment)
-    4. Fetch market/global news from Alpha Vantage (topics-based)
+    4. Fetch market/global news from Alpha Vantage (dual-strategy: broad + ticker-macro)
     5. Fetch related-company news from Alpha Vantage using peers from Node 3
     6. Cache results for future use
     7. Update state with all news articles
@@ -364,7 +430,8 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         state: LangGraph state containing 'ticker' and optionally 'raw_price_data'
         
     Returns:
-        Updated state with 'stock_news', 'market_news', and 'related_company_news' populated
+        Updated state with 'stock_news', 'market_news', and 'related_company_news' populated.
+        No new state fields — market_news contains the combined dual-strategy results.
     """
     start_time = datetime.now()
     ticker = state['ticker']
@@ -383,29 +450,28 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # ====================================================================
         # STEP 1: Same-day cache (hybrid) — avoid API if we have fresh data
         # ====================================================================
-        cached_stock_news = get_cached_news(ticker, 'stock', max_age_hours=NEWS_CACHE_HOURS)
+        cached_stock_news  = get_cached_news(ticker, 'stock',  max_age_hours=NEWS_CACHE_HOURS)
         cached_market_news = get_cached_news(ticker, 'market', max_age_hours=NEWS_CACHE_HOURS)
-        has_cached_stock = cached_stock_news is not None and len(cached_stock_news) > 0
+        has_cached_stock  = cached_stock_news  is not None and len(cached_stock_news)  > 0
         has_cached_market = cached_market_news is not None and len(cached_market_news) > 0
         
         if has_cached_stock and has_cached_market:
             logger.info(f"Node 2: Using cached news for {ticker}")
-            state['stock_news'] = cached_stock_news
-            state['market_news'] = cached_market_news
+            state['stock_news']          = cached_stock_news
+            state['market_news']         = cached_market_news
             state['related_company_news'] = []
-            # Read stored velocity baseline (no DB scan needed — TTL-cached)
             from src.database.db_manager import get_ticker_stats
             _cached_stats = get_ticker_stats(ticker)
             state['news_fetch_metadata'] = {
-                'from_date': None,
-                'to_date': to_date.isoformat(),
-                'fetch_window_days': 0,
-                'newly_fetched_count': 0,  # No new articles - cache hit
-                'total_in_state': len(cached_stock_news) + len(cached_market_news),
-                'newly_fetched_stock': 0,
+                'from_date':           None,
+                'to_date':             to_date.isoformat(),
+                'fetch_window_days':   0,
+                'newly_fetched_count': 0,
+                'total_in_state':      len(cached_stock_news) + len(cached_market_news),
+                'newly_fetched_stock':  0,
                 'newly_fetched_market': 0,
-                'was_cache_hit': True,
-                'daily_article_avg': _cached_stats['daily_article_avg'] if _cached_stats else None,
+                'was_cache_hit':        True,
+                'daily_article_avg':    _cached_stats['daily_article_avg'] if _cached_stats else None,
             }
             elapsed = (datetime.now() - start_time).total_seconds()
             state['node_execution_times']['node_2'] = elapsed
@@ -419,31 +485,31 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         today = to_date.date() if hasattr(to_date, 'date') else to_date
         
         if latest_news_date is not None:
-            latest_d = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
+            latest_d   = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
             days_since = (today - latest_d).days
             if days_since <= 1:
-                stock_from_db = get_news_for_ticker(ticker, 'stock', days=NEWS_LOOKBACK_DAYS)
+                stock_from_db  = get_news_for_ticker(ticker, 'stock',  days=NEWS_LOOKBACK_DAYS)
                 market_from_db = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
                 if stock_from_db or market_from_db:
                     logger.info(
                         f"Node 2: News current for {ticker}, loaded from DB (no API) — "
                         f"stock: {len(stock_from_db)}, market: {len(market_from_db)}"
                     )
-                    state['stock_news'] = stock_from_db
-                    state['market_news'] = market_from_db
+                    state['stock_news']          = stock_from_db
+                    state['market_news']         = market_from_db
                     state['related_company_news'] = []
                     from src.database.db_manager import get_ticker_stats
                     _db_stats = get_ticker_stats(ticker)
                     state['news_fetch_metadata'] = {
-                        'from_date': None,
-                        'to_date': to_date.isoformat(),
-                        'fetch_window_days': 0,
-                        'newly_fetched_count': 0,  # No new articles - loaded from DB
-                        'total_in_state': len(stock_from_db) + len(market_from_db),
-                        'newly_fetched_stock': 0,
+                        'from_date':           None,
+                        'to_date':             to_date.isoformat(),
+                        'fetch_window_days':   0,
+                        'newly_fetched_count': 0,
+                        'total_in_state':      len(stock_from_db) + len(market_from_db),
+                        'newly_fetched_stock':  0,
                         'newly_fetched_market': 0,
-                        'was_db_load': True,
-                        'daily_article_avg': _db_stats['daily_article_avg'] if _db_stats else None,
+                        'was_db_load':          True,
+                        'daily_article_avg':    _db_stats['daily_article_avg'] if _db_stats else None,
                     }
                     elapsed = (datetime.now() - start_time).total_seconds()
                     state['node_execution_times']['node_2'] = elapsed
@@ -456,59 +522,69 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
             logger.info(f"Node 2: First run for {ticker}, fetching 6-month window")
         else:
-            latest_d = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
+            latest_d  = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
             from_date = (datetime.combine(latest_d, datetime.min.time()) - timedelta(days=NEWS_OVERLAP_DAYS))
-            logger.info(f"Node 2: Incremental fetch for {ticker} from {from_date.date()} (incl. {NEWS_OVERLAP_DAYS}-day overlap)")
+            logger.info(
+                f"Node 2: Incremental fetch for {ticker} from {from_date.date()} "
+                f"(incl. {NEWS_OVERLAP_DAYS}-day overlap)"
+            )
         
-        from_str = from_date.strftime('%Y-%m-%d')
-        to_str = to_date.strftime('%Y-%m-%d')
-        logger.info(f"Node 2: Fetching news from {from_str} to {to_str}")
+        logger.info(
+            f"Node 2: Fetching news from {from_date.strftime('%Y-%m-%d')} "
+            f"to {to_date.strftime('%Y-%m-%d')}"
+        )
         
         # ====================================================================
         # STEP 4: Fetch News from Alpha Vantage (Async Parallel)
+        #
+        # Market news uses dual strategy — ticker is passed so
+        # fetch_alpha_vantage_market_news_async can run both:
+        #   Strategy 1: broad topics (financial_markets, economy_macro, economy_fiscal)
+        #   Strategy 2: same topics filtered to articles mentioning the target ticker
+        # Both strategies return news_type='market' — no state schema changes.
         # ====================================================================
         
         async def fetch_all():
-            """Async wrapper to fetch all news in parallel with date range"""
+            """Async wrapper to fetch all news in parallel with date range."""
             async with aiohttp.ClientSession() as session:
                 tasks = [
-                    # Alpha Vantage: stock news + sentiment (with time_from, time_to)
-                    fetch_alpha_vantage_news_async(ticker, session, from_date, to_date),
-                    # Alpha Vantage: market/global news via topics
-                    fetch_alpha_vantage_market_news_async(session, from_date, to_date),
-                    # Alpha Vantage: related-company news for peers from Node 3
+                    # Stock news: ticker-specific articles
+                    fetch_alpha_vantage_news_async(
+                        ticker, session, from_date, to_date
+                    ),
+                    # Market news: broad topics + ticker-macro (dual strategy)
+                    fetch_alpha_vantage_market_news_async(
+                        session, ticker, from_date, to_date
+                    ),
+                    # Related-company news: one call per peer
                     fetch_alpha_vantage_related_company_news_async(
                         related_companies, session, from_date, to_date
                     ),
                 ]
-                
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                return results
+                return await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Run async tasks
         results = asyncio.run(fetch_all())
         
-        stock_news = results[0] if isinstance(results[0], list) else []
-        market_news = results[1] if isinstance(results[1], list) else []
+        stock_news           = results[0] if isinstance(results[0], list) else []
+        market_news          = results[1] if isinstance(results[1], list) else []
         related_company_news = results[2] if isinstance(results[2], list) else []
         
-        # Track how many articles were newly fetched from APIs (before date filtering)
-        newly_fetched_stock_count = len(stock_news)
-        newly_fetched_market_count = len(market_news)
+        newly_fetched_stock_count   = len(stock_news)
+        newly_fetched_market_count  = len(market_news)
         newly_fetched_related_count = len(related_company_news)
         newly_fetched_total = (
-            newly_fetched_stock_count + newly_fetched_market_count + newly_fetched_related_count
+            newly_fetched_stock_count
+            + newly_fetched_market_count
+            + newly_fetched_related_count
         )
         logger.info(
             f"Node 2: Newly fetched from Alpha Vantage: {newly_fetched_total} articles "
             f"({newly_fetched_stock_count} stock + {newly_fetched_market_count} market "
-            f"+ {newly_fetched_related_count} related)"
+            f"[dual-strategy] + {newly_fetched_related_count} related)"
         )
 
         # ====================================================================
-        # AV DOWN FALLBACK: if all three AV calls returned nothing, load
-        # whatever is cached in DB (may be stale) so downstream nodes have
-        # something to work with instead of producing a zero-data HOLD signal.
+        # AV DOWN FALLBACK
         # ====================================================================
         _av_down_fallback = False
         if newly_fetched_total == 0:
@@ -516,10 +592,10 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             _db_market  = get_news_for_ticker(ticker, "market",  days=NEWS_LOOKBACK_DAYS)
             _db_related = get_news_for_ticker(ticker, "related", days=NEWS_LOOKBACK_DAYS)
             if _db_stock or _db_market or _db_related:
-                stock_news            = _db_stock
-                market_news           = _db_market
-                related_company_news  = _db_related
-                _av_down_fallback     = True
+                stock_news           = _db_stock
+                market_news          = _db_market
+                related_company_news = _db_related
+                _av_down_fallback    = True
                 logger.warning(
                     f"Node 2: AV returned 0 articles — using stale DB data as fallback "
                     f"(stock:{len(stock_news)}, market:{len(market_news)}, "
@@ -535,24 +611,19 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # Filter by Date Range
         # ====================================================================
         from_timestamp = int(from_date.timestamp())
-        to_timestamp = int(to_date.timestamp())
+        to_timestamp   = int(to_date.timestamp())
         
         stock_news = [
-            article
-            for article in stock_news
-            if from_timestamp <= article.get("datetime", 0) <= to_timestamp
+            a for a in stock_news
+            if from_timestamp <= a.get("datetime", 0) <= to_timestamp
         ]
-        
         market_news = [
-            article
-            for article in market_news
-            if from_timestamp <= article.get("datetime", 0) <= to_timestamp
+            a for a in market_news
+            if from_timestamp <= a.get("datetime", 0) <= to_timestamp
         ]
-        
         related_company_news = [
-            article
-            for article in related_company_news
-            if from_timestamp <= article.get("datetime", 0) <= to_timestamp
+            a for a in related_company_news
+            if from_timestamp <= a.get("datetime", 0) <= to_timestamp
         ]
         
         # ====================================================================
@@ -573,13 +644,11 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Node 2: Failed to cache news: {str(e)}")
         
-        # After incremental fetch, load full 6 months from DB for state
+        # After incremental fetch, reload full 6 months from DB for state
         if latest_news_date is not None and (to_date - from_date).days < (NEWS_LOOKBACK_DAYS - 10):
-            stock_news = get_news_for_ticker(ticker, "stock", days=NEWS_LOOKBACK_DAYS)
-            market_news = get_news_for_ticker(ticker, "market", days=NEWS_LOOKBACK_DAYS)
-            related_company_news = get_news_for_ticker(
-                ticker, "related", days=NEWS_LOOKBACK_DAYS
-            )
+            stock_news           = get_news_for_ticker(ticker, "stock",   days=NEWS_LOOKBACK_DAYS)
+            market_news          = get_news_for_ticker(ticker, "market",  days=NEWS_LOOKBACK_DAYS)
+            related_company_news = get_news_for_ticker(ticker, "related", days=NEWS_LOOKBACK_DAYS)
             logger.info(
                 "Node 2: Loaded full 6-month series from DB — "
                 f"stock: {len(stock_news)}, market: {len(market_news)}, "
@@ -587,37 +656,39 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         # ====================================================================
-        # Persist velocity baseline (ticker_stats) — live API fetch only.
-        # Cache and DB-load paths skip this; their stats are already fresh.
+        # Persist velocity baseline (ticker_stats)
         # ====================================================================
+        daily_avg = None
         try:
             daily_avg = compute_and_store_ticker_stats(ticker)
             if daily_avg is not None:
-                logger.info(f"Node 2: Velocity baseline stored — {daily_avg:.2f} articles/day for {ticker}")
+                logger.info(
+                    f"Node 2: Velocity baseline stored — "
+                    f"{daily_avg:.2f} articles/day for {ticker}"
+                )
         except Exception as _stats_err:
             logger.warning(f"Node 2: Could not update ticker_stats for {ticker}: {_stats_err}")
 
         # ====================================================================
         # Update State
         # ====================================================================
-        state["stock_news"] = stock_news
-        state["market_news"] = market_news
+        state["stock_news"]           = stock_news
+        state["market_news"]          = market_news
         state["related_company_news"] = related_company_news
 
-        # Add metadata about this fetch for Node 9B velocity detection
         fetch_window_days = max(1, (to_date - from_date).days + 1)
         state["news_fetch_metadata"] = {
-            "from_date": from_date.isoformat(),
-            "to_date": to_date.isoformat(),
-            "fetch_window_days": fetch_window_days,
-            "newly_fetched_count": newly_fetched_total,
-            "total_in_state": len(stock_news) + len(market_news) + len(related_company_news),
-            "newly_fetched_stock": newly_fetched_stock_count,
-            "newly_fetched_market": newly_fetched_market_count,
-            "newly_fetched_related": newly_fetched_related_count,
-            "was_incremental_fetch": latest_news_date is not None,
-            "was_av_down_fallback": _av_down_fallback,
-            "daily_article_avg": daily_avg,
+            "from_date":              from_date.isoformat(),
+            "to_date":                to_date.isoformat(),
+            "fetch_window_days":      fetch_window_days,
+            "newly_fetched_count":    newly_fetched_total,
+            "total_in_state":         len(stock_news) + len(market_news) + len(related_company_news),
+            "newly_fetched_stock":    newly_fetched_stock_count,
+            "newly_fetched_market":   newly_fetched_market_count,
+            "newly_fetched_related":  newly_fetched_related_count,
+            "was_incremental_fetch":  latest_news_date is not None,
+            "was_av_down_fallback":   _av_down_fallback,
+            "daily_article_avg":      daily_avg,
         }
 
         total_articles = len(stock_news) + len(market_news) + len(related_company_news)
@@ -629,17 +700,15 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"(6-month window)"
         )
         logger.info(
-            f"Node 2:   Stock news: {len(stock_news)} (Alpha Vantage ticker-specific, 6-month range)"
+            f"Node 2:   Stock news:   {len(stock_news)} (ticker-specific)"
         )
         logger.info(
-            f"Node 2:   Market/global news: {len(market_news)} (Alpha Vantage topics-based)"
+            f"Node 2:   Market news:  {len(market_news)} "
+            f"(broad topics + ticker-macro dual-strategy)"
         )
         logger.info(
-            f"Node 2:   Related-company news: {len(related_company_news)} "
-            f"(Alpha Vantage peers from Node 3)"
-        )
-        logger.info(
-            f"Node 2:   Newly fetched: {newly_fetched_total} articles over {fetch_window_days} days"
+            f"Node 2:   Related news: {len(related_company_news)} "
+            f"(peers from Node 3)"
         )
         
         return state
@@ -650,8 +719,8 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         traceback.print_exc()
         
         state['errors'].append(f"Node 2: {str(e)}")
-        state['stock_news'] = []
-        state['market_news'] = []
+        state['stock_news']           = []
+        state['market_news']          = []
         state['related_company_news'] = []
         
         elapsed = (datetime.now() - start_time).total_seconds()

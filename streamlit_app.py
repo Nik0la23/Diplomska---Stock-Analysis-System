@@ -771,6 +771,7 @@ def main():
     macro= dd.get("macro_factors")        or {}
     diag = dd.get("diagnostics")          or {}
     tw   = dd.get("trustworthiness")      or {}
+    mp   = dd.get("model_performance")    or {}
 
     ticker        = es.get("ticker") or ticker_input
     final_signal  = es.get("recommendation", "HOLD")
@@ -1074,6 +1075,50 @@ def main():
             Agreement   <span style="font-family:'DM Mono';color:#333">{agr:.0%}</span>
             &nbsp;·&nbsp;
             Pattern     <span style="font-family:'DM Mono';color:#333">{pat:.0%}</span>
+        </div>""", unsafe_allow_html=True)
+
+        # ── IC Scores table ───────────────────────────────────────────────
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("**Information Coefficient (IC)**")
+
+        def _ic_row(label: str, ic_key: str, p_key: str, sig_key: str, note: str = "") -> str:
+            ic_val = mp.get(ic_key)
+            ic_p   = mp.get(p_key)
+            ic_sig = mp.get(sig_key)
+            if ic_val is None:
+                val_html = '<span style="color:#aaa">N/A</span>'
+            else:
+                color = ("#065f46" if (ic_sig and ic_val > 0)
+                         else "#991b1b" if (ic_sig and ic_val < 0)
+                         else "#92400e" if abs(ic_val) > 0.03 else "#aaa")
+                star  = " ✦" if ic_sig else ""
+                p_str = f'<span style="color:#aaa;font-size:10px"> p={ic_p:.3f}</span>' if ic_p is not None else ""
+                val_html = (
+                    f'<span style="font-family:\'DM Mono\',monospace;color:{color}">'
+                    f'{ic_val:+.3f}{star}</span>{p_str}'
+                )
+            note_html = f'<span style="font-size:10px;color:#aaa"> {note}</span>' if note else ""
+            return (
+                f'<tr><td style="color:#666;font-size:12px">{label}</td>'
+                f'<td style="font-size:12px">{val_html}{note_html}</td></tr>'
+            )
+
+        mkt_note = "idiosyn." if mp.get("market_news_decomposed") else "raw ret"
+        ic_rows = "".join([
+            _ic_row("Technical",   "technical_ic",   "technical_ic_p",   "technical_ic_significant"),
+            _ic_row("Stock news",  "stock_news_ic",  "stock_news_ic_p",  "stock_news_ic_significant"),
+            _ic_row("Market news", "market_news_ic", "market_news_ic_p", "market_news_ic_significant", mkt_note),
+            _ic_row("Related",     "related_news_ic","related_news_ic_p","related_news_ic_significant"),
+        ])
+        st.markdown(f"""
+        <table class="sim-table" style="margin-bottom:6px">
+            <tr><th>Stream</th><th>IC score</th></tr>
+            {ic_rows}
+        </table>
+        <div style="font-size:10px;color:#aaa;line-height:1.6">
+            Pearson correlation between stream score and 7-day return.
+            ✦ = significant (p&lt;0.05). Market news measured against
+            {'idiosyncratic return (stock − beta×SPY)' if mp.get('market_news_decomposed') else 'raw stock return'}.
         </div>""", unsafe_allow_html=True)
 
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
