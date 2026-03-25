@@ -97,6 +97,7 @@ def _build_user_prompt(
     mc: Dict[str, Any],
     ba: Dict[str, Any],
     ca: Dict[str, Any],
+    related_companies: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Assemble the full data block from pre-extracted state dicts.
@@ -290,6 +291,21 @@ def _build_user_prompt(
             f"  commodity_factors (use to assess cost/revenue impact on price):\n"
             + commodity_block_str
         )
+
+        # Append peer companies if available
+        if related_companies:
+            _rel_lines: List[str] = []
+            for c in related_companies:
+                if not isinstance(c, dict):
+                    continue
+                _rel_lines.append(
+                    f"    {c.get('ticker', '')} ({c.get('relationship', 'SAME_SECTOR')}): {c.get('reason', '')}"
+                )
+            if _rel_lines:
+                mc_ctx_block += (
+                    "\n  peer_companies (suppliers / customers / competitors — use in"
+                    " section 5 Market Context & Risk):\n" + "\n".join(_rel_lines)
+                )
     else:
         mc_ctx_block = "UNAVAILABLE"
 
@@ -571,6 +587,7 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     mc:  Dict[str, Any]           = state.get("monte_carlo_results") or {}
     ba:  Dict[str, Any]           = state.get("behavioral_anomaly_detection") or {}
     ca:  Dict[str, Any]           = state.get("content_analysis_summary") or {}
+    related_companies: List[Dict[str, Any]] = state.get("related_companies") or []
 
     # =========================================================================
     # STEP 2: Guard — signal_components is required
@@ -601,6 +618,7 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         mc=mc,
         ba=ba,
         ca=ca,
+        related_companies=related_companies,
     )
 
     logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")

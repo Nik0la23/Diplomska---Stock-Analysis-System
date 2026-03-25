@@ -769,6 +769,7 @@ def main():
     llm  = dd.get("llm_analysis")         or {}
     viz  = dd.get("visualization")        or {}
     macro= dd.get("macro_factors")        or {}
+    peers= dd.get("peer_companies")       or {}
     diag = dd.get("diagnostics")          or {}
     tw   = dd.get("trustworthiness")      or {}
     mp   = dd.get("model_performance")    or {}
@@ -1028,6 +1029,61 @@ def main():
                 f'margin-bottom:16px;padding:0 2px">{macro_summary}</div>',
                 unsafe_allow_html=True,
             )
+
+    # ── Peer Companies ────────────────────────────────────────────────────────
+    peer_list = peers.get("companies") or []
+    if peer_list:
+        st.markdown(
+            '<div class="section-header">Peer companies</div>',
+            unsafe_allow_html=True,
+        )
+        _REL_COLORS: dict = {
+            "COMPETITOR":      ("#7f1d1d", "#fca5a5"),
+            "SUPPLIER":        ("#14532d", "#86efac"),
+            "CUSTOMER":        ("#1e3a5f", "#93c5fd"),
+            "SAME_SECTOR":     ("#374151", "#d1d5db"),
+            "PARTNER":         ("#3b0764", "#d8b4fe"),
+        }
+        peer_rows_html = ""
+        for c in peer_list:
+            if not isinstance(c, dict):
+                continue
+            t   = c.get("ticker", "—")
+            rel = c.get("relationship", "SAME_SECTOR")
+            rsn = c.get("reason", "")
+            bg_c, txt_c = _REL_COLORS.get(rel, ("#374151", "#d1d5db"))
+            rel_label = rel.replace("_", " ").title()
+            badge_html = (
+                f'<span style="background:{bg_c};color:{txt_c};'
+                f'padding:2px 7px;border-radius:4px;font-size:11px;'
+                f'font-family:\'DM Mono\',monospace;white-space:nowrap">'
+                f'{rel_label}</span>'
+            )
+            peer_rows_html += (
+                f"<tr>"
+                f'<td style="font-size:13px;padding:6px 10px;color:#e5e7eb;'
+                f'font-family:\'DM Mono\',monospace;font-weight:600">{t}</td>'
+                f'<td style="padding:6px 10px">{badge_html}</td>'
+                f'<td style="font-size:12px;color:#9ca3af;padding:6px 10px">{rsn}</td>'
+                f"</tr>"
+            )
+        st.markdown(
+            f"""<table style="width:100%;border-collapse:collapse;
+                background:#111827;border-radius:8px;overflow:hidden;margin-bottom:16px">
+              <thead>
+                <tr style="border-bottom:1px solid #374151">
+                  <th style="text-align:left;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Ticker</th>
+                  <th style="text-align:left;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Relationship</th>
+                  <th style="text-align:left;padding:8px 10px;
+                      font-size:11px;color:#6b7280;font-weight:500">Why it matters</th>
+                </tr>
+              </thead>
+              <tbody>{peer_rows_html}</tbody>
+            </table>""",
+            unsafe_allow_html=True,
+        )
 
     # ── Analysis text ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Analysis</div>',

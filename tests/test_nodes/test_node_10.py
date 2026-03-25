@@ -277,30 +277,34 @@ class TestReconstructTechnicalSignal:
 
     def test_sufficient_data_returns_signal_and_confidence(self):
         df = _make_price_df(120)
-        signal, confidence = reconstruct_technical_signal(df)
+        signal, confidence, alpha = reconstruct_technical_signal(df)
         assert signal in ("BUY", "SELL", "HOLD")
         assert 0.0 <= confidence <= 1.0
+        assert alpha is not None
+        assert isinstance(alpha, float)
 
     def test_insufficient_data_returns_none_tuple(self):
         df = _make_price_df(30)  # below MIN_PRICE_ROWS_FOR_TECHNICAL
-        signal, confidence = reconstruct_technical_signal(df)
+        signal, confidence, alpha = reconstruct_technical_signal(df)
         assert signal is None
         assert confidence is None
+        assert alpha is None
 
     def test_none_input_returns_none_tuple(self):
-        signal, confidence = reconstruct_technical_signal(None)
+        signal, confidence, alpha = reconstruct_technical_signal(None)
         assert signal is None
         assert confidence is None
+        assert alpha is None
 
     def test_exactly_minimum_rows(self):
         """Exactly MIN_PRICE_ROWS_FOR_TECHNICAL rows should succeed."""
         df = _make_price_df(MIN_PRICE_ROWS_FOR_TECHNICAL)
-        signal, confidence = reconstruct_technical_signal(df)
+        signal, confidence, alpha = reconstruct_technical_signal(df)
         assert signal in ("BUY", "SELL", "HOLD")
 
     def test_one_below_minimum_returns_none(self):
         df = _make_price_df(MIN_PRICE_ROWS_FOR_TECHNICAL - 1)
-        signal, confidence = reconstruct_technical_signal(df)
+        signal, confidence, alpha = reconstruct_technical_signal(df)
         assert signal is None
 
 

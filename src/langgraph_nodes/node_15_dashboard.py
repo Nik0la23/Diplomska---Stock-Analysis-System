@@ -586,6 +586,21 @@ def _macro_factors(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _peer_companies(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tier 2 — related companies (peers, suppliers, customers, competitors).
+
+    Passes through the Node 3 related_companies list verbatim so the
+    Streamlit app can render a peer table without touching raw state.
+    Each entry is a dict with keys: ticker, relationship, reason.
+    """
+    related: List[Dict[str, Any]] = state.get("related_companies") or []
+    return {
+        "companies": related,
+        "count":     len(related),
+    }
+
+
 def _diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Tier 4 — data-availability and backtest-sufficiency counters.
@@ -891,6 +906,7 @@ def dashboard_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "market_context":         _market_context(state),
             "monte_carlo":            _monte_carlo(state),
             "macro_factors":          _macro_factors(state),
+            "peer_companies":         _peer_companies(state),
             # Tier 3: model quality & validation
             "model_performance":      _model_performance(state),
             "news_intelligence":      _news_intelligence(state),

@@ -121,6 +121,11 @@ MIN_BASELINE_DAYS: int = 5              # below this, no correction applied (col
 # Improvement 4: half-life in days for exponential recency decay in IC.
 IC_DECAY_HALF_LIFE: int = 60
 
+# Minimum number of daily samples (dates with outcomes) required to compute IC.
+# Lowered from 10 to 5 to handle sparse streams (e.g. market news clusters on few dates).
+# Pearson r is still meaningful at n=5–9; Node 11 Bayesian smoothing handles uncertainty.
+MIN_IC_SAMPLES: int = 5
+
 
 # ============================================================================
 # HELPER 1: HOLD THRESHOLD
@@ -217,7 +222,7 @@ def evaluate_outcome(signal: str, actual_change: float, hold_threshold: float) -
 
 def reconstruct_technical_signal(
     price_slice: pd.DataFrame,
-) -> Tuple[Optional[str], Optional[float]]:
+) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     """
     Reconstruct the technical signal for the last day of a historical price slice.
 
@@ -227,11 +232,12 @@ def reconstruct_technical_signal(
         price_slice: DataFrame with 'close', 'open', 'high', 'low', 'volume' columns.
 
     Returns:
-        Tuple (signal, confidence) — ('BUY'/'SELL'/'HOLD', 0.0-1.0)
-        Returns (None, None) if the slice has fewer than MIN_PRICE_ROWS_FOR_TECHNICAL rows.
+        Tuple (signal, confidence, alpha) — ('BUY'/'SELL'/'HOLD', 0.0-1.0, signed float)
+        Returns (None, None, None) if the slice has fewer than MIN_PRICE_ROWS_FOR_TECHNICAL rows.
+        alpha is the raw signed Ridge regression output — positive = bullish, negative = bearish.
     """
     if price_slice is None or len(price_slice) < MIN_PRICE_ROWS_FOR_TECHNICAL:
-        return None, None
+        return None, None, None
 
     try:
         regression_slice = (
@@ -265,11 +271,11 @@ def reconstruct_technical_signal(
             signal     = 'HOLD'
             confidence = float(1.0 - abs(alpha) / ALPHA_SIGNAL_THRESHOLD)
 
-        return signal, float(confidence)
+        return signal, float(confidence), float(alpha)
 
     except Exception as e:
         logger.debug(f"Technical signal reconstruction failed for {len(price_slice)}-row slice: {e}")
-        return None, None
+        return None, None, None
 
 
 # ============================================================================
@@ -294,7 +300,9 @@ def backtest_technical_stream(
         hold_threshold: Stock-specific HOLD zone width in percent
 
     Returns:
-        List of dicts: {date, signal, confidence, actual_change_7d, correct, days_ago}
+        List of dicts: {date, signal, confidence, sentiment_score, actual_change_7d, correct, days_ago}
+        sentiment_score is set to the signed technical_alpha so calculate_news_ic() can compute
+        the out-of-sample rolling IC using the same code path as news streams.
     """
     results: List[Dict[str, Any]] = []
 
@@ -328,7 +336,7 @@ def backtest_technical_stream(
             actual_change = ((price_future - price_today) / price_today) * 100
 
             price_slice = df.iloc[: i + 1].copy()
-            signal, confidence = reconstruct_technical_signal(price_slice)
+            signal, confidence, alpha = reconstruct_technical_signal(price_slice)
 
             if signal is None:
                 continue
@@ -340,6 +348,7 @@ def backtest_technical_stream(
                 "date":             date_str,
                 "signal":           signal,
                 "confidence":       round(confidence, 4) if confidence is not None else None,
+                "sentiment_score":  round(alpha, 4) if alpha is not None else None,
                 "actual_change_7d": round(actual_change, 4),
                 "correct":          correct,
                 "days_ago":         days_ago,
@@ -789,7 +798,7 @@ def calculate_news_ic(daily_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         if r.get("sentiment_score") is not None
         and r.get("actual_change_7d") is not None
     ]
-    if len(valid) < 10:
+    if len(valid) < MIN_IC_SAMPLES:
         return {**_NO_IC, "ic_n_samples": len(valid)}
 
     scores  = [float(r["sentiment_score"])  for r in valid]
@@ -850,7 +859,7 @@ def calculate_news_ic_decay(
         and r.get("actual_change_7d") is not None
         and r.get("days_ago") is not None
     ]
-    if len(valid) < 10:
+    if len(valid) < MIN_IC_SAMPLES:
         return {**_NO_IC_DECAY, "ic_decay_n_effective": len(valid)}
 
     days_arr    = np.array([float(r["days_ago"])         for r in valid])
@@ -1205,17 +1214,30 @@ def backtesting_node(state: Dict[str, Any]) -> Dict[str, Any]:
         combined_metrics  = calculate_stream_metrics(combined_daily)     if combined_daily     else None
 
         # ====================================================================
-        # STEP 7: Compute news IC (standard + decay) for all three news streams
+        # STEP 7: Compute IC (standard + decay) for all four streams
         # ====================================================================
 
         for metrics, daily in [
-            (stock_metrics,   stock_news_daily),
-            (market_metrics,  market_news_daily),
-            (related_metrics, related_news_daily),
+            (technical_metrics, technical_daily),
+            (stock_metrics,     stock_news_daily),
+            (market_metrics,    market_news_daily),
+            (related_metrics,   related_news_daily),
         ]:
             if metrics and daily:
                 metrics.update(calculate_news_ic(daily))
                 metrics.update(calculate_news_ic_decay(daily))
+        # technical_daily dicts contain 'sentiment_score' = signed technical_alpha,
+        # so calculate_news_ic computes the same out-of-sample Pearson IC as news streams.
+
+        # Also store Node 4's in-sample Ridge regression IC separately — it is a
+        # different quantity (in-sample pearsonr of Ridge predictions vs actual returns)
+        # used by Node 11's accuracy estimation, and should coexist with the
+        # out-of-sample IC above rather than replace it.
+        if technical_metrics:
+            ti = state.get("technical_indicators") or {}
+            node4_ic = ti.get("ic_score")
+            if node4_ic is not None:
+                technical_metrics["node4_ic_score"] = float(node4_ic)
 
         # ====================================================================
         # STEP 8: Build and store results

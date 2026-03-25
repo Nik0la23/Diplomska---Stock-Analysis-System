@@ -44,6 +44,11 @@ NEWS_LOOKBACK_DAYS = 180
 # Overlap when doing incremental fetch (re-fetch last N days for late-arriving articles)
 NEWS_OVERLAP_DAYS = 3
 
+# Related-company news is intentionally narrower:
+# keep it tied to CURRENT peers and recent market context.
+RELATED_NEWS_LOOKBACK_DAYS = 30
+MAX_RELATED_PEERS = 5
+
 
 # ============================================================================
 # HELPER FUNCTIONS: Alpha Vantage (Primary for ALL News)
@@ -436,11 +441,18 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
     start_time = datetime.now()
     ticker = state['ticker']
     _related_raw = state.get('related_companies', []) or []
-    # Node 3 now returns List[Dict] with 'ticker' key; extract plain ticker strings for news fetching
-    related_companies = [
-        c['ticker'] if isinstance(c, dict) else c
-        for c in _related_raw
-    ]
+    # Node 3 returns List[Dict] with ticker metadata; normalize to unique, valid symbols.
+    related_companies = []
+    for company in _related_raw:
+        candidate = company.get("ticker") if isinstance(company, dict) else company
+        if not candidate:
+            continue
+        symbol = str(candidate).strip().upper()
+        if not symbol or symbol == ticker.upper():
+            continue
+        if symbol not in related_companies:
+            related_companies.append(symbol)
+    related_companies = related_companies[:MAX_RELATED_PEERS]
     
     try:
         logger.info(f"Node 2: Starting news fetching for {ticker}")
@@ -457,9 +469,16 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         
         if has_cached_stock and has_cached_market:
             logger.info(f"Node 2: Using cached news for {ticker}")
+            related_from_cache = get_news_for_ticker(
+                ticker, 'related', days=RELATED_NEWS_LOOKBACK_DAYS
+            )
+            logger.info(
+                f"Node 2: Loaded {len(related_from_cache)} related articles from DB "
+                f"(last {RELATED_NEWS_LOOKBACK_DAYS} days)"
+            )
             state['stock_news']          = cached_stock_news
             state['market_news']         = cached_market_news
-            state['related_company_news'] = []
+            state['related_company_news'] = related_from_cache
             from src.database.db_manager import get_ticker_stats
             _cached_stats = get_ticker_stats(ticker)
             state['news_fetch_metadata'] = {
@@ -467,7 +486,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 'to_date':             to_date.isoformat(),
                 'fetch_window_days':   0,
                 'newly_fetched_count': 0,
-                'total_in_state':      len(cached_stock_news) + len(cached_market_news),
+                'total_in_state':      len(cached_stock_news) + len(cached_market_news) + len(related_from_cache),
                 'newly_fetched_stock':  0,
                 'newly_fetched_market': 0,
                 'was_cache_hit':        True,
@@ -491,13 +510,17 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 stock_from_db  = get_news_for_ticker(ticker, 'stock',  days=NEWS_LOOKBACK_DAYS)
                 market_from_db = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
                 if stock_from_db or market_from_db:
+                    related_from_db = get_news_for_ticker(
+                        ticker, 'related', days=RELATED_NEWS_LOOKBACK_DAYS
+                    )
                     logger.info(
                         f"Node 2: News current for {ticker}, loaded from DB (no API) — "
-                        f"stock: {len(stock_from_db)}, market: {len(market_from_db)}"
+                        f"stock: {len(stock_from_db)}, market: {len(market_from_db)}, "
+                        f"related: {len(related_from_db)}"
                     )
                     state['stock_news']          = stock_from_db
                     state['market_news']         = market_from_db
-                    state['related_company_news'] = []
+                    state['related_company_news'] = related_from_db
                     from src.database.db_manager import get_ticker_stats
                     _db_stats = get_ticker_stats(ticker)
                     state['news_fetch_metadata'] = {
@@ -505,7 +528,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                         'to_date':             to_date.isoformat(),
                         'fetch_window_days':   0,
                         'newly_fetched_count': 0,
-                        'total_in_state':      len(stock_from_db) + len(market_from_db),
+                        'total_in_state':      len(stock_from_db) + len(market_from_db) + len(related_from_db),
                         'newly_fetched_stock':  0,
                         'newly_fetched_market': 0,
                         'was_db_load':          True,
@@ -533,6 +556,11 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"Node 2: Fetching news from {from_date.strftime('%Y-%m-%d')} "
             f"to {to_date.strftime('%Y-%m-%d')}"
         )
+        related_from_date = max(from_date, to_date - timedelta(days=RELATED_NEWS_LOOKBACK_DAYS))
+        logger.info(
+            f"Node 2: Related-company window: {related_from_date.strftime('%Y-%m-%d')} "
+            f"to {to_date.strftime('%Y-%m-%d')} for peers {related_companies}"
+        )
         
         # ====================================================================
         # STEP 4: Fetch News from Alpha Vantage (Async Parallel)
@@ -558,7 +586,7 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     ),
                     # Related-company news: one call per peer
                     fetch_alpha_vantage_related_company_news_async(
-                        related_companies, session, from_date, to_date
+                        related_companies, session, related_from_date, to_date
                     ),
                 ]
                 return await asyncio.gather(*tasks, return_exceptions=True)
@@ -590,16 +618,14 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if newly_fetched_total == 0:
             _db_stock   = get_news_for_ticker(ticker, "stock",   days=NEWS_LOOKBACK_DAYS)
             _db_market  = get_news_for_ticker(ticker, "market",  days=NEWS_LOOKBACK_DAYS)
-            _db_related = get_news_for_ticker(ticker, "related", days=NEWS_LOOKBACK_DAYS)
-            if _db_stock or _db_market or _db_related:
+            if _db_stock or _db_market:
                 stock_news           = _db_stock
                 market_news          = _db_market
-                related_company_news = _db_related
+                related_company_news = []
                 _av_down_fallback    = True
                 logger.warning(
-                    f"Node 2: AV returned 0 articles — using stale DB data as fallback "
-                    f"(stock:{len(stock_news)}, market:{len(market_news)}, "
-                    f"related:{len(related_company_news)})"
+                    "Node 2: AV returned 0 articles — using stale DB data for stock/market only; "
+                    "related-company news skipped to preserve peer fidelity"
                 )
             else:
                 logger.warning(
@@ -623,7 +649,8 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ]
         related_company_news = [
             a for a in related_company_news
-            if from_timestamp <= a.get("datetime", 0) <= to_timestamp
+            if int(related_from_date.timestamp()) <= a.get("datetime", 0) <= to_timestamp
+            and a.get("related_ticker") in related_companies
         ]
         
         # ====================================================================
@@ -648,11 +675,16 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if latest_news_date is not None and (to_date - from_date).days < (NEWS_LOOKBACK_DAYS - 10):
             stock_news           = get_news_for_ticker(ticker, "stock",   days=NEWS_LOOKBACK_DAYS)
             market_news          = get_news_for_ticker(ticker, "market",  days=NEWS_LOOKBACK_DAYS)
-            related_company_news = get_news_for_ticker(ticker, "related", days=NEWS_LOOKBACK_DAYS)
+            # Keep related-company stream from live peer-scoped fetch only.
+            # DB rows do not persist related_ticker, so reloading can mix old peers.
+            related_company_news = [
+                a for a in related_company_news
+                if a.get("related_ticker") in related_companies
+            ]
             logger.info(
                 "Node 2: Loaded full 6-month series from DB — "
                 f"stock: {len(stock_news)}, market: {len(market_news)}, "
-                f"related: {len(related_company_news)}"
+                f"related(live peer-scoped): {len(related_company_news)}"
             )
 
         # ====================================================================

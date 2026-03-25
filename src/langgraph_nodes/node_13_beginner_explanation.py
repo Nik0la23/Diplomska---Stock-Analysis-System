@@ -141,15 +141,17 @@ def _build_user_prompt(
     sb: Dict[str, Any],
     ticker: str,
     macro_factors: Optional[List[Dict[str, Any]]] = None,
+    related_companies: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Assemble the dynamic data block from pre-extracted state dicts.
 
     Args:
-        sc:            signal_components dict from Node 12.
-        sb:            sentiment_breakdown dict from Node 5 (may be empty).
-        ticker:        Stock ticker symbol.
-        macro_factors: identified_factors list from Node 6 (may be None/empty).
+        sc:                signal_components dict from Node 12.
+        sb:                sentiment_breakdown dict from Node 5 (may be empty).
+        ticker:            Stock ticker symbol.
+        macro_factors:     identified_factors list from Node 6 (may be None/empty).
+        related_companies: related_companies list from Node 3 (may be None/empty).
 
     Returns:
         Formatted user prompt string ready to send to the LLM.
@@ -299,11 +301,38 @@ def _build_user_prompt(
                 " in plain English without technical jargon.\n"
             )
 
+    # --- PEER COMPANIES BLOCK ---
+    peers_section = ""
+    if related_companies:
+        rel_label = {
+            "COMPETITOR": "Direct Competitor",
+            "SUPPLIER": "Supplier",
+            "CUSTOMER": "Customer",
+            "SAME_SECTOR": "Same Sector",
+            "PARTNER": "Partner",
+        }
+        peer_lines: List[str] = []
+        for c in related_companies:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("ticker", "")
+            rel = c.get("relationship", "SAME_SECTOR")
+            reason = c.get("reason", "")
+            label = rel_label.get(rel, rel.replace("_", " ").title())
+            peer_lines.append(f"- {t} ({label}): {reason}")
+        if peer_lines:
+            peers_section = (
+                "\nPEER COMPANIES (mention in section 3 — What's Driving This,"
+                " explain how each peer's relationship affects the stock):\n"
+                + "\n".join(peer_lines)
+                + "\n"
+            )
+
     return f"""Generate a beginner explanation for the following stock analysis.
 Follow the 7-section structure exactly in this order:
 1. Headline
 2. How Strong and Reliable is This Signal
-3. What's Driving This (incorporate commodity/macro factor prices if provided)
+3. What's Driving This (incorporate commodity/macro factor prices and peer companies if provided)
 4. Historical Pattern (skip entirely if marked insufficient)
 5. Price Expectation (skip if unavailable)
 6. Risk
@@ -320,7 +349,7 @@ SIGNAL:
 
 STREAM DIRECTIONS (translate these to plain English in section 3):
 {streams_block}
-{commodity_section}
+{commodity_section}{peers_section}
 {top_articles_block}
 
 PRICE TARGETS:
@@ -414,6 +443,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     macro_factors: List[Dict[str, Any]] = (
         mc_ctx.get("macro_factor_exposure", {}).get("identified_factors", []) or []
     )
+    related_companies: List[Dict[str, Any]] = state.get("related_companies") or []
 
     # =========================================================================
     # STEP 2: Guard — signal_components is required
@@ -432,7 +462,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # =========================================================================
     # STEP 3: Build prompts
     # =========================================================================
-    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors)
+    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors, related_companies)
 
     logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")
 
