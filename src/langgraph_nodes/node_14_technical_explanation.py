@@ -42,7 +42,7 @@ logger = get_node_logger("node_14")
 # ============================================================================
 
 CLAUDE_MODEL: str = "claude-sonnet-4-5"
-MAX_TOKENS: int = 2800  # ~1200 words with headroom
+MAX_TOKENS: int = 3200  # ~1100 words with per-section budgets and headroom
 
 
 def _fmt(value: Any, fmt: str = "+.4f", fallback: str = "N/A") -> str:
@@ -74,10 +74,50 @@ Summary with this finding prominently.
 trustworthiness reflects a statistical prior (0.55), not measured accuracy.
 - When insufficient_history is False, interpret trustworthiness as a backtested hit rate \
 and note which streams are driving it up or down based on stream_hit_rates.
-- Keep the response between 900 and 1200 words.
+- Follow these per-section word budgets as hard upper limits. Total output \
+must not exceed 1100 words excluding markdown headers: \
+Section 1 Executive Summary: 180 words. \
+Section 2 Signal Decomposition and Quality: 160 words. \
+Section 3 Technical and Quantitative Analysis: 220 words. \
+Section 4 Sentiment and News Analysis: 160 words. \
+Section 5 Market Context and Risk: 160 words. \
+Section 6 Anomaly Detection: 120 words. \
+Section 7 Methodology Notes: 100 words minimum, 120 words maximum. \
+Do not exceed any individual section budget. If a section has less to say, \
+use fewer words — do not pad. These budgets exist to ensure every section \
+is completed and none is truncated.
 - Use markdown headers (##) for each section. Follow the 7-section order exactly.
 - Synthesise — do not just list data points. A sophisticated reader wants your \
 interpretation of what the combination of signals means, not a table of values.
+- Before writing any section, identify the single most important tension or \
+confirmation in the data — the finding that most affects whether the signal \
+should be trusted. Lead the Executive Summary with that finding. Every \
+subsequent section should either support or complicate it.
+- If the technical regression direction contradicts price-action indicators \
+(e.g. regression predicts a negative return while MACD is bullish, or vice \
+versa), this contradiction must be the first sentence of the Executive Summary. \
+Label it explicitly as 'internal technical disagreement', quantify the gap \
+between what regression predicts and what price-action indicators show, and \
+re-reference it in section 3.
+- In section 4, after presenting source accuracy data, write one explicit \
+conclusion sentence in this exact form: 'Sentiment signal for [TICKER] is \
+[reliable / unreliable / low-reliability] based on [X]% measured accuracy — \
+[weight accordingly / treat as corroborating evidence only / discount \
+substantially].' Do not leave the sentiment reliability conclusion implicit.
+- In section 5, state explicitly: 'If SPY drops 1%, [TICKER] is expected to \
+drop approximately [beta]% based on its calculated beta.' Then combine beta \
+and VIX into a single volatility risk statement for the reader. Do not \
+mention beta and VIX in separate sentences — synthesise them.
+- Section 7 must explicitly address each of the following if present in the \
+data: (a) weights_are_fallback=True — state that adaptive stream weights are \
+prior-based, not learned from this ticker's history; (b) \
+insufficient_history=True — state that trustworthiness reflects a statistical \
+prior of 0.55, not a measured hit rate; (c) streams_missing — name each \
+missing stream and state what analytical dimension is blind as a result; \
+(d) avg_news_accuracy below 40% — flag sentiment as a low-reliability stream \
+for this ticker. If none of these conditions apply, write 'No material data \
+gaps or reliability flags detected.' Never write section 7 in fewer than \
+80 words.
 - Do not add sections not listed below."""
 
 
@@ -151,7 +191,15 @@ def _build_user_prompt(
     # TECHNICAL INDICATORS BLOCK
     # -------------------------------------------------------------------------
     if ti:
-        ti_lines = [f"  {k}: {v}" for k, v in ti.items()]
+        _ti_keep = [
+            "normalized_score", "rsi", "macd_histogram", "macd_histogram_slope",
+            "sma_relationship", "volume_ratio", "adx", "bollinger_position",
+            "predicted_return", "market_regime", "persistent_pressure",
+            "technical_summary", "hold_low", "hold_high",
+        ]
+        ti_lines = [f"  {k}: {v}" for k, v in ti.items() if k in _ti_keep]
+        if not ti_lines:  # fallback: schema change → dump all
+            ti_lines = [f"  {k}: {v}" for k, v in ti.items()]
         ti_block = "\n".join(ti_lines)
     else:
         ti_block = "UNAVAILABLE — Node 4 did not produce data"
@@ -219,17 +267,37 @@ def _build_user_prompt(
     # News impact verification
     if niv:
         src_rel = niv.get("source_reliability") or {}
-        # Cap at 10 most-tracked sources to prevent unbounded growth over many runs
+        src_filtered = {
+            src: v for src, v in src_rel.items()
+            if isinstance(v, dict) and int(v.get("total_articles") or 0) >= 10
+        }
+        src_top5 = sorted(
+            src_filtered.items(),
+            key=lambda x: int(x[1].get("total_articles") or 0),
+            reverse=True,
+        )[:5]
+
+        if src_top5:
+            avg_accuracy = sum(
+                float(v.get("accuracy_rate") or 0) for _, v in src_top5
+            ) / len(src_top5)
+        else:
+            avg_accuracy = 0.0
+
         src_lines = [
             f"    {src}: accuracy={v.get('accuracy_rate')} "
             f"articles={v.get('total_articles')} multiplier={v.get('confidence_multiplier')}"
-            for src, v in list(src_rel.items())[:10]
+            for src, v in src_top5
         ]
+
         niv_block = (
             f"  historical_correlation: {niv.get('historical_correlation')}\n"
             f"  news_accuracy_score: {niv.get('news_accuracy_score')}\n"
             f"  learning_adjustment: {niv.get('learning_adjustment')}\n"
-            f"  source_reliability (top 10):\n" + "\n".join(src_lines)
+            f"  avg_accuracy_top5_sources: {avg_accuracy:.1%} "
+            f"({'low-reliability — discount sentiment stream' if avg_accuracy < 0.40 else 'moderate reliability' if avg_accuracy < 0.60 else 'high reliability'})\n"
+            f"  source_reliability (top 5 by volume, min 10 articles):\n"
+            + "\n".join(src_lines)
         )
     else:
         niv_block = "UNAVAILABLE — Node 8 learning data not present"
@@ -306,6 +374,37 @@ def _build_user_prompt(
                     "\n  peer_companies (suppliers / customers / competitors — use in"
                     " section 5 Market Context & Risk):\n" + "\n".join(_rel_lines)
                 )
+
+        # Pre-computed beta/VIX volatility risk statement
+        _beta = float(corr_profile.get("beta_calculated") or 1.0)
+        _vix  = float(regime.get("vix_level") or 20.0)
+
+        if _beta > 1.3 and _vix > 22:
+            _vol_risk = "HIGH — amplified market sensitivity in elevated volatility"
+            _vol_note = (
+                f"A 1% SPY decline implies approximately {_beta:.2f}% decline in "
+                f"{ticker} under current VIX={_vix:.1f} conditions."
+            )
+        elif _beta > 1.0 or _vix > 22:
+            _vol_risk = "MODERATE"
+            _vol_note = (
+                f"Beta of {_beta:.2f} with VIX at {_vix:.1f} — above-average "
+                f"sensitivity to market moves."
+            )
+        else:
+            _vol_risk = "LOW"
+            _vol_note = (
+                f"Beta {_beta:.2f} and VIX {_vix:.1f} indicate contained "
+                f"volatility exposure."
+            )
+
+        mc_ctx_block += (
+            f"\n  PRE-COMPUTED VOLATILITY RISK: {_vol_risk}\n"
+            f"  {_vol_note}\n"
+            f"  INSTRUCTION: Use this pre-computed statement verbatim as the "
+            f"opening of the volatility risk paragraph in section 5. Do not "
+            f"restate beta and VIX separately — use the synthesised statement."
+        )
     else:
         mc_ctx_block = "UNAVAILABLE"
 
@@ -315,15 +414,18 @@ def _build_user_prompt(
     if mc:
         ci95 = mc.get("confidence_95") or {}
         mc_block = (
-            f"  current_price: {mc.get('current_price')}\n"
+            f"  PRIMARY (lead with these):\n"
             f"  probability_up: {mc.get('probability_up')}\n"
             f"  expected_return: {mc.get('expected_return')}\n"
-            f"  mean_forecast: {mc.get('mean_forecast')}\n"
             f"  confidence_95_lower: {ci95.get('lower')}\n"
             f"  confidence_95_upper: {ci95.get('upper')}\n"
+            f"  volatility: {mc.get('volatility')}\n"
+            f"  SECONDARY (reference only):\n"
+            f"  mean_forecast: {mc.get('mean_forecast')}\n"
+            f"  current_price: {mc.get('current_price')}\n"
+            f"  METHODOLOGY (section 7 only):\n"
             f"  simulation_count: {mc.get('simulation_count')}\n"
-            f"  time_horizon_days: {mc.get('time_horizon_days')}\n"
-            f"  volatility: {mc.get('volatility')}"
+            f"  time_horizon_days: {mc.get('time_horizon_days')}"
         )
     else:
         mc_block = "UNAVAILABLE"
@@ -333,13 +435,30 @@ def _build_user_prompt(
     # -------------------------------------------------------------------------
     if pp.get("sufficient_data"):
         detail = pp.get("similar_days_detail") or []
-        # Node 12 already caps this to top 5 — iterate all
+        detail_top3 = sorted(
+            [d for d in detail if d.get("actual_change_7d") is not None],
+            key=lambda d: float(d.get("similarity_score") or 0),
+            reverse=True,
+        )[:3]
+
         detail_rows = "\n".join(
             f"  {d.get('date')} | sim={_fmt(d.get('similarity_score'), '.3f')} "
             f"| change={_fmt(d.get('actual_change_7d'), '+.2f')}% | {d.get('direction')}"
-            for d in detail
-            if d.get("actual_change_7d") is not None
+            for d in detail_top3
         )
+
+        if len(detail_top3) >= 2:
+            changes = [float(d.get("actual_change_7d") or 0) for d in detail_top3]
+            dispersion = max(changes) - min(changes)
+            dispersion_note = (
+                f"\n  outcome_dispersion_top3: {dispersion:+.2f}% range — "
+                + ("high variance, low predictive value" if dispersion > 10
+                   else "moderate variance" if dispersion > 5
+                   else "low variance, higher predictive value")
+            )
+        else:
+            dispersion_note = ""
+
         pattern_block = (
             f"  sufficient_data: True\n"
             f"  similar_days_found: {pp.get('similar_days_found')} "
@@ -350,7 +469,8 @@ def _build_user_prompt(
             f"  best_case_7d (90th pct): {_fmt(pp.get('best_case_7d'))}%\n"
             f"  median_return_7d: {_fmt(pp.get('median_return_7d'))}%\n"
             f"  agreement_with_job1: {pp.get('agreement_with_job1')}\n"
-            f"  similar_days_detail:\n{detail_rows}"
+            f"  similar_days_detail (top 3 by similarity):\n{detail_rows}"
+            + dispersion_note
         )
     else:
         pattern_block = (
@@ -375,6 +495,31 @@ def _build_user_prompt(
             f"{pg.get('gbm_blend_weight', 1.0):.0%} GBM "
             f"({int(pg.get('similar_days_used', 0))} similar days → dynamic weight)"
         )
+
+        _similar_days_used = int(pg.get("similar_days_used") or 0)
+        _job2_weight = float(pg.get("job2_blend_weight") or 0)
+
+        if _similar_days_used >= 20 and _job2_weight >= 0.6:
+            _blend_interp = (
+                "High empirical weight — model has strong historical precedent. "
+                "Empirical distribution is the more reliable range estimate."
+            )
+        elif _similar_days_used >= 10:
+            _blend_interp = (
+                "Moderate empirical weight — reasonable historical sample. "
+                "Blend is balanced between theory and precedent."
+            )
+        else:
+            _blend_interp = (
+                "Low empirical weight — limited historical precedent. "
+                "GBM theoretical distribution dominates. Wider uncertainty."
+            )
+
+        blend_block += (
+            f"\n  blend_interpretation: {_blend_interp}\n"
+            f"  INSTRUCTION: Use blend_interpretation when describing what "
+            f"the blended forecast means for signal confidence in section 3."
+        )
     else:
         blend_block = "UNAVAILABLE"
 
@@ -383,11 +528,15 @@ def _build_user_prompt(
     # -------------------------------------------------------------------------
     if ba:
         dd = ba.get("detection_breakdown") or {}
-        _NUMERIC_DD_KEYS = {"price_velocity", "volume_anomaly", "news_divergence", "momentum_score"}
-        dd_clean = {
-            k: round(float(v), 4) if k in _NUMERIC_DD_KEYS and isinstance(v, (int, float)) else str(v)[:80]
-            for k, v in dd.items()
+        _NUMERIC_DD_KEYS = {
+            "price_velocity", "volume_anomaly",
+            "news_divergence", "momentum_score",
         }
+        dd_formatted = "\n".join(
+            f"    {k}: {round(float(v), 4) if isinstance(v, (int, float)) else str(v)[:60]}"
+            for k, v in dd.items()
+            if k in _NUMERIC_DD_KEYS
+        )
         ba_block = (
             f"  risk_level: {ba.get('risk_level')}\n"
             f"  pump_and_dump_score: {ba.get('pump_and_dump_score')}\n"
@@ -395,7 +544,7 @@ def _build_user_prompt(
             f"  behavioral_summary: {ba.get('behavioral_summary')}\n"
             f"  primary_risk_factors: {ba.get('primary_risk_factors')}\n"
             f"  alerts: {ba.get('alerts')}\n"
-            f"  detection_breakdown: {dd_clean}"
+            f"  key_detection_metrics:\n{dd_formatted}"
         )
     else:
         ba_block = "UNAVAILABLE"

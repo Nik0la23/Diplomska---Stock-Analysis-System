@@ -638,6 +638,19 @@ def _mock_state(ticker: str) -> Dict:
             "*This is an automated analysis, not financial advice. "
             "Always conduct your own research before making investment decisions.*"
         ),
+        "market_context": {
+            "market_correlation_profile": {
+                "beta_calculated":    1.24,
+                "market_correlation": 0.81,
+            },
+            "market_regime": {
+                "vix_level":      16.4,
+                "vix_category":   "LOW",
+                "spy_trend_label": "BULLISH",
+                "spy_return_5d":  0.018,
+                "regime_label":   "RISK_ON",
+            },
+        },
         "technical_explanation": (
             f"## Executive Summary\n\n"
             f"{ticker} **BUY** (score +0.6091, trust 64%, strength 78/100). "
@@ -780,6 +793,7 @@ def main():
     trust         = float(es.get("confidence_raw") or 0)
     current_price = float(es.get("current_price_usd") or 0)
     risk_level    = risk.get("overall_risk_level", "UNKNOWN")
+    vol_risk      = risk.get("volatility_risk", "UNKNOWN")
     insuff        = tw.get("insufficient_history", True)
 
     # ── Header ────────────────────────────────────────────────────────────────
@@ -825,7 +839,7 @@ def main():
                          else "Insufficient data"))
     with m6:
         pnds = int(risk.get("pump_and_dump_score") or 0)
-        st.metric("Risk", risk_level, delta=f"P&D {pnds}/100",
+        st.metric("Manip. Risk", risk_level, delta=f"Vol: {vol_risk}",
                   delta_color="inverse")
 
     if insuff:
@@ -1202,10 +1216,15 @@ def main():
         alerts       = risk.get("alerts") or []
         risk_factors = risk.get("primary_risk_factors") or []
         pnd          = int(risk.get("pump_and_dump_score") or 0)
+        _beta        = risk.get("beta", 1.0)
+        _vix         = risk.get("vix_level", 20.0)
         st.markdown(f"""
         <div style="font-size:12px;color:#666;line-height:1.9">
-            Level &nbsp;{risk_badge(risk_level)}<br/>
+            Manipulation risk &nbsp;{risk_badge(risk_level)}<br/>
             P&D score &nbsp;<span style="font-family:'DM Mono'">{pnd}/100</span><br/>
+            Volatility risk &nbsp;{risk_badge(vol_risk)}<br/>
+            Beta &nbsp;<span style="font-family:'DM Mono'">{_beta:.2f}</span> &nbsp;·&nbsp;
+            VIX &nbsp;<span style="font-family:'DM Mono'">{_vix:.1f}</span><br/>
             Alerts &nbsp;<span style="font-family:'DM Mono'">{len(alerts)}</span><br/>
             Risk factors &nbsp;<span style="font-family:'DM Mono'">{len(risk_factors)}</span>
         </div>""", unsafe_allow_html=True)

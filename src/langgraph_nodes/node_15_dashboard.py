@@ -306,14 +306,32 @@ def _risk_assessment(state: Dict[str, Any]) -> Dict[str, Any]:
 
     A high pump_and_dump_score or HIGH/CRITICAL behavioral risk overrides
     the recommendation with a mandatory CAUTION flag.
+
+    Exposes two distinct risk dimensions:
+      - overall_risk_level  (pump/manipulation risk from Node 9)
+      - volatility_risk     (investment/market risk derived from beta + VIX)
     """
     sc = state.get("signal_components") or {}
     risk = sc.get("risk_summary") or {}
     bad = state.get("behavioral_anomaly_detection") or {}
     cas = state.get("content_analysis_summary") or {}
 
+    # Volatility risk — separate concept from manipulation/pump risk
+    _mc = state.get("market_context") or {}
+    beta = float((_mc.get("market_correlation_profile") or {}).get("beta_calculated") or 1.0)
+    vix  = float((_mc.get("market_regime") or {}).get("vix_level") or 20.0)
+    if beta > 1.3 and vix > 22:
+        volatility_risk = "HIGH"
+    elif beta > 1.0 or vix > 22:
+        volatility_risk = "MODERATE"
+    else:
+        volatility_risk = "LOW"
+
     return {
         "overall_risk_level":       risk.get("overall_risk_level", "UNKNOWN"),
+        "volatility_risk":          volatility_risk,
+        "beta":                     beta,
+        "vix_level":                vix,
         "behavioral_risk":          risk.get("behavioral_risk", "UNKNOWN"),
         "content_risk":             risk.get("content_risk", "UNKNOWN"),
         "trading_safe":             risk.get("trading_safe", True),

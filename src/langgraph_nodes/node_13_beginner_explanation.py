@@ -72,7 +72,17 @@ type of signal has been right historically — explain it as a percentage if ava
 or note that the system is still building its track record if marked insufficient.
 - Use the exact 7-section structure provided. Do not add sections or change their order.
 - Do not give specific investment advice beyond what the signal says.
-- Always end with the disclaimer exactly as provided — word for word."""
+- Always end with the disclaimer exactly as provided — word for word.
+- When signal_strength is below 40, the opening of section 1 (Headline) must \
+convey that evidence is mixed or indicators are conflicting. Use language like \
+'signals are mixed', 'no clear direction yet', or 'indicators are not strongly \
+aligned'. Never open a low-conviction HOLD with language that implies the \
+recommendation is clear or confident.
+- Never use the phrase 'current pricing data isn't available' or similar — \
+if data is missing, describe the concept without referencing the gap.
+- The risk section must always distinguish between manipulation risk (is this \
+stock being artificially traded?) and investment risk (how volatile is this \
+stock likely to be?). These are different things and beginners confuse them."""
 
 
 # ============================================================================
@@ -142,6 +152,7 @@ def _build_user_prompt(
     ticker: str,
     macro_factors: Optional[List[Dict[str, Any]]] = None,
     related_companies: Optional[List[Dict[str, Any]]] = None,
+    mc_ctx: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Assemble the dynamic data block from pre-extracted state dicts.
@@ -152,6 +163,7 @@ def _build_user_prompt(
         ticker:            Stock ticker symbol.
         macro_factors:     identified_factors list from Node 6 (may be None/empty).
         related_companies: related_companies list from Node 3 (may be None/empty).
+        mc_ctx:            market_context dict from Node 6 (may be None/empty).
 
     Returns:
         Formatted user prompt string ready to send to the LLM.
@@ -239,13 +251,30 @@ def _build_user_prompt(
             f"- Expected range: "
             f"{'${:.2f} – ${:.2f}'.format(float(range_lower), float(range_upper)) if range_lower is not None and range_upper is not None else 'unavailable'}"
         )
+        price_block += (
+            "\nINSTRUCTION: When describing the price range in section 5, call it a "
+            "'range of simulated outcomes, not a price target'. Emphasise that most "
+            "real outcomes will land near the middle of this range. The outer edges "
+            "represent unlikely but statistically possible scenarios. The forecasted "
+            "price is the expected midpoint, not a guarantee."
+        )
     else:
         price_block = "Price targets: unavailable — omit section 5."
 
     # --- RISK ---
-    risk_level  = rs.get("overall_risk_level", "UNKNOWN")
     trading_safe = rs.get("trading_safe", True)
     pump_score   = int(rs.get("pump_and_dump_score") or 0)
+
+    # Volatility risk: derived from beta and VIX — separate from manipulation/pump risk
+    _mc = mc_ctx or {}
+    beta = float((_mc.get("market_correlation_profile") or {}).get("beta_calculated") or 1.0)
+    vix  = float((_mc.get("market_regime") or {}).get("vix_level") or 20.0)
+    if beta > 1.3 and vix > 22:
+        volatility_risk = "HIGH"
+    elif beta > 1.0 or vix > 22:
+        volatility_risk = "MODERATE"
+    else:
+        volatility_risk = "LOW"
     alerts       = rs.get("alerts") or []
     # Truncate to 200 chars — this is a free-form Node 9B narrative; the full version
     # is for Node 14. Beginners only need the gist.
@@ -293,12 +322,12 @@ def _build_user_prompt(
                 "\nCOMMODITY & MACRO FACTOR PRICES"
                 " (incorporate into section 3 — What's Driving This):\n"
                 + "\n".join(lines)
-                + "\nInterpretation guide: COST_INPUT rising (↑) = cost headwind for the company."
-                " COST_INPUT falling (↓) = cost tailwind."
-                " REVENUE_DRIVER rising (↑) = revenue tailwind."
-                " REVENUE_DRIVER falling (↓) = revenue headwind."
-                " MACRO_SENSITIVITY / COMPETITOR_PRESSURE — mention the directional impact"
-                " in plain English without technical jargon.\n"
+                + "\nInterpretation guide: For factors where a live price is available, mention it. "
+                "For factors where price = N/A, describe only the directional relationship between "
+                "that factor and the company's business — do NOT mention that pricing data is "
+                "unavailable, just omit the price reference and explain the relationship in plain "
+                "English (e.g. 'Higher defense spending typically means more government contracts "
+                "for this company'). The goal is useful context, not a data dump.\n"
             )
 
     # --- PEER COMPANIES BLOCK ---
@@ -328,7 +357,24 @@ def _build_user_prompt(
                 + "\n"
             )
 
-    return f"""Generate a beginner explanation for the following stock analysis.
+    # --- CONVICTION LABEL (FIX 3) ---
+    if signal_strength < 34:
+        conviction_label = "weak — indicators are pulling in different directions"
+    elif signal_strength < 67:
+        conviction_label = "moderate — indicators are broadly aligned"
+    else:
+        conviction_label = "strong — indicators are well-aligned"
+
+    return f"""WORD BUDGET PER SECTION (treat as approximate upper bounds):
+1. Headline: 15 words max
+2. Signal strength & reliability: 60 words
+3. What's driving this (including macro/peers): 100 words
+4. Historical pattern: 60 words (omit entirely if insufficient data)
+5. Price expectation: 50 words
+6. Risk: 80 words — must cover BOTH manipulation risk and volatility risk
+7. Disclaimer: verbatim only, no additions
+
+Generate a beginner explanation for the following stock analysis.
 Follow the 7-section structure exactly in this order:
 1. Headline
 2. How Strong and Reliable is This Signal
@@ -343,7 +389,7 @@ TICKER: {ticker}
 SIGNAL:
 - Recommendation: {final_signal}
 - Confidence: {final_confidence:.0%}
-- Signal strength: {signal_strength}/100 (how loud and united the indicators are)
+- Signal strength: {signal_strength}/100 ({conviction_label})
 - Trustworthiness: {"building track record — not enough history yet" if insufficient_history else f"{trustworthiness:.0%} (based on historical stream accuracy)"}
 - Number of indicators agreeing: {signal_agreement} out of 4{missing_note}{weights_note}
 
@@ -356,12 +402,18 @@ PRICE TARGETS:
 {price_block}
 
 RISK:
-- Overall risk level: {risk_level}
-- Trading safe: {trading_safe}
-- Pump-and-dump score: {pump_score}/100{risk_note}
+- Manipulation risk (pump-and-dump score): {pump_score}/100
+- Investment/volatility risk: {volatility_risk} (beta={beta:.1f}, VIX={vix:.1f})
+- Trading safe: {trading_safe}{risk_note}
 - Active alerts:
 {alerts_str}
 - Behavioral summary: {beh_summary or 'none'}
+
+INSTRUCTION: In section 6, explain BOTH risk types separately in plain English.
+Manipulation risk = is the stock being artificially pumped or showing suspicious trading patterns?
+Investment/volatility risk = how much could the price swing based on the stock's historical behavior relative to the market?
+Never describe investment/volatility risk as LOW if volatility_risk = HIGH.
+Never conflate these two concepts.
 
 {pattern_block}
 
@@ -462,7 +514,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # =========================================================================
     # STEP 3: Build prompts
     # =========================================================================
-    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors, related_companies)
+    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors, related_companies, mc_ctx)
 
     logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")
 
