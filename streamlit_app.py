@@ -28,8 +28,26 @@ Fixes applied vs previous version:
 """
 
 import asyncio
+import pickle
+import pathlib
 from datetime import datetime
 from typing import Dict, Optional
+
+_HISTORY_FILE = pathlib.Path(__file__).parent / ".signal_history.pkl"
+
+def _load_history() -> list:
+    try:
+        if _HISTORY_FILE.exists():
+            return pickle.loads(_HISTORY_FILE.read_bytes())
+    except Exception:
+        pass
+    return []
+
+def _save_history(history: list) -> None:
+    try:
+        _HISTORY_FILE.write_bytes(pickle.dumps(history))
+    except Exception:
+        pass
 
 from streamlit_app.components.signal_diagnostics import render_signal_diagnostics
 
@@ -73,7 +91,12 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 #MainMenu, footer, header { visibility: hidden; }
 .block-container { padding: 1.5rem 2rem 2rem; max-width: 1400px; }
 
-section[data-testid="stSidebar"] { background: #0a0a0a; border-right: 1px solid #1e1e1e; }
+section[data-testid="stSidebar"] {
+    background: #0a0a0a !important; border-right: 1px solid #1e1e1e !important;
+    transform: translateX(0) !important;
+    min-width: 244px !important; width: 244px !important;
+    visibility: visible !important; display: block !important;
+}
 section[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
 section[data-testid="stSidebar"] .stTextInput input {
     background: #141414 !important; border: 1px solid #2a2a2a !important;
@@ -81,14 +104,16 @@ section[data-testid="stSidebar"] .stTextInput input {
     font-family: 'DM Mono', monospace !important; font-size: 15px !important;
     letter-spacing: .05em !important; text-transform: uppercase !important;
 }
-section[data-testid="stSidebar"] .stButton button {
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
     background: #e0e0e0 !important; color: #0a0a0a !important;
     border: none !important; border-radius: 6px !important;
     font-family: 'DM Sans', sans-serif !important; font-weight: 600 !important;
     font-size: 13px !important; letter-spacing: .04em !important;
     width: 100% !important; padding: 10px !important;
 }
-section[data-testid="stSidebar"] .stButton button:hover { background: #ffffff !important; }
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] * { color: #0a0a0a !important; background: transparent !important; }
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover { background: #ffffff !important; }
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover * { color: #0a0a0a !important; }
 section[data-testid="stSidebar"] .stRadio label { font-size: 12px !important; }
 
 [data-testid="metric-container"] {
@@ -139,6 +164,11 @@ section[data-testid="stSidebar"] .stRadio label { font-size: 12px !important; }
 .disclaimer { font-size:11px; color:#bbb; margin-top:1rem; padding:.6rem .9rem; background:#f9f9f9; border-radius:6px; border-left:3px solid #e0e0e0; line-height:1.6; }
 
 .building-badge { display:inline-block; font-size:11px; color:#92400e; background:#fffbeb; padding:3px 10px; border-radius:4px; border:1px solid #fde68a; }
+
+/* collapse button is a div wrapper, not a button element */
+[data-testid="stSidebarCollapseButton"], [data-testid="collapsedControl"] { display:none !important; }
+
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -684,23 +714,27 @@ def _mock_state(ticker: str) -> Dict:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    # ── Load history from disk once per session ───────────────────────────────
+    if "run_history" not in st.session_state:
+        st.session_state.run_history = _load_history()
+
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("""
         <div style="margin-bottom:1.5rem">
             <div style="font-size:22px;font-weight:700;color:#e0e0e0;
-                        font-family:'DM Mono',monospace;letter-spacing:.06em">◈ SIGNAL</div>
+                        font-family:'DM Mono',monospace;letter-spacing:.06em">◈ StockSentinel</div>
             <div style="font-size:11px;color:#555;margin-top:2px;letter-spacing:.04em">
-                AI TRADING ANALYSIS</div>
+                AI STOCK ANALYSIS SYSTEM</div>
         </div>
         """, unsafe_allow_html=True)
 
-        ticker_input = st.text_input(
-            "Ticker", value="", placeholder="Enter ticker (e.g. AAPL)",
-            label_visibility="collapsed",
-        ).upper().strip()
-
-        run_btn = st.button("Analyse", type="primary", use_container_width=True)
+        with st.form("ticker_form", border=False):
+            ticker_input = st.text_input(
+                "Ticker", value="", placeholder="Enter ticker (e.g. AAPL)",
+                label_visibility="collapsed",
+            ).upper().strip()
+            run_btn = st.form_submit_button("Analyse", type="primary", use_container_width=True)
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
         view_mode = st.radio(
@@ -719,6 +753,30 @@ def main():
                 <b style="color:#888">Simulations</b><br/>1,000 GBM paths
             </div>""", unsafe_allow_html=True)
 
+        # ── History ───────────────────────────────────────────────────────────
+        history = st.session_state.get("run_history", [])
+        if history:
+            st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div style="font-size:10px;font-weight:600;text-transform:uppercase;
+                        letter-spacing:.08em;color:#555;margin-bottom:6px">History</div>
+            """, unsafe_allow_html=True)
+            today = datetime.now().date()
+            for i, entry in enumerate(history):
+                ts: datetime = entry["timestamp"]
+                label = f"{entry['ticker']}  ·  {ts.strftime('%H:%M')}" if ts.date() == today \
+                    else f"{entry['ticker']}  ·  {ts.strftime('%d %b')}"
+                col_h, col_r = st.columns([3, 1]) if ts.date() < today else (st.columns([1])[0], None)
+                with col_h:
+                    if st.button(label, key=f"hist_{i}", use_container_width=True):
+                        st.session_state.state       = entry["state"]
+                        st.session_state.last_ticker = entry["ticker"]
+                        st.session_state.elapsed     = entry["elapsed"]
+                if col_r is not None:
+                    with col_r:
+                        if st.button("↺", key=f"rerun_{i}", help="Rerun analysis"):
+                            st.session_state.rerun_ticker = entry["ticker"]
+
         if not PIPELINE_AVAILABLE:
             st.markdown("""
             <div style="margin-top:1rem;font-size:10px;color:#c0392b;
@@ -728,16 +786,21 @@ def main():
             </div>""", unsafe_allow_html=True)
 
     # ── Run pipeline ──────────────────────────────────────────────────────────
-    if run_btn:
-        if not ticker_input:
+    _rerun_ticker = None
+    if "rerun_ticker" in st.session_state:
+        _rerun_ticker = st.session_state["rerun_ticker"]
+        del st.session_state["rerun_ticker"]
+    _effective_ticker = ticker_input or _rerun_ticker or ""
+    if run_btn or _rerun_ticker:
+        if not _effective_ticker:
             st.sidebar.warning("Please enter a ticker symbol.")
         else:
-            with st.spinner(f"Running analysis for {ticker_input}…"):
+            with st.spinner(f"Running analysis for {_effective_ticker}…"):
                 t0 = datetime.now()
                 pipeline_error: Optional[str] = None
                 if PIPELINE_AVAILABLE:
                     try:
-                        state = asyncio.run(run_stock_analysis_async(ticker_input))
+                        state = asyncio.run(run_stock_analysis_async(_effective_ticker))
                     except Exception as e:
                         # ExceptionGroup (Python 3.11+ TaskGroup) hides the real cause.
                         # Unwrap one level so the user sees the actual sub-exception.
@@ -749,14 +812,26 @@ def main():
                             pipeline_error = f"{e}\n\nSub-exceptions:\n{causes}"
                         else:
                             pipeline_error = f"{type(e).__name__}: {e}"
-                        state = _mock_state(ticker_input)
+                        state = _mock_state(_effective_ticker)
                 else:
                     pipeline_error = "Pipeline not available — import failed."
-                    state = _mock_state(ticker_input)
+                    state = _mock_state(_effective_ticker)
+                elapsed = (datetime.now() - t0).total_seconds()
                 st.session_state.state          = state
-                st.session_state.last_ticker    = ticker_input
-                st.session_state.elapsed        = (datetime.now() - t0).total_seconds()
+                st.session_state.last_ticker    = _effective_ticker
+                st.session_state.elapsed        = elapsed
                 st.session_state.pipeline_error = pipeline_error
+                # Append to run history (max 10 entries, most recent first)
+                if "run_history" not in st.session_state:
+                    st.session_state.run_history = []
+                st.session_state.run_history.insert(0, {
+                    "ticker":    _effective_ticker,
+                    "timestamp": datetime.now(),
+                    "state":     state,
+                    "elapsed":   elapsed,
+                })
+                st.session_state.run_history = st.session_state.run_history[:10]
+                _save_history(st.session_state.run_history)
 
     if "state" not in st.session_state:
         st.info("Enter a ticker in the sidebar and click **Analyse** to start.")
@@ -801,7 +876,7 @@ def main():
     with col_t:
         st.markdown(f"""
         <div style="font-family:'DM Mono',monospace;font-size:28px;font-weight:700;
-                    color:#0a0a0a;letter-spacing:.04em;line-height:1">{ticker}</div>
+                    color:#ffffff;letter-spacing:.04em;line-height:1">{ticker}</div>
         <div style="font-size:11px;color:#aaa;margin-top:3px;letter-spacing:.04em">
             {datetime.now().strftime('%d %b %Y · %H:%M')}</div>
         """, unsafe_allow_html=True)
@@ -1105,14 +1180,19 @@ def main():
     exp_col, detail_col = st.columns([3, 2])
 
     with exp_col:
+        import re as _re
         if view_mode == "Beginner":
+            _beg = _re.sub(r'(?i)#+\s*\d*\.?\s*DISCLAIMER.*', '', llm.get("beginner_explanation", ""), flags=_re.DOTALL).strip()
             st.markdown(
-                f'<div class="explanation-body">'
-                f'{llm.get("beginner_explanation","")}</div>',
+                f'<div class="explanation-body">{_beg}</div>',
                 unsafe_allow_html=True,
             )
         else:
-            st.markdown(llm.get("technical_explanation", ""))
+            _tech = _re.sub(r'(?i)#+\s*\d*\.?\s*DISCLAIMER.*', '', llm.get("technical_explanation", ""), flags=_re.DOTALL).strip()
+            st.markdown(
+                f'<div class="explanation-body">{_tech}</div>',
+                unsafe_allow_html=True,
+            )
 
     with detail_col:
         st.markdown("**Signal quality**")
@@ -1212,37 +1292,31 @@ def main():
             </table>""", unsafe_allow_html=True)
 
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        st.markdown("**Risk**")
         alerts       = risk.get("alerts") or []
         risk_factors = risk.get("primary_risk_factors") or []
         pnd          = int(risk.get("pump_and_dump_score") or 0)
         _beta        = risk.get("beta", 1.0)
         _vix         = risk.get("vix_level", 20.0)
+        alert_rows = "".join(
+            f'<div style="font-size:13px;color:#ff6b6b;margin-top:5px;line-height:1.5">⚠ {a}</div>'
+            for a in alerts[:3]
+        )
         st.markdown(f"""
-        <div style="font-size:12px;color:#666;line-height:1.9">
-            Manipulation risk &nbsp;{risk_badge(risk_level)}<br/>
-            P&D score &nbsp;<span style="font-family:'DM Mono'">{pnd}/100</span><br/>
-            Volatility risk &nbsp;{risk_badge(vol_risk)}<br/>
-            Beta &nbsp;<span style="font-family:'DM Mono'">{_beta:.2f}</span> &nbsp;·&nbsp;
-            VIX &nbsp;<span style="font-family:'DM Mono'">{_vix:.1f}</span><br/>
-            Alerts &nbsp;<span style="font-family:'DM Mono'">{len(alerts)}</span><br/>
-            Risk factors &nbsp;<span style="font-family:'DM Mono'">{len(risk_factors)}</span>
+        <div style="background:transparent;border:1px solid #ffffff33;border-radius:8px;padding:14px 16px;margin-top:4px">
+            <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:#ffffff99;margin-bottom:10px">Risk</div>
+            <div style="font-size:14px;color:#ffffff;line-height:2.1">
+                <span style="color:#ffffff99;font-size:12px">Manipulation risk</span>&nbsp;&nbsp;{risk_badge(risk_level)}<br/>
+                <span style="color:#ffffff99;font-size:12px">P&D score</span>&nbsp;&nbsp;<span style="font-family:'DM Mono';font-weight:600">{pnd}/100</span><br/>
+                <span style="color:#ffffff99;font-size:12px">Volatility risk</span>&nbsp;&nbsp;{risk_badge(vol_risk)}<br/>
+                <span style="color:#ffffff99;font-size:12px">Beta</span>&nbsp;&nbsp;<span style="font-family:'DM Mono';font-weight:600">{_beta:.2f}</span>&nbsp;&nbsp;·&nbsp;&nbsp;<span style="color:#ffffff99;font-size:12px">VIX</span>&nbsp;&nbsp;<span style="font-family:'DM Mono';font-weight:600">{_vix:.1f}</span><br/>
+                <span style="color:#ffffff99;font-size:12px">Alerts</span>&nbsp;&nbsp;<span style="font-family:'DM Mono';font-weight:600">{len(alerts)}</span>&nbsp;&nbsp;·&nbsp;&nbsp;<span style="color:#ffffff99;font-size:12px">Risk factors</span>&nbsp;&nbsp;<span style="font-family:'DM Mono';font-weight:600">{len(risk_factors)}</span>
+            </div>
+            {alert_rows}
         </div>""", unsafe_allow_html=True)
-        for a in alerts[:3]:
-            st.markdown(
-                f'<div style="font-size:11px;color:#991b1b;margin-top:3px">⚠ {a}</div>',
-                unsafe_allow_html=True,
-            )
 
     # ── Signal diagnostics ────────────────────────────────────────────────────
     render_signal_diagnostics(diag)
 
-    # ── Disclaimer ────────────────────────────────────────────────────────────
-    st.markdown("""
-    <div class="disclaimer">
-        This is an automated analysis, not financial advice.
-        Always conduct your own research before making investment decisions.
-    </div>""", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

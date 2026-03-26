@@ -238,15 +238,3 @@ def render_signal_diagnostics(diag: Dict[str, Any]) -> None:
                 f"(needs ≥{_MIN_SIGNALS_SUFFICIENT})"
             )
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    if issues:
-        for issue in issues:
-            st.markdown(
-                f'<div style="font-size:11px;color:#991b1b;margin-top:3px">⚠ {issue}</div>',
-                unsafe_allow_html=True,
-            )
-    else:
-        st.markdown(
-            '<div style="font-size:11px;color:#065f46">✓ All streams have sufficient signal data.</div>',
-            unsafe_allow_html=True,
-        )
