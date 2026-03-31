@@ -1028,13 +1028,39 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
 
     try:
         # ------------------------------------------------------------------
+        # MCP compatibility layer:
+        # - Legacy tool surface: profile-symbol / historical-*/quote direct tools
+        # - Current tool surface: company / marketPerformance / chart / quote(endpoint=...)
+        # Keeps Node 6 output schema unchanged for downstream nodes.
+        # ------------------------------------------------------------------
+        company_tool = tools_by_name.get("company")
+        market_performance_tool = tools_by_name.get("marketPerformance")
+        chart_tool = tools_by_name.get("chart")
+
+        async def _invoke_with_payload_fallbacks(tool: Any, payloads: List[Dict[str, Any]]) -> Any:
+            last_exc: Optional[Exception] = None
+            for payload in payloads:
+                try:
+                    return await tool.ainvoke(payload)
+                except Exception as exc:  # try next payload style
+                    last_exc = exc
+            if last_exc is not None:
+                raise last_exc
+            return None
+
+        # ------------------------------------------------------------------
         # Step 1: company_profile (Pattern A)
         # ------------------------------------------------------------------
         company_profile_tool = tools_by_name.get("profile-symbol")
         company_profile_data: Dict[str, Any] = {}
-        if company_profile_tool is not None:
+        if company_profile_tool is not None or company_tool is not None:
             try:
-                raw_profile = await company_profile_tool.ainvoke({"symbol": ticker})
+                if company_profile_tool is not None:
+                    raw_profile = await company_profile_tool.ainvoke({"symbol": ticker})
+                else:
+                    raw_profile = await company_tool.ainvoke(
+                        {"endpoint": "profile-symbol", "symbol": ticker}
+                    )
                 parsed_profile = _parse_tool_response(raw_profile)
                 if isinstance(parsed_profile, list) and parsed_profile:
                     company_profile_data = parsed_profile[0]
@@ -1115,9 +1141,14 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         commodity_trends: Dict[str, str] = {}
 
         sector_tool = tools_by_name.get("historical-sector-performance")
-        if sector_tool is not None and sector != "Unknown":
+        if (sector_tool is not None or market_performance_tool is not None) and sector != "Unknown":
             try:
-                raw = await sector_tool.ainvoke({"sector": sector})
+                if sector_tool is not None:
+                    raw = await sector_tool.ainvoke({"sector": sector})
+                else:
+                    raw = await market_performance_tool.ainvoke(
+                        {"endpoint": "historical-sector-performance", "sector": sector}
+                    )
                 logger.info(f"[Node 6] RAW sector response (first 500 chars): {str(raw)[:500]}")
                 data = _parse_tool_response(raw)
                 if isinstance(data, list) and len(data) >= 6:
@@ -1144,9 +1175,14 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
                 )
 
         industry_tool = tools_by_name.get("historical-industry-performance")
-        if industry_tool is not None and industry != "Unknown":
+        if (industry_tool is not None or market_performance_tool is not None) and industry != "Unknown":
             try:
-                raw = await industry_tool.ainvoke({"industry": industry})
+                if industry_tool is not None:
+                    raw = await industry_tool.ainvoke({"industry": industry})
+                else:
+                    raw = await market_performance_tool.ainvoke(
+                        {"endpoint": "historical-industry-performance", "industry": industry}
+                    )
                 data = _parse_tool_response(raw)
                 if isinstance(data, list) and len(data) >= 6:
                     # data is ordered newest first
@@ -1173,10 +1209,21 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
 
         # SPY historical prices – use FMP historical-price-eod-light.
         spy_history_tool = tools_by_name.get("historical-price-eod-light")
-        if spy_history_tool is not None:
+        if spy_history_tool is not None or chart_tool is not None:
             try:
-                # Request at least 30 calendar days to guarantee 21 trading days.
-                raw = await spy_history_tool.ainvoke({"symbol": "SPY", "days": 30})
+                if spy_history_tool is not None:
+                    # Legacy shape used by older MCP adapters.
+                    raw = await spy_history_tool.ainvoke({"symbol": "SPY", "days": 30})
+                else:
+                    # Current MCP chart endpoint expects explicit date range.
+                    to_date = datetime.now(tz=timezone.utc).date()
+                    from_date = to_date - timedelta(days=45)
+                    raw = await chart_tool.ainvoke({
+                        "endpoint": "historical-price-eod-light",
+                        "symbol": "SPY",
+                        "from": str(from_date),
+                        "to": str(to_date),
+                    })
                 data = _parse_tool_response(raw)
                 if isinstance(data, list):
                     spy_closes = [
@@ -1199,7 +1246,14 @@ async def market_context_node(state: StockAnalysisState, config: RunnableConfig)
         vix_quote_tool = tools_by_name.get("quote")
         if vix_quote_tool is not None:
             try:
-                raw = await vix_quote_tool.ainvoke({"symbol": "^VIX"})
+                # Try legacy payload first, then current MCP payload requiring endpoint.
+                raw = await _invoke_with_payload_fallbacks(
+                    vix_quote_tool,
+                    [
+                        {"symbol": "^VIX"},
+                        {"endpoint": "quote", "symbol": "^VIX"},
+                    ],
+                )
                 data = _parse_tool_response(raw)
                 if isinstance(data, list) and data:
                     vix_price = float(data[0].get("price") or vix_price)

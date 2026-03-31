@@ -239,6 +239,7 @@ async def detect_related_companies_node(
         # ------------------------------------------------------------------
         peers: List[str] = []
         peers_tool = tools_by_name.get("peers")
+        company_tool = tools_by_name.get("company")
         if peers_tool is not None:
             try:
                 raw = await peers_tool.ainvoke({"symbol": ticker})
@@ -249,8 +250,20 @@ async def detect_related_companies_node(
                 logger.info(f"[Node 3] FMP peers → {len(peers)} peers: {peers}")
             except Exception as exc:
                 logger.warning(f"[Node 3] peers tool failed for {ticker}: {exc}")
+        elif company_tool is not None:
+            # New FMP MCP schema exposes peers as company(endpoint="peers", ...).
+            try:
+                raw = await company_tool.ainvoke({"endpoint": "peers", "symbol": ticker})
+                parsed = _parse_tool_response(raw)
+                peers = _extract_tickers(parsed)
+                peers = [p for p in peers if p != ticker.upper()]
+                logger.info(f"[Node 3] FMP company/peers → {len(peers)} peers: {peers}")
+            except Exception as exc:
+                logger.warning(f"[Node 3] company(peers) failed for {ticker}: {exc}")
         else:
-            logger.warning("[Node 3] 'peers' tool not found in tools_by_name — check tool names")
+            logger.warning(
+                "[Node 3] neither 'peers' nor 'company' tool found in tools_by_name — check MCP tool names"
+            )
 
         # Fallback when FMP returned nothing
         if not peers:
@@ -279,19 +292,23 @@ async def detect_related_companies_node(
         peer_descriptions: Dict[str, str] = {}
 
         profile_tool = tools_by_name.get("profile-symbol")
-        if profile_tool is not None:
+        if profile_tool is not None or company_tool is not None:
             symbols_to_fetch = [ticker] + peers
 
             async def _fetch_profile(sym: str) -> tuple[str, dict]:
                 try:
-                    raw = await profile_tool.ainvoke({"symbol": sym})
+                    if profile_tool is not None:
+                        raw = await profile_tool.ainvoke({"symbol": sym})
+                    else:
+                        # New FMP MCP schema: company(endpoint="profile-symbol", ...).
+                        raw = await company_tool.ainvoke({"endpoint": "profile-symbol", "symbol": sym})
                     parsed = _parse_tool_response(raw)
                     if isinstance(parsed, list) and parsed:
                         return sym, parsed[0]
                     if isinstance(parsed, dict):
                         return sym, parsed
                 except Exception as exc:
-                    logger.warning(f"[Node 3] profile-symbol failed for {sym}: {exc}")
+                    logger.warning(f"[Node 3] profile lookup failed for {sym}: {exc}")
                 return sym, {}
 
             results = await asyncio.gather(*[_fetch_profile(s) for s in symbols_to_fetch])
@@ -315,7 +332,9 @@ async def detect_related_companies_node(
 
             logger.info(f"[Node 3] {ticker} — sector={sector}, industry={industry}")
         else:
-            logger.warning("[Node 3] profile-symbol tool not found — LLM will use ticker symbols only")
+            logger.warning(
+                "[Node 3] neither 'profile-symbol' nor 'company' tool found — LLM will use ticker symbols only"
+            )
             for p in peers:
                 peer_descriptions[p] = "No description available."
 
