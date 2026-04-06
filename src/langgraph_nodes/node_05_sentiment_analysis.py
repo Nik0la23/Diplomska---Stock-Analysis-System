@@ -231,12 +231,11 @@ def analyze_text_with_finbert(text: str, model) -> Dict[str, float]:
         if not text:
             return {'label': 'neutral', 'score': 0.0, 'sentiment': 0.0}
         
-        # Truncate to avoid token limit (rough estimate: 512 tokens ≈ 2000 chars)
-        if len(text) > 2000:
-            text = text[:2000]
-        
-        # Run FinBERT
-        results = model(text)[0]  # Returns list of dicts
+        # Let the tokenizer truncate at the 512-token boundary rather than
+        # guessing a safe char count.  Char-based truncation is unreliable for
+        # dense financial text (SEC filings average ~3 chars/token, not ~4),
+        # which caused chunks to silently exceed the limit and return 0.0.
+        results = model(text, truncation=True, max_length=512)[0]
         
         # Find highest-confidence label
         best_result = max(results, key=lambda x: x['score'])

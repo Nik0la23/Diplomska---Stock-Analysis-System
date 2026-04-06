@@ -858,6 +858,7 @@ def main():
     viz  = dd.get("visualization")        or {}
     macro= dd.get("macro_factors")        or {}
     peers= dd.get("peer_companies")       or {}
+    sec_fund = dd.get("sec_fundamentals") or {}
     diag = dd.get("diagnostics")          or {}
     tw   = dd.get("trustworthiness")      or {}
     mp   = dd.get("model_performance")    or {}
@@ -1173,6 +1174,159 @@ def main():
             </table>""",
             unsafe_allow_html=True,
         )
+
+    # ── SEC Fundamentals (Node 16) ────────────────────────────────────────────
+    if sec_fund.get("available"):
+        st.markdown(
+            '<div class="section-header">SEC Fundamentals</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Summary row: quarters coverage / revenue / margin ───────────────
+        _TREND_COLORS = {
+            "growing":   ("#14532d", "#86efac"),
+            "improving": ("#14532d", "#86efac"),
+            "stable":    ("#374151", "#d1d5db"),
+            "declining": ("#7f1d1d", "#fca5a5"),
+            "mixed":     ("#78350f", "#fcd34d"),
+        }
+
+        def _fund_badge(label: str, color_map: dict, key: str) -> str:
+            bg, fg = color_map.get(key, ("#374151", "#d1d5db"))
+            return (
+                f'<span style="background:{bg};color:{fg};padding:3px 10px;'
+                f'border-radius:4px;font-size:12px;font-family:\'DM Mono\','
+                f'monospace;font-weight:600;white-space:nowrap">{label}</span>'
+            )
+
+        rev_tr  = sec_fund.get("revenue_trend",  "stable")
+        mrg_tr  = sec_fund.get("margin_trend",   "stable")
+        mgmt_s  = sec_fund.get("management_sentiment")
+        events  = sec_fund.get("recent_events") or []
+        f_dates = sec_fund.get("filing_dates") or []
+        qs      = sec_fund.get("quarters_covered", 0)
+        dq      = sec_fund.get("data_quality", "partial")
+
+        rev_badge = _fund_badge(rev_tr.capitalize(), _TREND_COLORS, rev_tr)
+        mrg_badge = _fund_badge(mrg_tr.capitalize(), _TREND_COLORS, mrg_tr)
+
+        dq_color = (
+            "#4ade80" if dq == "complete" else "#fbbf24" if dq == "partial" else "#f87171"
+        )
+        quarters_line = (
+            f'<span style="font-family:\'DM Mono\',monospace;font-size:15px;'
+            f'font-weight:600;color:#e5e7eb">{qs}Q</span>'
+            f'<span style="color:{dq_color};font-size:13px;margin-left:6px">· {dq}</span>'
+        )
+
+        # Sentiment bar: -1 (red) → 0 (grey) → +1 (green), 200px wide
+        if mgmt_s is not None:
+            pct_pos = int((mgmt_s + 1) / 2 * 100)
+            bar_color = "#22c55e" if mgmt_s >= 0 else "#ef4444"
+            sent_html = (
+                f'<div style="font-size:11px;color:#6b7280;margin-bottom:4px">'
+                f'Management tone '
+                f'<span style="font-family:\'DM Mono\',monospace;'
+                f'color:#e5e7eb">{mgmt_s:+.3f}</span></div>'
+                f'<div style="background:#374151;border-radius:3px;height:6px;width:200px">'
+                f'<div style="background:{bar_color};width:{pct_pos}%;height:6px;border-radius:3px"></div>'
+                f'</div>'
+            )
+        else:
+            sent_html = '<div style="font-size:11px;color:#6b7280">Management tone N/A</div>'
+
+        events_html = "".join(
+            f'<span style="background:#1f2937;color:#d1d5db;padding:2px 8px;'
+            f'border-radius:3px;font-size:11px;margin-right:4px;margin-bottom:4px;'
+            f'display:inline-block;font-family:\'DM Mono\',monospace">{ev}</span>'
+            for ev in events[:6]
+        ) or '<span style="color:#6b7280;font-size:11px">No recent events</span>'
+
+        dates_str = " · ".join(f_dates) if f_dates else "—"
+
+        st.markdown(
+            f"""<div style="background:#111827;border-radius:8px;
+                padding:16px 20px;margin-bottom:16px">
+              <div style="display:flex;align-items:flex-start;gap:32px;flex-wrap:wrap">
+                <div>
+                  <div style="font-size:11px;color:#6b7280;margin-bottom:6px">Filing coverage</div>
+                  {quarters_line}
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#6b7280;margin-bottom:6px">Revenue trend</div>
+                  {rev_badge}
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#6b7280;margin-bottom:6px">Margin trend</div>
+                  {mrg_badge}
+                </div>
+                <div>
+                  {sent_html}
+                </div>
+              </div>
+              <div style="margin-top:14px">
+                <div style="font-size:11px;color:#6b7280;margin-bottom:6px">Recent events</div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px">{events_html}</div>
+              </div>
+              <div style="margin-top:10px;font-size:11px;color:#4b5563">
+                Filings: {dates_str}
+              </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        # ── Peer filing events ───────────────────────────────────────────────
+        peer_fc_list = sec_fund.get("peers") or []
+        if peer_fc_list:
+            peer_fc_rows = ""
+            for p in peer_fc_list:
+                pt      = p.get("ticker", "—")
+                rel     = p.get("relationship", "")
+                p_evs   = p.get("recent_events") or []
+                p_sent  = p.get("event_sentiment")
+                bg_c, txt_c = {
+                    "COMPETITOR":  ("#7f1d1d", "#fca5a5"),
+                    "SUPPLIER":    ("#14532d", "#86efac"),
+                    "CUSTOMER":    ("#1e3a5f", "#93c5fd"),
+                    "SAME_SECTOR": ("#374151", "#d1d5db"),
+                    "PARTNER":     ("#3b0764", "#d8b4fe"),
+                }.get(rel, ("#374151", "#d1d5db"))
+                rel_label   = rel.replace("_", " ").title()
+                rel_badge   = (
+                    f'<span style="background:{bg_c};color:{txt_c};'
+                    f'padding:2px 7px;border-radius:4px;font-size:11px;'
+                    f'font-family:\'DM Mono\',monospace">{rel_label}</span>'
+                )
+                evs_text = ", ".join(p_evs[:3]) if p_evs else "—"
+                if p_sent is not None:
+                    sc_color = "#4ade80" if p_sent > 0.05 else "#f87171" if p_sent < -0.05 else "#9ca3af"
+                    sent_cell = f'<span style="font-family:\'DM Mono\',monospace;color:{sc_color}">{p_sent:+.3f}</span>'
+                else:
+                    sent_cell = '<span style="color:#6b7280">N/A</span>'
+                peer_fc_rows += (
+                    f"<tr>"
+                    f'<td style="font-size:13px;padding:6px 10px;color:#e5e7eb;'
+                    f'font-family:\'DM Mono\',monospace;font-weight:600">{pt}</td>'
+                    f'<td style="padding:6px 10px">{rel_badge}</td>'
+                    f'<td style="font-size:12px;color:#9ca3af;padding:6px 10px">{evs_text}</td>'
+                    f'<td style="padding:6px 10px;text-align:right">{sent_cell}</td>'
+                    f"</tr>"
+                )
+            st.markdown(
+                f"""<table style="width:100%;border-collapse:collapse;
+                    background:#111827;border-radius:8px;overflow:hidden;margin-bottom:12px">
+                  <thead>
+                    <tr style="border-bottom:1px solid #374151">
+                      <th style="text-align:left;padding:8px 10px;font-size:11px;color:#6b7280;font-weight:500">Peer</th>
+                      <th style="text-align:left;padding:8px 10px;font-size:11px;color:#6b7280;font-weight:500">Relationship</th>
+                      <th style="text-align:left;padding:8px 10px;font-size:11px;color:#6b7280;font-weight:500">Recent 8-K events</th>
+                      <th style="text-align:right;padding:8px 10px;font-size:11px;color:#6b7280;font-weight:500">Event sentiment</th>
+                    </tr>
+                  </thead>
+                  <tbody>{peer_fc_rows}</tbody>
+                </table>""",
+                unsafe_allow_html=True,
+            )
 
     # ── Analysis text ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Analysis</div>',

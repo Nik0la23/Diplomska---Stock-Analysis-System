@@ -10,6 +10,7 @@ Reads from state:
   PRIMARY   — signal_components  (Node 12 output: signal, streams, risk, pattern, prices)
   SECONDARY — sentiment_breakdown (Node 5: top articles, per-stream labels)
   TERTIARY  — technical_indicators, monte_carlo_results, ticker (direct fields)
+  OPTIONAL  — fundamental_context (Node 16: SEC filing trends, management sentiment, peer events)
 
 Writes to state:
   beginner_explanation     — plain string, 250-400 words
@@ -86,6 +87,58 @@ stock likely to be?). These are different things and beginners confuse them."""
 
 
 # ============================================================================
+# HELPER: SEC FUNDAMENTALS BLOCK (Node 16 enhancement)
+# ============================================================================
+
+def _build_fundamentals_block_beginner(fc: Dict[str, Any]) -> str:
+    """
+    Build a short plain-English SEC fundamentals data block for the user prompt.
+
+    Omitted entirely when fundamental_context is absent or data_quality is
+    'unavailable' — the LLM never sees a gap it needs to explain.
+
+    Args:
+        fc: fundamental_context dict from state (may be empty).
+
+    Returns:
+        Formatted string ready to append to the user prompt, or "".
+    """
+    if not fc or fc.get("data_quality") == "unavailable":
+        return ""
+
+    target       = fc.get("target") or {}
+    divergences  = fc.get("divergences") or []
+    fund_signal  = fc.get("fundamental_signal", "NEUTRAL")
+    data_quality = fc.get("data_quality", "partial")
+    mgmt         = target.get("management_sentiment")
+    events       = target.get("recent_events") or []
+
+    lines = [
+        f"\nSEC FUNDAMENTALS (from official filings — data_quality={data_quality}):",
+        f"- Revenue trend: {target.get('revenue_trend', 'unknown')}",
+        f"- Margin trend:  {target.get('margin_trend', 'unknown')}",
+    ]
+    if mgmt is not None:
+        lines.append(f"- Management tone in filings (FinBERT score): {mgmt:.3f}")
+    if events:
+        lines.append(f"- Recent corporate events: {', '.join(events[:3])}")
+    lines.append(f"- Filing-based fundamental signal: {fund_signal}")
+    if divergences:
+        lines.append("- Peer divergences flagged:")
+        for d in divergences[:2]:
+            lines.append(f"  • {d}")
+
+    lines.append(
+        "\nINSTRUCTION: Add a short 'Company Financials:' paragraph at the very end "
+        "of section 3 (What's Driving This). Use 2-3 plain-English sentences: translate "
+        "revenue/margin trends into everyday language, describe management tone as "
+        "'cautious', 'optimistic', or 'neutral', and mention any meaningful peer "
+        "divergence. Skip this paragraph only if data_quality is 'unavailable'."
+    )
+    return "\n".join(lines)
+
+
+# ============================================================================
 # HELPER: TRANSLATE RAW SCORE TO PLAIN LANGUAGE
 # ============================================================================
 
@@ -153,6 +206,7 @@ def _build_user_prompt(
     macro_factors: Optional[List[Dict[str, Any]]] = None,
     related_companies: Optional[List[Dict[str, Any]]] = None,
     mc_ctx: Optional[Dict[str, Any]] = None,
+    fc: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Assemble the dynamic data block from pre-extracted state dicts.
@@ -164,6 +218,7 @@ def _build_user_prompt(
         macro_factors:     identified_factors list from Node 6 (may be None/empty).
         related_companies: related_companies list from Node 3 (may be None/empty).
         mc_ctx:            market_context dict from Node 6 (may be None/empty).
+        fc:                fundamental_context dict from Node 16 (optional).
 
     Returns:
         Formatted user prompt string ready to send to the LLM.
@@ -357,13 +412,16 @@ def _build_user_prompt(
                 + "\n"
             )
 
-    # --- CONVICTION LABEL (FIX 3) ---
+    # --- CONVICTION LABEL ---
     if signal_strength < 34:
         conviction_label = "weak — indicators are pulling in different directions"
     elif signal_strength < 67:
         conviction_label = "moderate — indicators are broadly aligned"
     else:
         conviction_label = "strong — indicators are well-aligned"
+
+    # --- SEC FUNDAMENTALS BLOCK (Node 16 optional enhancement) ---
+    fundamentals_block = _build_fundamentals_block_beginner(fc or {})
 
     return f"""WORD BUDGET PER SECTION (treat as approximate upper bounds):
 1. Headline: 15 words max
@@ -395,7 +453,8 @@ SIGNAL:
 
 STREAM DIRECTIONS (translate these to plain English in section 3):
 {streams_block}
-{commodity_section}{peers_section}
+{commodity_section}{peers_section}{fundamentals_block}
+
 {top_articles_block}
 
 PRICE TARGETS:
@@ -496,6 +555,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         mc_ctx.get("macro_factor_exposure", {}).get("identified_factors", []) or []
     )
     related_companies: List[Dict[str, Any]] = state.get("related_companies") or []
+    fc: Dict[str, Any]           = state.get("fundamental_context") or {}
 
     # =========================================================================
     # STEP 2: Guard — signal_components is required
@@ -514,7 +574,7 @@ def beginner_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # =========================================================================
     # STEP 3: Build prompts
     # =========================================================================
-    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors, related_companies, mc_ctx)
+    user_prompt = _build_user_prompt(sc, sb, ticker, macro_factors, related_companies, mc_ctx, fc)
 
     logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")
 

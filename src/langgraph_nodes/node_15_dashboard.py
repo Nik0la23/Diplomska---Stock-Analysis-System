@@ -619,6 +619,50 @@ def _peer_companies(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _sec_fundamentals(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tier 2 — SEC filing analysis from Node 16.
+
+    Passes through the fundamental_context dict with a thin reshaping so
+    the Streamlit app never reads state directly.  Returns an empty-but-safe
+    dict when Node 16 did not run or returned data_quality='unavailable'.
+    """
+    fc = state.get("fundamental_context") or {}
+    if not fc or fc.get("data_quality") == "unavailable":
+        return {"available": False}
+
+    target      = fc.get("target") or {}
+    peers_raw   = fc.get("peers") or {}
+    divergences = fc.get("divergences") or []
+
+    # Flatten peers dict → list for easier iteration in the UI
+    peers_list = [
+        {
+            "ticker":        pt,
+            "relationship":  pd.get("relationship", ""),
+            "recent_events": pd.get("recent_events") or [],
+            "event_sentiment": pd.get("event_sentiment"),
+            "filing_dates":  pd.get("filing_dates") or [],
+        }
+        for pt, pd in peers_raw.items()
+    ]
+
+    return {
+        "available":              True,
+        "fundamental_signal":     fc.get("fundamental_signal", "NEUTRAL"),
+        "fundamental_confidence": fc.get("fundamental_confidence", 0.0),
+        "data_quality":           fc.get("data_quality", "partial"),
+        "revenue_trend":          target.get("revenue_trend", "stable"),
+        "margin_trend":           target.get("margin_trend", "stable"),
+        "management_sentiment":   target.get("management_sentiment"),
+        "recent_events":          target.get("recent_events") or [],
+        "filing_dates":           (target.get("filing_dates") or [])[:3],
+        "quarters_covered":       target.get("quarters_covered", 0),
+        "peers":                  peers_list,
+        "divergences":            divergences,
+    }
+
+
 def _diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Tier 4 — data-availability and backtest-sufficiency counters.
@@ -925,6 +969,7 @@ def dashboard_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "monte_carlo":            _monte_carlo(state),
             "macro_factors":          _macro_factors(state),
             "peer_companies":         _peer_companies(state),
+            "sec_fundamentals":       _sec_fundamentals(state),
             # Tier 3: model quality & validation
             "model_performance":      _model_performance(state),
             "news_intelligence":      _news_intelligence(state),

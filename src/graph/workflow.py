@@ -3,7 +3,7 @@ LangGraph Workflow Builder
 
 Defines the complete stock analysis workflow with all nodes and edges.
 
-Current Flow (Nodes 1-15):
+Current Flow (Nodes 1-16):
  1. Node 1:  Price Data Fetching
  2. Node 3:  Related Companies Detection
  3. Node 2:  Multi-Source News Fetching
@@ -12,13 +12,12 @@ Current Flow (Nodes 1-15):
     └─ fan-in via parallel_join barrier
  6. Node 7:  Monte Carlo (sequential, after parallel join — needs Node 6 market_context)
  7. Node 8:  News Verification & Learning (thesis innovation)
- 8. Node 9B: Behavioral Anomaly Detection
- 9. Node 10: Backtesting (raw accuracy metrics)
-10. Node 11: Adaptive Weights Calculation
-11. Node 12: Final Signal Generation
-12. Node 13: Beginner Explanation (LLM)
-13. Node 14: Technical Explanation (LLM)
-14. Node 15: Dashboard Data Preparation
+ 8. Node 8 → Node 9B → Node 10 → Node 11 → Node 12 (signal chain)
+ 9. Node 16 SEC Fundamentals (sequential after Node 12 — needs final_signal;
+    not parallel with 9B/12 to avoid LangGraph InvalidUpdateError on ticker)
+10. Node 13: Beginner Explanation (LLM)
+11. Node 14: Technical Explanation (LLM)
+12. Node 15: Dashboard Data Preparation
 """
 
 from langgraph.graph import StateGraph, END
@@ -50,6 +49,7 @@ from src.langgraph_nodes.node_12_signal_generation import signal_generation_node
 from src.langgraph_nodes.node_13_beginner_explanation import beginner_explanation_node
 from src.langgraph_nodes.node_14_technical_explanation import technical_explanation_node
 from src.langgraph_nodes.node_15_dashboard import dashboard_node
+from src.langgraph_nodes.node_16_sec_fundamentals import sec_fundamentals_node
 
 logger = logging.getLogger(__name__)
 
@@ -140,11 +140,19 @@ def create_stock_analysis_workflow() -> StateGraph:
     Tech      Sent      Market
     └─────────┴─────────┴─────────┘
       ↓
-    Node 7: Monte Carlo (needs Node 6 market_context)
+    Node 7: Monte Carlo
       ↓
     Node 8: News Verification & Learning
       ↓
-    END
+    Node 9B → Node 10 → Node 11 → Node 12 (signal chain)
+      ↓
+    Node 16: SEC Fundamentals (sequential — needs final_signal)
+      ↓
+    Node 13: Beginner Explanation (LLM)
+      ↓
+    Node 14: Technical Explanation (LLM)
+      ↓
+    Node 15: Dashboard
     ```
     
     Returns:
@@ -196,13 +204,18 @@ def create_stock_analysis_workflow() -> StateGraph:
     # Phase 6: Final Signal Generation (Node 12)
     workflow.add_node("signal_generation", signal_generation_node)
 
-    # Phase 7: Beginner Explanation (Node 13)
+    # Phase 7: SEC Fundamentals (Node 16) — sequential after Node 12 (needs
+    # final_signal; must not run in parallel with 9B/12 — full state returns
+    # collide on ticker and other keys at LangGraph merge)
+    workflow.add_node("sec_fundamentals", sec_fundamentals_node)
+
+    # Phase 8: Beginner Explanation (Node 13)
     workflow.add_node("beginner_explanation", beginner_explanation_node)
 
-    # Phase 8: Technical Explanation (Node 14)
+    # Phase 9: Technical Explanation (Node 14)
     workflow.add_node("technical_explanation", technical_explanation_node)
 
-    # Phase 9: Dashboard Data Preparation (Node 15)
+    # Phase 10: Dashboard Data Preparation (Node 15)
     workflow.add_node("dashboard", dashboard_node)
     
     # ========================================================================
@@ -254,16 +267,27 @@ def create_stock_analysis_workflow() -> StateGraph:
     # then Node 8, then 9B
     workflow.add_edge("run_background_outcomes", "monte_carlo")
     workflow.add_edge("monte_carlo", "news_verification")
+
     workflow.add_edge("news_verification", "behavioral_anomaly_detection")
     workflow.add_edge("behavioral_anomaly_detection", "backtesting")
     workflow.add_edge("backtesting", "adaptive_weights")
     workflow.add_edge("adaptive_weights", "signal_generation")
-    workflow.add_edge("signal_generation", "beginner_explanation")
+
+    # Node 16 after Node 12 — avoids parallel merge with 9B/12 (both return full
+    # state) and supplies final_signal for SEC vs signal divergences
+    workflow.add_edge("signal_generation", "sec_fundamentals")
+
+    workflow.add_edge("sec_fundamentals", "beginner_explanation")
     workflow.add_edge("beginner_explanation", "technical_explanation")
     workflow.add_edge("technical_explanation", "dashboard")
     workflow.add_edge("dashboard", END)
 
-    logger.info("Workflow built successfully (parallel[4,5,6] → background outcomes → Node 7 → Node 8 → Node 9B → Node 10 → Node 11 → Node 12 → Node 13 → Node 14 → Node 15)")
+    logger.info(
+        "Workflow built successfully ("
+        "parallel[4,5,6] → Node 7 → Node 8 → 9B → 10 → 11 → 12 → Node 16 → "
+        "Node 13 → Node 14 → Node 15"
+        ")"
+    )
     
     # Compile and return
     return workflow.compile()

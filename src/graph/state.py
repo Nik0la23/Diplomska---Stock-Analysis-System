@@ -12,6 +12,16 @@ from datetime import datetime
 import operator
 
 
+def _coalesce(a: Any, b: Any) -> Any:
+    """Fan-in reducer: keep the non-None value; b wins when both are non-None.
+
+    Used for keys written by exactly one parallel branch — the other branch
+    returns None (its initial value).  Without this reducer LangGraph errors
+    with InvalidUpdateError when both branches produce the same key.
+    """
+    return b if b is not None else a
+
+
 class StockAnalysisState(TypedDict):
     """
     Complete state for LangGraph stock analysis pipeline.
@@ -140,6 +150,15 @@ class StockAnalysisState(TypedDict):
     # NODE 15: Dashboard Data Preparation
     # ========================================================================
     dashboard_data: Optional[Dict[str, Any]]          # All viz-ready data
+
+
+    # ========================================================================
+    # NODE 16: SEC Fundamentals
+    # ISOLATION: This key is consumed ONLY by Nodes 13 and 14 (LLM explanation
+    # layer). It must NEVER be read by Nodes 4-12. Node 16 runs after Node 12
+    # so historical filing data cannot leak into signal generation or backtesting.
+    # ========================================================================
+    fundamental_context: Annotated[Optional[Dict[str, Any]], _coalesce]  # SEC filing analysis (Nodes 13/14 only)
     
     
     # ========================================================================
@@ -210,6 +229,7 @@ def create_initial_state(ticker: str) -> StockAnalysisState:
         beginner_explanation=None,
         technical_explanation=None,
         dashboard_data=None,
+        fundamental_context=None,
         
         # System tracking
         errors=[],

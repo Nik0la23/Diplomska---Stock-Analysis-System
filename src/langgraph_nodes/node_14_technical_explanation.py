@@ -17,6 +17,7 @@ Reads from state (all tiers):
   TIER 8  — behavioral_anomaly_detection (Node 9B: full detection_breakdown)
   TIER 9  — content_analysis_summary    (Node 9A: anomaly flags)
   TIER 10 — ticker (direct field; technical_signal/confidence removed — see ti dict)
+  TIER 11 — fundamental_context (Node 16: SEC filing trends, management sentiment, peer events)
 
 Writes to state:
   technical_explanation    — markdown string, 600-900 words
@@ -43,6 +44,88 @@ logger = get_node_logger("node_14")
 
 CLAUDE_MODEL: str = "claude-sonnet-4-5"
 MAX_TOKENS: int = 3200  # ~1100 words with per-section budgets and headroom
+
+
+# ============================================================================
+# HELPER: SEC FUNDAMENTALS BLOCK (Node 16 enhancement)
+# ============================================================================
+
+def _build_fundamentals_block_technical(
+    fc: Dict[str, Any],
+    ticker: str,
+) -> str:
+    """
+    Build the structured SEC fundamentals data block for the Node 14 user prompt.
+
+    Omitted entirely when fundamental_context is absent or data_quality is
+    'unavailable'.  When present, the block instructs the LLM to weave findings
+    into the existing 7 sections — no new section is added.
+
+    Args:
+        fc:     fundamental_context dict from state (may be empty).
+        ticker: Stock ticker symbol (used in instruction strings).
+
+    Returns:
+        Formatted string to append to the user prompt, or "".
+    """
+    if not fc or fc.get("data_quality") == "unavailable":
+        return ""
+
+    target          = fc.get("target") or {}
+    peers           = fc.get("peers") or {}
+    divergences     = fc.get("divergences") or []
+    fund_signal     = fc.get("fundamental_signal", "NEUTRAL")
+    fund_confidence = fc.get("fundamental_confidence", 0.0)
+    data_quality    = fc.get("data_quality", "partial")
+
+    target_lines = [
+        f"  ticker:                    {target.get('ticker')}",
+        f"  revenue_trend:             {target.get('revenue_trend')}",
+        f"  margin_trend:              {target.get('margin_trend')}",
+        f"  management_sentiment:      {target.get('management_sentiment')} "
+        f"(FinBERT mean across MD&A + 8-K filings)",
+        f"  recent_events:             {target.get('recent_events')}",
+        f"  filing_dates (most recent):{(target.get('filing_dates') or [])[:3]}",
+        f"  quarters_covered:          {target.get('quarters_covered')}",
+    ]
+
+    peer_lines = []
+    for pt, pd in peers.items():
+        peer_lines.append(
+            f"  {pt} ({pd.get('relationship', '?')}): "
+            f"events={pd.get('recent_events')}  "
+            f"sentiment={pd.get('event_sentiment')}  "
+            f"filed={( pd.get('filing_dates') or [None])[0]}"
+        )
+
+    div_lines = [f"  {i + 1}. {d}" for i, d in enumerate(divergences)]
+
+    block = (
+        f"\n--- SEC FUNDAMENTALS (Node 16) — data_quality={data_quality} ---\n"
+        f"  fundamental_signal:     {fund_signal}\n"
+        f"  fundamental_confidence: {fund_confidence}\n"
+        + "\n".join(target_lines)
+        + (
+            "\n\n  peers:\n" + "\n".join(peer_lines)
+            if peer_lines else "\n  peers: none fetched"
+        )
+        + (
+            "\n\n  divergences:\n" + "\n".join(div_lines)
+            if div_lines else "\n  divergences: none"
+        )
+        + "\n\n"
+        "INSTRUCTION — integrate SEC fundamentals into existing sections only, "
+        "do NOT add a new section:\n"
+        f"- If fundamental_signal contradicts final_signal (e.g. BEARISH while "
+        f"final_signal is BUY, or BULLISH while final_signal is SELL), call this out "
+        f"explicitly in section 1 (Executive Summary) as a fundamental vs quant tension.\n"
+        f"- In section 5 (Market Context & Risk), add a brief 'SEC Filing Context' "
+        f"paragraph: cite management_sentiment, revenue/margin trends, and any peer "
+        f"divergences that are relevant to {ticker}'s risk or competitive position.\n"
+        f"- If data_quality is 'partial', note that only limited filing data was "
+        f"available and findings should be treated as directional only."
+    )
+    return block
 
 
 def _fmt(value: Any, fmt: str = "+.4f", fallback: str = "N/A") -> str:
@@ -138,6 +221,7 @@ def _build_user_prompt(
     ba: Dict[str, Any],
     ca: Dict[str, Any],
     related_companies: Optional[List[Dict[str, Any]]] = None,
+    fc: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Assemble the full data block from pre-extracted state dicts.
@@ -164,6 +248,7 @@ def _build_user_prompt(
         mc:      monte_carlo_results (Node 7).
         ba:      behavioral_anomaly_detection (Node 9B).
         ca:      content_analysis_summary (Node 9A).
+        fc:      fundamental_context (Node 16, optional).
 
     Returns:
         Formatted user prompt string.
@@ -654,7 +739,7 @@ TICKER: {ticker}
 
 --- BEHAVIORAL ANOMALY (Node 9B) ---
 {ba_block}
-"""
+{_build_fundamentals_block_technical(fc or {}, ticker)}"""
 
 
 # ============================================================================
@@ -737,6 +822,7 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     ba:  Dict[str, Any]           = state.get("behavioral_anomaly_detection") or {}
     ca:  Dict[str, Any]           = state.get("content_analysis_summary") or {}
     related_companies: List[Dict[str, Any]] = state.get("related_companies") or []
+    fc:  Dict[str, Any]           = state.get("fundamental_context") or {}
 
     # =========================================================================
     # STEP 2: Guard — signal_components is required
@@ -768,6 +854,7 @@ def technical_explanation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ba=ba,
         ca=ca,
         related_companies=related_companies,
+        fc=fc,
     )
 
     logger.debug(f"  Prompt built ({len(user_prompt)} chars), calling Anthropic...")

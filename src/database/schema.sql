@@ -616,3 +616,53 @@ FROM behavioral_anomaly_results
 WHERE is_pump_and_dump = 1
 ORDER BY analysis_date DESC;
 */
+
+
+-- ============================================================================
+-- NODE 16: SEC FUNDAMENTALS
+-- These tables are consumed ONLY by Nodes 13 and 14 (LLM explanation layer).
+-- They must NEVER be read by Nodes 4-12 to prevent look-ahead bias.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS sec_filings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    form_type TEXT NOT NULL,
+    filed_date TEXT NOT NULL,
+    accession_number TEXT UNIQUE,
+    raw_text TEXT,
+    md_and_a_text TEXT,
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sec_filings_ticker ON sec_filings(ticker, form_type);
+CREATE INDEX IF NOT EXISTS idx_sec_filings_accession ON sec_filings(accession_number);
+
+
+CREATE TABLE IF NOT EXISTS sec_fundamentals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    analysis_date TEXT NOT NULL,
+    revenue_trend TEXT,
+    margin_trend TEXT,
+    management_sentiment REAL,
+    recent_events TEXT,
+    fundamental_signal TEXT,
+    fundamental_confidence REAL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sec_fundamentals_ticker ON sec_fundamentals(ticker, analysis_date DESC);
+
+
+CREATE TABLE IF NOT EXISTS sec_peer_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_ticker TEXT NOT NULL,
+    peer_ticker TEXT NOT NULL,
+    filed_date TEXT NOT NULL,
+    event_description TEXT,
+    event_sentiment REAL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sec_peer_events_target ON sec_peer_events(target_ticker, peer_ticker);
