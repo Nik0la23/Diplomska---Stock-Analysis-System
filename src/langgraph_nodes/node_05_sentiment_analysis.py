@@ -169,9 +169,16 @@ def load_finbert_model():
     
     try:
         logger.info(f"Loading FinBERT model: {FINBERT_MODEL_NAME}")
-        
+
         from transformers import pipeline
-        
+        from src.utils.config import HF_TOKEN
+        if HF_TOKEN:
+            try:
+                from huggingface_hub import login
+                login(token=HF_TOKEN, add_to_git_credential=False)
+            except Exception:
+                pass  # Non-fatal — model is public, token only needed for rate limits
+
         # Load sentiment analysis pipeline with FinBERT
         _FINBERT_MODEL = pipeline(
             "sentiment-analysis",

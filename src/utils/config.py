@@ -35,6 +35,9 @@ ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY')  # Primary news + sen
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')                    # Kept for reference (no longer used by nodes)
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')          # Claude — Explanations (Nodes 13, 14)
 
+# HuggingFace (FinBERT model download — optional but removes unauthenticated warning)
+HF_TOKEN = os.getenv('HF_TOKEN')
+
 
 # ============================================================================
 # OPTIONAL SETTINGS

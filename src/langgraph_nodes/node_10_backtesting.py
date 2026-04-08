@@ -716,7 +716,7 @@ def backtest_combined_stream(
             actual_change = ((price_future - price_today) / price_today) * 100
 
             price_slice = df.iloc[: i + 1].copy()
-            tech_signal, tech_conf = reconstruct_technical_signal(price_slice)
+            tech_signal, tech_conf, _ = reconstruct_technical_signal(price_slice)
             if tech_signal is None:
                 continue
 

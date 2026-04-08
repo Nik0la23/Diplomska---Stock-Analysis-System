@@ -64,6 +64,10 @@ _AV_WINDOW_DAYS = 30
 _MARKET_TOPICS_BROAD  = "financial_markets,economy_macro,economy_fiscal"
 _MARKET_TOPICS_TICKER = "financial_markets,economy_macro,economy_fiscal,earnings"
 
+# Minimum market articles expected from a full 6-month fetch.
+# Fewer than this means the DB data is stale/partial → force a full re-fetch.
+_MIN_MARKET_ARTICLES = 50
+
 
 def _parse_av_timestamp(time_str: str) -> int:
     """Parse Alpha Vantage time_published string to Unix timestamp."""
@@ -82,6 +86,7 @@ async def _av_window_fetch(
     to_date: Optional[datetime],
     label: str,
     window_days: int = _AV_WINDOW_DAYS,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch Alpha Vantage NEWS_SENTIMENT by slicing the date range into fixed
@@ -133,19 +138,22 @@ async def _av_window_fetch(
         )
 
         try:
-            async with session.get(url, params=params) as response:
-                if response.status != 200:
-                    logger.error(f"AV API error ({label}) window {idx}: {response.status}")
-                    continue
-                data = await response.json()
+            async with (sem if sem else asyncio.Semaphore(999)):
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        logger.error(f"AV API error ({label}) window {idx}: {response.status}")
+                        await asyncio.sleep(1)
+                        continue
+                    data = await response.json()
+                await asyncio.sleep(1)  # 1s gap after each request — stays within 5 req/s burst limit
         except Exception as exc:
             logger.error(f"AV request failed ({label}) window {idx}: {exc}")
             continue
 
-        if "Note" in data or "Error Message" in data:
+        if "Note" in data or "Error Message" in data or ("Information" in data and not data.get("feed")):
             logger.warning(
                 f"AV ({label}) window {idx}: "
-                f"{data.get('Note') or data.get('Error Message')}"
+                f"{data.get('Note') or data.get('Error Message') or data.get('Information')}"
             )
             continue
 
@@ -182,6 +190,7 @@ async def fetch_alpha_vantage_news_async(
     session: aiohttp.ClientSession,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch ticker-specific stock news + sentiment from Alpha Vantage (paginated).
@@ -195,6 +204,7 @@ async def fetch_alpha_vantage_news_async(
         from_date=from_date,
         to_date=to_date,
         label=f"stock:{ticker}",
+        sem=sem,
     )
 
     articles: List[Dict[str, Any]] = []
@@ -230,6 +240,7 @@ async def fetch_alpha_vantage_market_news_async(
     ticker: str,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch market-context news using two complementary strategies, both stored
@@ -259,6 +270,7 @@ async def fetch_alpha_vantage_market_news_async(
         ticker:    Target ticker (e.g. 'AAPL') — used for Strategy 2.
         from_date: Start of fetch window.
         to_date:   End of fetch window.
+        sem:       Optional semaphore to cap concurrent AV requests.
 
     Returns:
         Combined deduplicated list of market news article dicts.
@@ -273,6 +285,7 @@ async def fetch_alpha_vantage_market_news_async(
             from_date=from_date,
             to_date=to_date,
             label="market:broad",
+            sem=sem,
         ),
         # Strategy 2: same macro topics filtered to articles mentioning ticker
         _av_window_fetch(
@@ -284,6 +297,7 @@ async def fetch_alpha_vantage_market_news_async(
             from_date=from_date,
             to_date=to_date,
             label=f"market:ticker_macro:{ticker}",
+            sem=sem,
         ),
     )
 
@@ -324,6 +338,7 @@ async def fetch_alpha_vantage_related_company_news_async(
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
     per_peer_limit: int = 100,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch top N most relevant articles for each peer concurrently.
@@ -358,17 +373,20 @@ async def fetch_alpha_vantage_related_company_news_async(
 
         logger.info(f"AV (related:{peer}): fetching top {per_peer_limit} articles")
         try:
-            async with session.get(url, params=params) as response:
-                if response.status != 200:
-                    logger.error(f"AV API error (related:{peer}): {response.status}")
-                    return []
-                data = await response.json()
+            async with (sem if sem else asyncio.Semaphore(999)):
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        logger.error(f"AV API error (related:{peer}): {response.status}")
+                        await asyncio.sleep(1)
+                        return []
+                    data = await response.json()
+                await asyncio.sleep(1)  # 1s gap — prevents burst when peers fire concurrently
         except Exception as exc:
             logger.error(f"AV request failed (related:{peer}): {exc}")
             return []
 
-        if "Note" in data or "Error Message" in data:
-            logger.warning(f"AV (related:{peer}): {data.get('Note') or data.get('Error Message')}")
+        if "Note" in data or "Error Message" in data or ("Information" in data and not data.get("feed")):
+            logger.warning(f"AV (related:{peer}): {data.get('Note') or data.get('Error Message') or data.get('Information')}")
             return []
 
         feed = data.get("feed", [])
@@ -465,8 +483,8 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         cached_stock_news  = get_cached_news(ticker, 'stock',  max_age_hours=NEWS_CACHE_HOURS)
         cached_market_news = get_cached_news(ticker, 'market', max_age_hours=NEWS_CACHE_HOURS)
         has_cached_stock  = cached_stock_news  is not None and len(cached_stock_news)  > 0
-        has_cached_market = cached_market_news is not None and len(cached_market_news) > 0
-        
+        has_cached_market = cached_market_news is not None and len(cached_market_news) >= _MIN_MARKET_ARTICLES
+
         if has_cached_stock and has_cached_market:
             logger.info(f"Node 2: Using cached news for {ticker}")
             related_from_cache = get_news_for_ticker(
@@ -502,14 +520,22 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # ====================================================================
         latest_news_date = get_latest_news_date(ticker)
         today = to_date.date() if hasattr(to_date, 'date') else to_date
-        
+        _market_missing_in_db = False  # flag: market never stored → force full fetch
+
         if latest_news_date is not None:
             latest_d   = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
             days_since = (today - latest_d).days
             if days_since <= 1:
                 stock_from_db  = get_news_for_ticker(ticker, 'stock',  days=NEWS_LOOKBACK_DAYS)
                 market_from_db = get_news_for_ticker(ticker, 'market', days=NEWS_LOOKBACK_DAYS)
-                if stock_from_db or market_from_db:
+                if not market_from_db or len(market_from_db) < _MIN_MARKET_ARTICLES:
+                    _market_missing_in_db = True
+                    logger.info(
+                        f"Node 2: Stock news current but market news insufficient in DB "
+                        f"({len(market_from_db) if market_from_db else 0} articles < {_MIN_MARKET_ARTICLES} minimum) "
+                        f"— will fetch full 6-month market window"
+                    )
+                if stock_from_db and market_from_db and len(market_from_db) >= _MIN_MARKET_ARTICLES:
                     related_from_db = get_news_for_ticker(
                         ticker, 'related', days=RELATED_NEWS_LOOKBACK_DAYS
                     )
@@ -537,13 +563,13 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     elapsed = (datetime.now() - start_time).total_seconds()
                     state['node_execution_times']['node_2'] = elapsed
                     return state
-        
+
         # ====================================================================
         # STEP 3: Define date range — full 6 months or incremental + overlap
         # ====================================================================
-        if latest_news_date is None:
+        if latest_news_date is None or _market_missing_in_db:
             from_date = to_date - timedelta(days=NEWS_LOOKBACK_DAYS)
-            logger.info(f"Node 2: First run for {ticker}, fetching 6-month window")
+            logger.info(f"Node 2: {'First run' if latest_news_date is None else 'Market news missing'} for {ticker}, fetching 6-month window")
         else:
             latest_d  = latest_news_date.date() if hasattr(latest_news_date, 'date') else latest_news_date
             from_date = (datetime.combine(latest_d, datetime.min.time()) - timedelta(days=NEWS_OVERLAP_DAYS))
@@ -574,19 +600,22 @@ def fetch_all_news_node(state: Dict[str, Any]) -> Dict[str, Any]:
         
         async def fetch_all():
             """Async wrapper to fetch all news in parallel with date range."""
+            # Semaphore caps concurrent AV requests at 4 to stay within the
+            # 5 req/s burst limit (stock + market×2 + peers×N can exceed it).
+            _sem = asyncio.Semaphore(4)
             async with aiohttp.ClientSession() as session:
                 tasks = [
                     # Stock news: ticker-specific articles
                     fetch_alpha_vantage_news_async(
-                        ticker, session, from_date, to_date
+                        ticker, session, from_date, to_date, sem=_sem
                     ),
                     # Market news: broad topics + ticker-macro (dual strategy)
                     fetch_alpha_vantage_market_news_async(
-                        session, ticker, from_date, to_date
+                        session, ticker, from_date, to_date, sem=_sem
                     ),
                     # Related-company news: one call per peer
                     fetch_alpha_vantage_related_company_news_async(
-                        related_companies, session, related_from_date, to_date
+                        related_companies, session, related_from_date, to_date, sem=_sem
                     ),
                 ]
                 return await asyncio.gather(*tasks, return_exceptions=True)
