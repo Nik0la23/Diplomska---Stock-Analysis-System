@@ -862,6 +862,7 @@ def main():
     diag = dd.get("diagnostics")          or {}
     tw   = dd.get("trustworthiness")      or {}
     mp   = dd.get("model_performance")    or {}
+    sa   = dd.get("system_accuracy")      or {}
 
     ticker        = es.get("ticker") or ticker_input
     final_signal  = es.get("recommendation", "HOLD")
@@ -892,7 +893,7 @@ def main():
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
     # ── Metric tiles ──────────────────────────────────────────────────────────
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
     with m1:
         st.metric("Current price", fmt_price(current_price))
     with m2:
@@ -917,6 +918,60 @@ def main():
         pnds = int(risk.get("pump_and_dump_score") or 0)
         st.metric("Manip. Risk", risk_level, delta=f"Vol: {vol_risk}",
                   delta_color="inverse")
+    with m7:
+        score  = sa.get("composite_score")
+        sa_ins = sa.get("insufficient_history", True)
+        lives  = int(sa.get("live_streams") or 0)
+        st.metric(
+            "System accuracy",
+            "Building…" if sa_ins else (f"{score:.0%}" if score is not None else "N/A"),
+            delta=f"{lives}/4 streams live" if not sa_ins else None,
+        )
+
+    # ── System accuracy breakdown ─────────────────────────────────────────────
+    if not sa.get("insufficient_history", True) and sa.get("composite_score") is not None:
+        with st.expander("System accuracy breakdown", expanded=False):
+            sig_acc  = sa.get("signal_accuracy")
+            tech_q   = sa.get("technical_model_quality")
+            sent_acc = sa.get("sentiment_accuracy")
+            comp     = sa.get("data_completeness")
+            ic_raw   = sa.get("ic_raw")
+            ic_sig   = sa.get("ic_significant")
+
+            def _bar(value: float, label: str, weight: str, note: str = "") -> str:
+                pct = int(value * 100)
+                color = "#065f46" if value >= 0.60 else "#92400e" if value >= 0.45 else "#991b1b"
+                note_html = f'<span style="font-size:10px;color:#aaa;margin-left:6px">{note}</span>' if note else ""
+                return f"""
+                <div style="margin-bottom:10px">
+                  <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                    <span style="font-size:12px;color:#555">{label}
+                      <span style="font-size:10px;color:#aaa">({weight} weight)</span>
+                    </span>
+                    <span style="font-family:'DM Mono',monospace;font-size:12px;color:{color}">{pct}%{note_html}</span>
+                  </div>
+                  <div style="background:#f0f0f0;border-radius:3px;height:5px">
+                    <div style="background:{color};width:{pct}%;height:5px;border-radius:3px"></div>
+                  </div>
+                </div>"""
+
+            ic_note = f"IC={ic_raw:+.3f}{'✦' if ic_sig else ''}" if ic_raw is not None else "IC N/A"
+            st.markdown(
+                _bar(sig_acc  or 0.55, "Signal accuracy (BUY/SELL/HOLD hit rate)", "40%") +
+                _bar(tech_q  or 0.50, "Technical model quality (IC score)", "25%", ic_note) +
+                _bar(sent_acc or 0.55, "Sentiment prediction accuracy", "20%") +
+                _bar(comp    or 0.0,  "Data completeness (live streams)", "15%",
+                     f"{int((comp or 0)*4)}/4 streams"),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                '<div style="font-size:10px;color:#aaa;margin-top:6px;line-height:1.6">'
+                'Composite of backtested directional accuracy (Node 11 weighted hit rates), '
+                'Ridge regression IC score, news sentiment stream accuracy, and fraction of '
+                'streams with ≥30 signals of live history. Clipped to [35%, 95%].'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
     if insuff:
         st.markdown("""

@@ -363,6 +363,23 @@ def _model_performance(state: Dict[str, Any]) -> Dict[str, Any]:
     aw = state.get("adaptive_weights") or {}
     br = state.get("backtest_results") or {}
 
+    combined = br.get("combined_stream") or {}
+    combined_accuracy: Optional[float] = combined.get("directional_accuracy")
+    combined_signal_count: int = int(combined.get("signal_count") or 0)
+
+    # Signal-conditional accuracy: "when the system said BUY/SELL in the past,
+    # how often was it right?" — read from the per-signal hit rates computed in
+    # Node 10's calculate_stream_metrics.  HOLD excluded (threshold-dependent).
+    final_signal: str = state.get("final_signal") or "HOLD"
+    signal_hit_rate: Optional[float] = None
+    signal_hit_n: int = 0
+    if final_signal == "BUY":
+        signal_hit_rate = combined.get("buy_hit_rate")
+        signal_hit_n    = int(combined.get("buy_count") or 0)
+    elif final_signal == "SELL":
+        signal_hit_rate = combined.get("sell_hit_rate")
+        signal_hit_n    = int(combined.get("sell_count") or 0)
+
     def _stream_accuracy(key: str) -> Optional[float]:
         stream = br.get(key) or {}
         return stream.get("full_accuracy")
@@ -425,6 +442,15 @@ def _model_performance(state: Dict[str, Any]) -> Dict[str, Any]:
         "related_news_ic":           _stream_ic("related_news"),
         "related_news_ic_p":         _stream_ic_p("related_news"),
         "related_news_ic_significant": _stream_ic_sig("related_news"),
+        # Combined-stream accuracy: directional accuracy of all 4 streams together
+        # over the full backtest window.
+        "combined_stream_accuracy":  combined_accuracy,
+        "combined_signal_count":     combined_signal_count,
+        # Signal-conditional accuracy: hit rate for past calls matching the current
+        # recommendation (BUY or SELL).  None when signal is HOLD or n < 5.
+        "signal_hit_rate":           signal_hit_rate,
+        "signal_hit_n":              signal_hit_n,
+        "signal_hit_type":           final_signal if signal_hit_rate is not None else None,
     }
 
 
@@ -558,6 +584,107 @@ def _trustworthiness(state: Dict[str, Any]) -> Dict[str, Any]:
         "insufficient_history": tw.get("insufficient_history", True),
         "using_prior":          tw.get("using_prior", False),
         "stream_hit_rates":     tw.get("stream_hit_rates", {}),
+    }
+
+
+def _system_accuracy(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Composite system accuracy score — covers every dimension the system outputs.
+
+    The system makes four categories of claims, each with a measurable accuracy:
+
+    1. SIGNAL ACCURACY (40 % weight)
+       Backtested directional hit rate across all 4 streams, Bayesian-smoothed
+       and recency-weighted by Node 11.  This is the reliability_score that
+       already drives trustworthiness — it measures whether BUY/SELL calls
+       were right over the past 180 days.
+
+    2. TECHNICAL MODEL QUALITY (25 % weight)
+       IC (Information Coefficient) of the Ridge-regression model: Pearson
+       correlation between the model's predicted 7-day return and the actual
+       7-day return.  Normalised from [-1, +1] → [0, 1].  When IC is not
+       significant (p ≥ 0.05) the component falls back to 0.5 (no evidence
+       of predictive power, but not actively wrong).
+
+    3. SENTIMENT PREDICTION ACCURACY (20 % weight)
+       Average directional accuracy of the three news-sentiment streams
+       (stock / market / related), weighted equally among streams that have
+       live backtested data.  Streams still on a prior (< 30 signals) are
+       excluded so they don't inflate or deflate the score.
+
+    4. DATA COMPLETENESS (15 % weight)
+       Fraction of streams backed by live backtested data rather than a
+       statistical prior.  A prior means the system has not yet seen enough
+       history for this ticker to trust a stream's hit rate — so the output
+       for that stream is less grounded.  4/4 live → 100 %, 2/4 → 50 %, etc.
+
+    The composite is clipped to [0.35, 0.95] so it never implies perfection
+    or complete uselessness.
+
+    Returns a dict with the composite score and all four component values so
+    the UI can display a breakdown rather than an opaque single number.
+    """
+    sc  = state.get("signal_components") or {}
+    tw  = sc.get("trustworthiness_breakdown") or {}
+    br  = state.get("backtest_results") or {}
+    aw  = state.get("adaptive_weights") or {}
+
+    # ── Component 1: signal accuracy (reliability_score from Node 12) ─────────
+    reliability: float = float(tw.get("reliability_score") or 0.55)
+    insufficient: bool = bool(tw.get("insufficient_history", True))
+
+    # ── Component 2: technical model quality (IC, normalised) ────────────────
+    tech_stream = br.get("technical") or {}
+    ic_raw: Optional[float] = tech_stream.get("ic_score")
+    ic_sig: Optional[bool]  = tech_stream.get("ic_significant")
+    if ic_raw is not None and ic_sig:
+        ic_component = float(max(0.0, (ic_raw + 1.0) / 2.0))   # [-1,1] → [0,1]
+    else:
+        ic_component = 0.50   # no significant evidence either way
+
+    # ── Component 3: sentiment stream accuracy ────────────────────────────────
+    stream_hit_rates: dict = tw.get("stream_hit_rates") or {}
+    sentiment_keys = ("sentiment", "market", "related_news")
+    live_sentiment_hits: list[float] = []
+    for key in sentiment_keys:
+        hr_data = stream_hit_rates.get(key) or {}
+        hit     = hr_data.get("hit_rate")
+        prior   = hr_data.get("using_prior", True)
+        if hit is not None and not prior:
+            live_sentiment_hits.append(float(hit))
+    sentiment_component: float = (
+        float(sum(live_sentiment_hits) / len(live_sentiment_hits))
+        if live_sentiment_hits else 0.55   # fall back to uninformative prior
+    )
+
+    # ── Component 4: data completeness ───────────────────────────────────────
+    all_keys = ("technical", "sentiment", "market", "related_news")
+    live_count = sum(
+        1 for k in all_keys
+        if not (stream_hit_rates.get(k) or {}).get("using_prior", True)
+    )
+    completeness_component: float = live_count / len(all_keys)
+
+    # ── Weighted composite ────────────────────────────────────────────────────
+    composite: float = (
+        0.40 * reliability           +
+        0.25 * ic_component          +
+        0.20 * sentiment_component   +
+        0.15 * completeness_component
+    )
+    composite = float(max(0.35, min(0.95, composite)))
+
+    return {
+        "composite_score":          round(composite, 4),
+        "insufficient_history":     insufficient,
+        # components (for breakdown display)
+        "signal_accuracy":          round(reliability, 4),
+        "technical_model_quality":  round(ic_component, 4),
+        "sentiment_accuracy":       round(sentiment_component, 4),
+        "data_completeness":        round(completeness_component, 4),
+        "live_streams":             live_count,
+        "ic_raw":                   round(ic_raw, 4) if ic_raw is not None else None,
+        "ic_significant":           ic_sig,
     }
 
 
@@ -971,6 +1098,7 @@ def dashboard_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "peer_companies":         _peer_companies(state),
             "sec_fundamentals":       _sec_fundamentals(state),
             # Tier 3: model quality & validation
+            "system_accuracy":        _system_accuracy(state),
             "model_performance":      _model_performance(state),
             "news_intelligence":      _news_intelligence(state),
             "historical_pattern":     _historical_pattern(state),

@@ -1008,6 +1008,20 @@ def calculate_stream_metrics(
             f"skipping significance test, marking near-random"
         )
 
+    # Per-signal hit rates: "when the system said BUY/SELL, how often was it right?"
+    # Minimum 5 samples required to report a meaningful rate.
+    _MIN_SIGNAL_HIT_N = 5
+    buy_days  = [r for r in all_days if r["signal"] == "BUY"]
+    sell_days = [r for r in all_days if r["signal"] == "SELL"]
+    buy_hit_rate:  Optional[float] = (
+        round(sum(1 for r in buy_days  if r["correct"]) / len(buy_days),  4)
+        if len(buy_days)  >= _MIN_SIGNAL_HIT_N else None
+    )
+    sell_hit_rate: Optional[float] = (
+        round(sum(1 for r in sell_days if r["correct"]) / len(sell_days), 4)
+        if len(sell_days) >= _MIN_SIGNAL_HIT_N else None
+    )
+
     return {
         "full_accuracy":                round(full_accuracy, 4),
         "recent_accuracy":              round(recent_accuracy, 4) if recent_accuracy is not None else None,
@@ -1017,6 +1031,8 @@ def calculate_stream_metrics(
         "buy_count":                    buy_count,
         "sell_count":                   sell_count,
         "hold_count":                   hold_count,
+        "buy_hit_rate":                 buy_hit_rate,
+        "sell_hit_rate":                sell_hit_rate,
         "total_days_evaluated":         len(all_days),
         "recent_days_evaluated":        len(recent_days),
         "avg_actual_change":            round(avg_actual_change, 4),
