@@ -50,6 +50,7 @@ def _save_history(history: list) -> None:
         pass
 
 from streamlit_app.components.signal_diagnostics import render_signal_diagnostics
+from streamlit_app.components.loading_screen import run_with_loading_screen
 
 import numpy as np
 import pandas as pd
@@ -795,43 +796,37 @@ def main():
         if not _effective_ticker:
             st.sidebar.warning("Please enter a ticker symbol.")
         else:
-            with st.spinner(f"Running analysis for {_effective_ticker}…"):
-                t0 = datetime.now()
-                pipeline_error: Optional[str] = None
-                if PIPELINE_AVAILABLE:
-                    try:
-                        state = asyncio.run(run_stock_analysis_async(_effective_ticker))
-                    except Exception as e:
-                        # ExceptionGroup (Python 3.11+ TaskGroup) hides the real cause.
-                        # Unwrap one level so the user sees the actual sub-exception.
-                        if hasattr(e, "exceptions") and e.exceptions:
-                            causes = "\n".join(
-                                f"[{i+1}] {type(sub).__name__}: {sub}"
-                                for i, sub in enumerate(e.exceptions)
-                            )
-                            pipeline_error = f"{e}\n\nSub-exceptions:\n{causes}"
-                        else:
-                            pipeline_error = f"{type(e).__name__}: {e}"
-                        state = _mock_state(_effective_ticker)
-                else:
-                    pipeline_error = "Pipeline not available — import failed."
+            t0 = datetime.now()
+            pipeline_error: Optional[str] = None
+            if PIPELINE_AVAILABLE:
+                _loading_ph = st.empty()
+                state, pipeline_error = asyncio.run(
+                    run_with_loading_screen(_effective_ticker, _loading_ph)
+                )
+                _loading_ph.empty()
+                if state is None:
+                    if pipeline_error is None:
+                        pipeline_error = "Pipeline returned no state."
                     state = _mock_state(_effective_ticker)
-                elapsed = (datetime.now() - t0).total_seconds()
-                st.session_state.state          = state
-                st.session_state.last_ticker    = _effective_ticker
-                st.session_state.elapsed        = elapsed
-                st.session_state.pipeline_error = pipeline_error
-                # Append to run history (max 10 entries, most recent first)
-                if "run_history" not in st.session_state:
-                    st.session_state.run_history = []
-                st.session_state.run_history.insert(0, {
-                    "ticker":    _effective_ticker,
-                    "timestamp": datetime.now(),
-                    "state":     state,
-                    "elapsed":   elapsed,
-                })
-                st.session_state.run_history = st.session_state.run_history[:10]
-                _save_history(st.session_state.run_history)
+            else:
+                pipeline_error = "Pipeline not available — import failed."
+                state = _mock_state(_effective_ticker)
+            elapsed = (datetime.now() - t0).total_seconds()
+            st.session_state.state          = state
+            st.session_state.last_ticker    = _effective_ticker
+            st.session_state.elapsed        = elapsed
+            st.session_state.pipeline_error = pipeline_error
+            # Append to run history (max 10 entries, most recent first)
+            if "run_history" not in st.session_state:
+                st.session_state.run_history = []
+            st.session_state.run_history.insert(0, {
+                "ticker":    _effective_ticker,
+                "timestamp": datetime.now(),
+                "state":     state,
+                "elapsed":   elapsed,
+            })
+            st.session_state.run_history = st.session_state.run_history[:10]
+            _save_history(st.session_state.run_history)
 
     if "state" not in st.session_state:
         st.info("Enter a ticker in the sidebar and click **Analyse** to start.")
